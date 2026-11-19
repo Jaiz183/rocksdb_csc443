@@ -157,12 +157,19 @@ class BuiltinFilterPolicy : public FilterPolicy {
   // (An internal convenience function to save boilerplate.)
   static FilterBitsBuilder* GetBuilderFromContext(const FilterBuildingContext&);
 
+ protected:
+  static FilterBitsBuilder* GetXorFilterBuilderWithContext(
+      const FilterBuildingContext& context);
+
  private:
   // For Bloom filter implementation(s)
   static BuiltinFilterBitsReader* GetBloomBitsReader(const Slice& contents);
 
   // For Ribbon filter implementation(s)
   static BuiltinFilterBitsReader* GetRibbonBitsReader(const Slice& contents);
+
+  // For XOR filter implementations
+  static BuiltinFilterBitsReader* GetXorFilterBitsReader(const Slice& contents);
 };
 
 // A "read only" filter policy used for backward compatibility with old

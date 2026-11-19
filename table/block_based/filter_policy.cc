@@ -9,6 +9,7 @@
 
 #include "rocksdb/filter_policy.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <climits>
@@ -16,6 +17,10 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <queue>
+#include <stack>
+#include <stdexcept>
+#include <tuple>
 
 #include "cache/cache_reservation_manager.h"
 #include "logging/logging.h"
@@ -357,6 +362,303 @@ class XXPH3FilterBitsBuilder : public FilterBitsBuilder {
 
   HashEntriesInfo hash_entries_info_;
 };
+
+struct XorFilterHash {
+  struct XorSlots {
+    uint32_t idx[3];
+    uint8_t fp;
+  };
+
+  // Mix the input hash with the seed before deriving its slots.
+  static inline uint64_t Remix(uint64_t h, uint8_t seed) {
+    h ^= (uint64_t{seed} + 1) * 0x9E3779B97F4A7C15ULL;
+    h ^= h >> 32;
+    h *= 0x9E3779B97F4A7C15ULL;
+    h ^= h >> 29;
+    return h;
+  }
+
+  // Map a 32-bit value to [0, n) using Lemire's fastrange.
+  static inline uint32_t FastRange32(uint32_t x, uint32_t n) {
+    return static_cast<uint32_t>((uint64_t{x} * n) >> 32);
+  }
+
+  // Rotate a 64-bit hash.
+  static inline uint64_t Rotl64(uint64_t x, int r) {
+    return (x << r) | (x >> (64 - r));
+  }
+
+  // Split a hash into three slot indices and an 8-bit fingerprint.
+  static inline XorSlots Derive(uint64_t h, uint32_t seg_len) {
+    XorSlots s;
+    // Each index lands in its own segment, so the three slots are distinct.
+    s.idx[0] = FastRange32(static_cast<uint32_t>(h), seg_len);
+    s.idx[1] =
+        FastRange32(static_cast<uint32_t>(Rotl64(h, 21)), seg_len) + seg_len;
+    s.idx[2] = FastRange32(static_cast<uint32_t>(Rotl64(h, 42)), seg_len) +
+               2 * seg_len;
+    s.fp = static_cast<uint8_t>(h ^ (h >> 32));
+    return s;
+  }
+
+  // Apply the seed-dependent mix before deriving the slots and fingerprint.
+  static inline XorSlots SeededDerive(uint64_t h, uint32_t seg_len,
+                                      uint8_t seed) {
+    return Derive(Remix(h, seed), seg_len);
+  }
+};
+
+// ---- Builder ----
+class XorFilterBitsBuilder : public XXPH3FilterBitsBuilder {
+ public:
+  XorFilterBitsBuilder(std::atomic<int64_t>* aggregate_rounding_balance,
+                       std::shared_ptr<CacheReservationManager> cache_res_mgr,
+                       bool detect_filter_construct_corruption)
+      : XXPH3FilterBitsBuilder(aggregate_rounding_balance,
+                               std::move(cache_res_mgr),
+                               detect_filter_construct_corruption) {}
+  // No copy allowed
+  XorFilterBitsBuilder(const XorFilterBitsBuilder&) = delete;
+  void operator=(const XorFilterBitsBuilder&) = delete;
+  XorFilterBitsBuilder(XorFilterBitsBuilder&&) = delete;
+  void operator=(XorFilterBitsBuilder&&) = delete;
+
+  ~XorFilterBitsBuilder() override {}
+
+  // AddKey, AddKeyAndAlt accumulate hashes in hash_entries_info_.entries
+
+  using FilterBitsBuilder::Finish;  // keep the other overloads visible
+  Slice Finish(std::unique_ptr<const char[]>* buf) override {
+    return Finish(buf, nullptr);
+  }
+
+  Slice Finish(std::unique_ptr<const char[]>* buf, Status* status) override {
+    // 0. verify checksum for corruption
+    Status vs = VerifyChecksumBeforeDedupe();
+    if (!vs.ok()) {
+      ResetEntries();
+      if (status) *status = vs;
+      return Slice();
+    }
+    // 1. dedupe hashes - duplicate hashes make peeling impossible
+    std::sort(hash_entries_info_.entries.begin(),
+              hash_entries_info_.entries.end());
+    auto new_end = std::unique(hash_entries_info_.entries.begin(),
+                               hash_entries_info_.entries.end());
+    hash_entries_info_.entries.erase(new_end, hash_entries_info_.entries.end());
+
+    // TODO: we need to update metadata - at least min, checksum and size
+    // TODO: make FP rate customisable
+    const uint32_t num_keys = hash_entries_info_.entries.size();
+    uint32_t filter_size = get_filter_size(num_keys, sizeof(uint8_t));
+    uint32_t filter_length = filter_size - kMetadataLen;
+    const uint32_t seg_len =
+        static_cast<uint32_t>(filter_length / 3);  // round seg_len up
+
+    // alloc buffer w/ space for metadata
+    // size of each fp is just 8 bits = 1B here
+    std::unique_ptr<char[]> mutable_buf = std::make_unique<char[]>(filter_size);
+    uint8_t* B = reinterpret_cast<uint8_t*>(
+        mutable_buf.get());  // to prevent copy of B into buf
+
+    // try to constuct hypergraph and peel until successful
+    bool peeled = false;
+    uint8_t s_seed = 0;
+    std::stack<std::tuple<uint64_t, uint32_t>> peeled_edges;
+    std::vector<std::set<uint64_t>> hypergraph;
+    for (uint8_t seed = 0; seed < 256 && !peeled; seed++) {
+      hypergraph = BuildHypergraph(filter_length, seg_len, seed);
+      peeled_edges = PeelHypergraph(hypergraph, seg_len, seed);
+      peeled = peeled_edges.size() ==
+               num_keys;  // if all edges could be peeled, we succeed
+      s_seed = seed;
+    }
+
+    if (!peeled) {
+      if (status)
+        *status = Status::Corruption(
+            "failed to peel edges over 256 seeds; we're in trouble :(");
+
+      ResetEntries();
+      return Slice();
+    }
+
+    // iterate through the stack of edges and init the filter
+    // init the filter w/ all 0s
+    while (!peeled_edges.empty()) {
+      // get edge, set corresponding vertex entry so all vertices xor to the
+      // fingerprint
+      const auto& [e, v] =
+          peeled_edges.top();  // read-only (const), non-copy (reference)
+      peeled_edges.pop();
+      XorFilterHash::XorSlots h =
+          XorFilterHash::SeededDerive(e, seg_len, s_seed);
+      uint32_t h0 = h.idx[0], h1 = h.idx[1], h2 = h.idx[2];
+      B[v] = B[h0] ^ B[h1] ^ B[h2] ^ h.fp;
+    }
+
+    // write metadata trailer / marker
+    mutable_buf[filter_size - kMetadataLen] = static_cast<char>(-3);
+    mutable_buf[filter_size - kMetadataLen + 1] =
+        static_cast<char>(s_seed);  // write succ. seed and retrieve later
+    // we must store the seed for the hash that worked
+    Slice f(mutable_buf.get(), filter_size);
+    *buf = std::move(mutable_buf);
+    if (status) *status = Status::OK();
+
+    // cleanup: frees hash list, its cache reservation, and the checksum
+    ReserveFinalFilterMemory(filter_size + kMetadataLen);
+    ResetEntries();
+
+    return f;
+  }
+
+  size_t ApproximateNumEntries(size_t bytes) override {
+    return static_cast<uint32_t>(
+        ((bytes - kMetadataLen) / (sizeof(uint8_t) * 3) - 32) / 1.23);
+  }
+
+  size_t CalculateSpace(const size_t num_entries) override {
+    return get_filter_size(num_entries, sizeof(uint8_t));
+  }
+
+  double EstimatedFpRate(size_t, size_t) override { return 0.0; }
+
+  size_t RoundDownUsableSpace(size_t available_size) override {
+    return available_size;
+  }
+
+ private:
+  uint32_t get_filter_size(uint32_t num_keys, uint32_t fp_size) {
+    const uint32_t unrounded_filter_length =
+        static_cast<uint32_t>(1.23 * num_keys) + 32;
+    const uint32_t seg_len =
+        (unrounded_filter_length + 2) / 3;  // round seg_len up
+    const uint32_t filter_length = seg_len * 3;
+    return filter_length * fp_size + kMetadataLen;
+  }
+  // Verify the running XOR checksum BEFORE sorting/deduping hash_entries_info_.
+  // Returns OK if corruption detection is off or the checksum matches.
+  // On failure the entries are reset, so the caller should just bail out.
+  Status VerifyChecksumBeforeDedupe() {
+    return MaybeVerifyHashEntriesChecksum();
+  }
+
+  // Charge the block cache for the final filter buffer and keep the
+  // reservation alive for the lifetime of the builder.
+  // Best-effort: a failed charge is not treated as a build failure.
+  void ReserveFinalFilterMemory(size_t len) {
+    if (!cache_res_mgr_) {
+      return;
+    }
+    std::unique_ptr<CacheReservationManager::CacheReservationHandle> handle;
+    Status s = cache_res_mgr_->MakeCacheReservation(len, &handle);
+    s.PermitUncheckedError();
+    final_filter_cache_res_handles_.push_back(std::move(handle));
+  }
+
+  std::vector<std::set<uint64_t>> BuildHypergraph(uint32_t filter_size,
+                                                  uint32_t seg_len,
+                                                  uint8_t seed) const {
+    // Each key is an edge; the hypergraph stores the keys incident to each
+    // vertex. The vertex array is partitioned into three segments.
+    std::vector<std::set<uint64_t>> hypergraph(filter_size);
+    for (uint64_t edge : hash_entries_info_.entries) {
+      XorFilterHash::XorSlots h =
+          XorFilterHash::SeededDerive(edge, seg_len, seed);
+      for (size_t i = 0; i < 3; i++) {
+        uint32_t vertex = h.idx[i];
+        hypergraph[vertex].insert(edge);
+      }
+    }
+    return hypergraph;
+  }
+
+  std::stack<std::tuple<uint64_t, uint32_t>> PeelHypergraph(
+      std::vector<std::set<uint64_t>>& hypergraph, uint32_t seg_len,
+      uint8_t seed) const {
+    // Start with vertices incident to a single edge, then propagate as edges
+    // are removed.
+    std::queue<uint32_t> queue;
+    for (size_t i = 0; i < hypergraph.size(); i++) {
+      if (hypergraph[i].size() == 1) {
+        queue.push(static_cast<uint32_t>(i));
+      }
+    }
+
+    std::stack<std::tuple<uint64_t, uint32_t>> peeled_edges;
+    while (!queue.empty()) {
+      uint32_t vertex = queue.front();
+      queue.pop();
+      if (!hypergraph[vertex].empty()) {
+        uint64_t edge = *hypergraph[vertex].begin();
+        XorFilterHash::XorSlots h =
+            XorFilterHash::SeededDerive(edge, seg_len, seed);
+        for (size_t i = 0; i < 3; i++) {
+          uint32_t hi = h.idx[i];
+          hypergraph[hi].erase(edge);
+          if (hypergraph[hi].size() == 1) {
+            queue.push(hi);
+          }
+        }
+        peeled_edges.emplace(edge, vertex);
+      }
+    }
+    return peeled_edges;
+  }
+
+  // Check your version: some of these may also need overriding
+  // (e.g. EstimateEntriesAdded, MaybePostVerify).
+};
+
+// ---- Reader ----
+class XorFilterBitsReader : public BuiltinFilterBitsReader {
+ public:
+  explicit XorFilterBitsReader(const char* data, uint8_t seed, uint32_t seg_len)
+      : data_(data), seed_(seed), seg_len_(seg_len) {}
+
+  XorFilterBitsReader(const XorFilterBitsReader&) = delete;
+  void operator=(const XorFilterBitsReader&) = delete;
+  XorFilterBitsReader(XorFilterBitsReader&&) = delete;
+  void operator=(XorFilterBitsReader&&) = delete;
+
+  bool MayMatch(const Slice& key) override {
+    // hash key, look up 3 slots, compare fingerprint
+    uint64_t hash = GetSliceHash64(key);
+    return HashMayMatch(hash);
+  }
+
+  bool HashMayMatch(const uint64_t hash) override {
+    XorFilterHash::XorSlots h =
+        XorFilterHash::SeededDerive(hash, seg_len_, seed_);
+    auto [h0, h1, h2] = h.idx;
+    return h.fp == (data_[h0] ^ data_[h1] ^ data_[h2]);
+  }
+
+ private:
+  const char* data_;
+  uint8_t seed_;
+  uint32_t seg_len_;
+};
+
+// ---- Policy ----
+class XorFilterPolicy : public BuiltinFilterPolicy {
+ public:
+  explicit XorFilterPolicy(double /*bits_per_key*/) {}
+
+  const char* Name() const override { return "rocksdb.XorFilter"; }
+
+  FilterBitsBuilder* GetBuilderWithContext(
+      const FilterBuildingContext& context) const override {
+    // does the same as the other filters for now, no customisable FP rate
+    return GetXorFilterBuilderWithContext(context);
+  }
+};
+
+// Public factory (declare in include/rocksdb/filter_policy.h)
+const FilterPolicy* NewXorFilterPolicy(double bits_per_key) {
+  return new XorFilterPolicy(bits_per_key);
+}
 
 // #################### FastLocalBloom implementation ################## //
 // ############## also known as format_version=5 Bloom filter ########## //
@@ -1588,6 +1890,30 @@ BloomLikeFilterPolicy::GetStandard128RibbonBuilderWithContext(
       context.info_log);
 }
 
+FilterBitsBuilder* BuiltinFilterPolicy::GetXorFilterBuilderWithContext(
+    const FilterBuildingContext& context) {
+  const auto options_overrides_iter =
+      context.table_options.cache_usage_options.options_overrides.find(
+          CacheEntryRole::kFilterConstruction);
+  const auto filter_construction_charged =
+      options_overrides_iter !=
+              context.table_options.cache_usage_options.options_overrides.end()
+          ? options_overrides_iter->second.charged
+          : context.table_options.cache_usage_options.options.charged;
+
+  std::shared_ptr<CacheReservationManager> cache_res_mgr;
+  if (context.table_options.block_cache &&
+      filter_construction_charged ==
+          CacheEntryRoleOptions::Decision::kEnabled) {
+    cache_res_mgr = std::make_shared<
+        CacheReservationManagerImpl<CacheEntryRole::kFilterConstruction>>(
+        context.table_options.block_cache);
+  }
+  return new XorFilterBitsBuilder(
+      nullptr, cache_res_mgr,
+      context.table_options.detect_filter_construct_corruption);
+}
+
 std::string BloomLikeFilterPolicy::GetBitsPerKeySuffix() const {
   std::string rv = ":" + std::to_string(millibits_per_key_ / 1000);
   int frac = millibits_per_key_ % 1000;
@@ -1699,6 +2025,9 @@ BuiltinFilterBitsReader* BuiltinFilterPolicy::GetBuiltinFilterBitsReader(
       case -2:
         // Marker for Ribbon implementations
         return GetRibbonBitsReader(contents);
+      case -3:
+        // Marker for XorFilter implementations
+        return GetXorFilterBitsReader(contents);
       default:
         // Reserved (treat as zero probes, always FP, for now)
         return new AlwaysTrueFilter();
@@ -1830,6 +2159,20 @@ BuiltinFilterBitsReader* BuiltinFilterPolicy::GetBloomBitsReader(
   return new AlwaysTrueFilter();
 }
 
+BuiltinFilterBitsReader* BuiltinFilterPolicy::GetXorFilterBitsReader(
+    const Slice& contents) {
+  uint32_t filter_size = static_cast<uint32_t>(contents.size());
+  uint32_t no_meta_size = filter_size - kMetadataLen;
+  // don't need to read subimplementation val. since there is only one xor
+  // implm.
+  uint8_t seed = contents.data()[filter_size - 4];
+  uint32_t seg_len =
+      static_cast<uint32_t>((contents.size() - kMetadataLen) / 3);
+
+  return new XorFilterBitsReader(contents.data(), seed, seg_len);
+}
+
+// #region sd
 const FilterPolicy* NewBloomFilterPolicy(double bits_per_key,
                                          bool /*use_block_based_builder*/) {
   // NOTE: use_block_based_builder now ignored so block-based filter is no
