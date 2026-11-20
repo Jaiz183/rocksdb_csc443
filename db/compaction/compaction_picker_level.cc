@@ -21,6 +21,10 @@ namespace ROCKSDB_NAMESPACE {
 
 bool LevelCompactionPicker::NeedsCompaction(
     const VersionStorageInfo* vstorage) const {
+  // [FADE] delete-driven trigger
+  if (!vstorage->FadeExpiredFiles().empty()) {
+    return true;
+  }
   if (!vstorage->ExpiredTtlFiles().empty()) {
     return true;
   }
@@ -81,6 +85,15 @@ class LevelCompactionBuilder {
   // Pick the initial files to compact to the next level. (or together
   // in Intra-L0 compactions)
   void SetupInitialFiles();
+
+  // [FADE] Delete-driven trigger + delete-driven file selection (DD mode).
+  // Returns true and fills start_level_inputs_ if a compaction was picked.
+  bool PickFadeCompaction();
+
+  // [FADE] Like PickFadeCompaction(), but only considers expired files in
+  // `level`. Used when a size-triggered compaction has already chosen the
+  // level: within that level, prefer a file whose tombstones have expired.
+  bool PickFadeCompactionAtLevel(int level);
 
   // If the initial files are from L0 level, pick other L0
   // files if needed.
@@ -204,7 +217,64 @@ void LevelCompactionBuilder::PickFileToCompact(
   start_level_inputs_.files.clear();
 }
 
+bool LevelCompactionBuilder::PickFadeCompaction() {
+  const auto& fade_files = vstorage_->FadeExpiredFiles();
+  if (fade_files.empty()) {
+    return false;
+  }
+  // FadeExpiredFiles() is already ordered by (level, oldest tombstone,
+  // #tombstones). kSkipLastLevel: a file is moved one level down
+  // (L0 -> base_level, Ln -> Ln+1) and never self-compacted in the last level.
+  PickFileToCompact(fade_files, CompactToNextLevel::kSkipLastLevel);
+  if (!start_level_inputs_.empty()) {
+    compaction_reason_ = CompactionReason::kFadeTtl;
+    TEST_SYNC_POINT_CALLBACK("LevelCompactionBuilder::PickFadeCompaction:Picked",
+                             &start_level_);
+    return true;
+  }
+  return false;
+}
+
+bool LevelCompactionBuilder::PickFadeCompactionAtLevel(int level) {
+  autovector<std::pair<int, FileMetaData*>> level_files;
+  for (const std::pair<int, FileMetaData*>& level_file :
+       vstorage_->FadeExpiredFiles()) {
+    if (level_file.first == level) {
+      level_files.push_back(level_file);
+    }
+  }
+  if (level_files.empty()) {
+    return false;
+  }
+  PickFileToCompact(level_files, CompactToNextLevel::kSkipLastLevel);
+  if (!start_level_inputs_.empty()) {
+    compaction_reason_ = CompactionReason::kFadeTtl;
+    TEST_SYNC_POINT_CALLBACK("LevelCompactionBuilder::PickFadeCompaction:Picked",
+                             &start_level_);
+    return true;
+  }
+  return false;
+}
+
 void LevelCompactionBuilder::SetupInitialFiles() {
+  // [FADE] Starvation guard. An expired tombstone TTL takes precedence over
+  // saturation (paper Sec. 4.1.4) only while the tree is healthy, i.e. no
+  // level's size score has reached kFadeYieldScore. FADE's smallest-level-
+  // first order means that, with a short L0 deadline, there is almost always
+  // an expired candidate; if FADE always went first, size-triggered
+  // compactions would starve whenever compaction bandwidth is tight, levels
+  // would overfill and the backlog would feed on itself. Once a level is
+  // that far over its target, the size-based picker chooses the level, and
+  // FADE only chooses which file in that level to compact (see the loop
+  // below). The scores are sorted in descending order, so CompactionScore(0)
+  // is the maximum. L0's score is #files / level0_file_num_compaction_trigger,
+  // so this also covers L0 backlogs well before the write-slowdown trigger.
+  static constexpr double kFadeYieldScore = 1.5;
+  const bool tree_saturated = vstorage_->CompactionScore(0) >= kFadeYieldScore;
+  if (!tree_saturated && PickFadeCompaction()) {
+    return;
+  }
+
   // Find the compactions by size on all levels.
   bool skipped_l0_to_base = false;
   for (int i = 0; i < compaction_picker_->NumberLevels() - 1; i++) {
@@ -217,6 +287,14 @@ void LevelCompactionBuilder::SetupInitialFiles() {
         // compaction from base level. Otherwise L0->base_level compaction
         // may starve.
         continue;
+      }
+      // [FADE] The tree is saturated and this level needs a size-based
+      // compaction anyway: compact a file with expired tombstones from it if
+      // there is one (L0 is excluded; its size-based compaction already takes
+      // all overlapping L0 files).
+      if (tree_saturated && start_level_ > 0 &&
+          PickFadeCompactionAtLevel(start_level_)) {
+        break;
       }
       output_level_ =
           (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
@@ -259,6 +337,12 @@ void LevelCompactionBuilder::SetupInitialFiles() {
     }
   }
   if (!start_level_inputs_.empty()) {
+    return;
+  }
+
+  // [FADE] The tree is saturated but no size-based compaction was possible
+  // (e.g. the saturated levels are busy): do not let expired files wait.
+  if (tree_saturated && PickFadeCompaction()) {
     return;
   }
 

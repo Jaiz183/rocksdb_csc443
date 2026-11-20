@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <limits>
 #include <vector>
 
 #include "db/builder.h"
@@ -1083,6 +1084,28 @@ Status FlushJob::WriteLevel0Table() {
           base_, &memtable_payload_bytes, &memtable_garbage_bytes, &flush_stats,
           blob_file_garbages_for_filtering, fast_sst_open_);
       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
+
+      // [FADE] a_max bookkeeping for the new L0 file: the oldest tombstone
+      // insertion time across all memtables being flushed. Only recorded if
+      // the output actually contains point or range tombstones.
+      if (s.ok() && (table_properties_.num_deletions > 0 ||
+                     table_properties_.num_range_deletions > 0)) {
+        uint64_t oldest_tombstone_time = std::numeric_limits<uint64_t>::max();
+        for (ReadOnlyMemTable* m : mems_) {
+          oldest_tombstone_time = std::min(oldest_tombstone_time,
+                                           m->ApproximateOldestTombstoneTime());
+        }
+        if (oldest_tombstone_time == std::numeric_limits<uint64_t>::max()) {
+          // Not tracked (e.g. non-MemTable implementation): fall back to the
+          // oldest key time, which is never newer than any tombstone.
+          oldest_tombstone_time = oldest_ancestor_time;
+        }
+        meta_.oldest_tombstone_time = oldest_tombstone_time;
+      } else {
+        meta_.oldest_tombstone_time = kNoTombstoneTime;
+      }
+      TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:oldest_tombstone_time",
+                               &meta_.oldest_tombstone_time);
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
       io_s.PermitUncheckedError();

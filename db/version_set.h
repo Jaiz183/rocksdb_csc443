@@ -238,6 +238,14 @@ class VersionStorageInfo {
   void ComputeExpiredTtlFiles(const ImmutableOptions& ioptions,
                               const uint64_t ttl);
 
+  // [FADE] Computes the per-level cumulative tombstone deadlines
+  // (fade_level_deadline_) from delete_persistence_threshold and collects the
+  // files whose oldest tombstone has outlived its level's deadline into
+  // fade_expired_files_, ordered for FADE's delete-driven (DD) file selection.
+  // Called by ComputeCompactionScore().
+  void ComputeFadeExpiredFiles(const ImmutableOptions& ioptions,
+                               const MutableCFOptions& mutable_cf_options);
+
   // This computes files_marked_for_periodic_compaction_ and is called by
   // ComputeCompactionScore()
   void ComputeFilesMarkedForPeriodicCompaction(
@@ -630,6 +638,27 @@ class VersionStorageInfo {
     return expired_ttl_files_;
   }
 
+  // [FADE] Files holding a tombstone older than their level's cumulative
+  // FADE deadline, sorted by (level asc, oldest tombstone asc, #tombstones
+  // desc). Empty when delete_persistence_threshold == 0.
+  // REQUIRES: ComputeCompactionScore has been called
+  // REQUIRES: DB mutex held during access
+  // Used by Leveled Compaction only.
+  const autovector<std::pair<int, FileMetaData*>>& FadeExpiredFiles() const {
+    assert(finalized_);
+    return fade_expired_files_;
+  }
+
+  // [FADE] Cumulative deadline D_i (seconds since a tombstone was written by
+  // which it must have left `level`). 0 if FADE does not govern this level
+  // (disabled, empty intermediate level, or the last non-empty level).
+  uint64_t FadeLevelDeadline(int level) const {
+    if (level < 0 || static_cast<size_t>(level) >= fade_level_deadline_.size()) {
+      return 0;
+    }
+    return fade_level_deadline_[level];
+  }
+
   // REQUIRES: ComputeCompactionScore has been called
   // REQUIRES: DB mutex held during access
   // Used by Leveled and Universal Compaction.
@@ -877,6 +906,10 @@ class VersionStorageInfo {
   autovector<std::pair<int, FileMetaData*>> files_marked_for_compaction_;
 
   autovector<std::pair<int, FileMetaData*>> expired_ttl_files_;
+
+  // [FADE] see FadeExpiredFiles() / FadeLevelDeadline()
+  autovector<std::pair<int, FileMetaData*>> fade_expired_files_;
+  std::vector<uint64_t> fade_level_deadline_;
 
   autovector<std::pair<int, FileMetaData*>>
       files_marked_for_periodic_compaction_;

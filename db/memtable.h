@@ -10,6 +10,7 @@
 #pragma once
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -324,6 +325,13 @@ class ReadOnlyMemTable {
   virtual const InternalKeyComparator& GetInternalKeyComparator() const = 0;
 
   virtual uint64_t ApproximateOldestKeyTime() const = 0;
+
+  // [FADE] Unix time at which the first (oldest) point or range tombstone was
+  // inserted into this memtable, or std::numeric_limits<uint64_t>::max() if
+  // it contains no tombstones (or the implementation does not track it).
+  virtual uint64_t ApproximateOldestTombstoneTime() const {
+    return std::numeric_limits<uint64_t>::max();
+  }
 
   // Inserts a range tombstone [start_key, end_key) that is logically redundant
   // -- it is derived from existing point tombstones observed during iteration
@@ -887,6 +895,10 @@ class MemTable final : public ReadOnlyMemTable {
     return oldest_key_time_.load(std::memory_order_relaxed);
   }
 
+  uint64_t ApproximateOldestTombstoneTime() const override {
+    return oldest_tombstone_time_.load(std::memory_order_relaxed);
+  }
+
   // Returns a heuristic flush decision
   bool ShouldFlushNow();
 
@@ -1015,6 +1027,9 @@ class MemTable final : public ReadOnlyMemTable {
   // Timestamp of oldest key
   std::atomic<uint64_t> oldest_key_time_;
 
+  // [FADE] Timestamp of the oldest tombstone (max() if none yet)
+  std::atomic<uint64_t> oldest_tombstone_time_;
+
   // keep track of memory usage in table_, arena_, and range_del_table_.
   // Gets refreshed inside `ApproximateMemoryUsage()` or `ShouldFlushNow`
   RelaxedAtomic<uint64_t> approximate_memory_usage_;
@@ -1036,6 +1051,9 @@ class MemTable final : public ReadOnlyMemTable {
   void UpdateFlushState();
 
   void UpdateOldestKeyTime();
+
+  // [FADE] Records the insertion time of the first tombstone in this memtable.
+  void UpdateOldestTombstoneTime();
 
   void GetFromTable(const LookupKey& key,
                     SequenceNumber max_covering_tombstone_seq, bool do_merge,

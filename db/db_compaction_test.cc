@@ -14262,6 +14262,342 @@ TEST_F(DBCompactionTest, CompactionFilterLargeValueRejected) {
   ASSERT_TRUE(s.ToString().find("4GB") != std::string::npos) << s.ToString();
 }
 
+// ---------------------------------------------------------------------------
+// [FADE] Tests for Lethe's FADE (delete_persistence_threshold)
+// ---------------------------------------------------------------------------
+namespace {
+VersionStorageInfo* FadeStorageInfo(DB* db) {
+  return static_cast_with_check<ColumnFamilyHandleImpl>(
+             db->DefaultColumnFamily())
+      ->cfd()
+      ->current()
+      ->storage_info();
+}
+
+Options FadeTestOptions(Options options, uint64_t dth, int num_levels) {
+  options.compaction_style = kCompactionStyleLevel;
+  options.delete_persistence_threshold = dth;
+  options.num_levels = num_levels;
+  options.max_bytes_for_level_multiplier = 10;
+  options.max_bytes_for_level_base = 64 << 20;  // keep size scores < 1
+  options.level_compaction_dynamic_level_bytes = false;  // base_level == 1
+  options.level0_file_num_compaction_trigger = 10;
+  options.level0_slowdown_writes_trigger = 20;
+  options.level0_stop_writes_trigger = 30;
+  options.ttl = 0;
+  options.periodic_compaction_seconds = 0;
+  options.compression = kNoCompression;
+  return options;
+}
+}  // namespace
+
+// d_i follow the paper: exponentially growing, cumulative, summing to D_th.
+TEST_F(DBCompactionTest, FadeLevelDeadlinesFollowPaper) {
+  env_->SetMockSleep();
+  Options options = FadeTestOptions(CurrentOptions(), /*dth=*/1000,
+                                    /*num_levels=*/5);
+  DestroyAndReopen(options);
+
+  // Populate L3 (last level), L2 and L1 so that the tree has
+  // stages {L0, L1, L2} and n = 3.
+  for (int level = 3; level >= 1; level--) {
+    for (int i = 0; i < 10; i++) {
+      ASSERT_OK(Put(Key(i * 10 + level), "v"));
+    }
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(level);
+  }
+  ASSERT_EQ("0,1,1,1", FilesPerLevel());
+
+  dbfull()->TEST_LockMutex();
+  VersionStorageInfo* vstorage = FadeStorageInfo(db_.get());
+  // T = 10, n = 3: D_k = 1000 * (10^(k+1) - 1) / (10^3 - 1)
+  EXPECT_EQ(9u, vstorage->FadeLevelDeadline(0));     // 9.009
+  EXPECT_EQ(99u, vstorage->FadeLevelDeadline(1));    // 99.099
+  EXPECT_EQ(1000u, vstorage->FadeLevelDeadline(2));  // == D_th
+  EXPECT_EQ(0u, vstorage->FadeLevelDeadline(3));     // last level: no TTL
+  EXPECT_EQ(0u, vstorage->FadeLevelDeadline(4));
+  dbfull()->TEST_UnlockMutex();
+}
+
+// A tombstone is pushed L0 -> L1 -> L2 (last level, purged) by FADE on the
+// clock alone, without any level becoming saturated.
+TEST_F(DBCompactionTest, FadePersistsTombstoneWithinThreshold) {
+  env_->SetMockSleep();
+  Options options = FadeTestOptions(CurrentOptions(), /*dth=*/1000,
+                                    /*num_levels=*/3);
+  DestroyAndReopen(options);
+
+  const int kNumKeys = 100;
+  for (int i = 0; i < kNumKeys; i++) {
+    ASSERT_OK(Put(Key(i), "value" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_EQ("0,0,1", FilesPerLevel());
+
+  std::atomic<int> fade_compactions{0};
+  std::vector<int> fade_start_levels;
+  SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        Compaction* c = static_cast<Compaction*>(arg);
+        if (c->compaction_reason() == CompactionReason::kFadeTtl) {
+          fade_compactions++;
+          fade_start_levels.push_back(c->start_level());
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Delete half of the keys; tombstones land in an L0 file.
+  for (int i = 0; i < kNumKeys / 2; i++) {
+    ASSERT_OK(Delete(Key(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ("1,0,1", FilesPerLevel());
+  ASSERT_EQ(0, fade_compactions.load());
+
+  uint64_t tombstone_time = 0;
+  {
+    dbfull()->TEST_LockMutex();
+    VersionStorageInfo* vstorage = FadeStorageInfo(db_.get());
+    ASSERT_EQ(1, vstorage->NumLevelFiles(0));
+    tombstone_time = vstorage->LevelFiles(0)[0]->oldest_tombstone_time;
+    // stages {L0, L1}, T = 10: D_0 = 1000 * 9 / 99 = 90, D_1 = 1000
+    EXPECT_EQ(90u, vstorage->FadeLevelDeadline(0));
+    EXPECT_EQ(1000u, vstorage->FadeLevelDeadline(1));
+    dbfull()->TEST_UnlockMutex();
+  }
+  ASSERT_NE(kNoTombstoneTime, tombstone_time);
+
+  // Not yet expired: a flush re-evaluates but schedules nothing.
+  env_->MockSleepForSeconds(60);
+  ASSERT_OK(Put("zz_trigger1", "x"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(0, fade_compactions.load());
+
+  // Past D_0 = 90s: the L0 tombstone file is pushed to L1 with kFadeTtl.
+  env_->MockSleepForSeconds(40);
+  ASSERT_OK(Put("zz_trigger2", "x"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_GE(fade_compactions.load(), 1);
+  ASSERT_EQ(0, fade_start_levels.front());
+  {
+    dbfull()->TEST_LockMutex();
+    VersionStorageInfo* vstorage = FadeStorageInfo(db_.get());
+    // The tombstone age survives the compaction (it is not reset).
+    bool found = false;
+    for (FileMetaData* f : vstorage->LevelFiles(1)) {
+      if (f->oldest_tombstone_time != kNoTombstoneTime) {
+        EXPECT_EQ(tombstone_time, f->oldest_tombstone_time);
+        found = true;
+      }
+    }
+    EXPECT_TRUE(found);
+    dbfull()->TEST_UnlockMutex();
+  }
+
+  // Past D_1 = D_th = 1000s (total age now ~1050s): pushed into L2
+  // (bottommost) and purged.
+  env_->MockSleepForSeconds(950);
+  ASSERT_OK(Put("zz_trigger3", "x"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_GE(fade_compactions.load(), 2);
+  ASSERT_EQ(1, fade_start_levels.back());
+  {
+    dbfull()->TEST_LockMutex();
+    VersionStorageInfo* vstorage = FadeStorageInfo(db_.get());
+    for (int level = 1; level < vstorage->num_levels(); level++) {
+      for (FileMetaData* f : vstorage->LevelFiles(level)) {
+        EXPECT_EQ(kNoTombstoneTime, f->oldest_tombstone_time)
+            << "tombstone left in L" << level;
+      }
+    }
+    EXPECT_TRUE(vstorage->FadeExpiredFiles().empty());
+    dbfull()->TEST_UnlockMutex();
+  }
+
+  for (int i = 0; i < kNumKeys; i++) {
+    if (i < kNumKeys / 2) {
+      ASSERT_EQ("NOT_FOUND", Get(Key(i)));
+    } else {
+      ASSERT_EQ("value" + std::to_string(i), Get(Key(i)));
+    }
+  }
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// With delete_persistence_threshold = 0 (default) nothing changes.
+TEST_F(DBCompactionTest, FadeDisabledByDefault) {
+  env_->SetMockSleep();
+  Options options = FadeTestOptions(CurrentOptions(), /*dth=*/0,
+                                    /*num_levels=*/3);
+  DestroyAndReopen(options);
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put(Key(i), "v"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+
+  std::atomic<int> fade_compactions{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        if (static_cast<Compaction*>(arg)->compaction_reason() ==
+            CompactionReason::kFadeTtl) {
+          fade_compactions++;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  for (int i = 0; i < 50; i++) {
+    ASSERT_OK(Delete(Key(i)));
+  }
+  ASSERT_OK(Flush());
+  env_->MockSleepForSeconds(100000);
+  ASSERT_OK(Put("zz_trigger", "x"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(0, fade_compactions.load());
+  ASSERT_EQ("2,0,1", FilesPerLevel());
+
+  dbfull()->TEST_LockMutex();
+  EXPECT_EQ(0u, FadeStorageInfo(db_.get())->FadeLevelDeadline(0));
+  dbfull()->TEST_UnlockMutex();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// a_max bookkeeping is persisted in the MANIFEST and survives a reopen.
+TEST_F(DBCompactionTest, FadeTombstoneTimeSurvivesReopen) {
+  env_->SetMockSleep();
+  Options options = FadeTestOptions(CurrentOptions(), /*dth=*/1000,
+                                    /*num_levels=*/3);
+  DestroyAndReopen(options);
+  ASSERT_OK(Put(Key(1), "v"));
+  ASSERT_OK(Flush());  // file without tombstones
+  ASSERT_OK(Delete(Key(1)));
+  ASSERT_OK(Flush());  // file with a tombstone
+
+  auto collect = [&]() {
+    std::vector<uint64_t> times;
+    dbfull()->TEST_LockMutex();
+    for (FileMetaData* f : FadeStorageInfo(db_.get())->LevelFiles(0)) {
+      times.push_back(f->oldest_tombstone_time);
+    }
+    dbfull()->TEST_UnlockMutex();
+    std::sort(times.begin(), times.end());
+    return times;
+  };
+  std::vector<uint64_t> before = collect();
+  ASSERT_EQ(2u, before.size());
+  ASSERT_EQ(kNoTombstoneTime, before[0]);
+  ASSERT_NE(kNoTombstoneTime, before[1]);
+
+  Reopen(options);
+  ASSERT_EQ(before, collect());
+}
+
+TEST_F(DBCompactionTest, FadeThresholdIsDynamic) {
+  Options options = FadeTestOptions(CurrentOptions(), /*dth=*/0,
+                                    /*num_levels=*/3);
+  DestroyAndReopen(options);
+  ASSERT_OK(dbfull()->SetOptions({{"delete_persistence_threshold", "3600"}}));
+  ASSERT_EQ(3600u, dbfull()->GetOptions().delete_persistence_threshold);
+}
+
+// FADE goes ahead of size-triggered compactions only while no level's
+// compaction score has reached 1.5; past that, the size-based compaction of
+// the saturated level goes first, so FADE cannot starve it.
+TEST_F(DBCompactionTest, FadeYieldsToSaturatedLevel) {
+  struct Case {
+    int num_l0_files;  // L0 score = num_l0_files / 2
+    CompactionReason expected_first_reason;
+    int expected_first_start_level;
+  };
+  const Case kCases[] = {
+      {2, CompactionReason::kFadeTtl, 1},          // score 1.0: FADE first
+      {3, CompactionReason::kLevelL0FilesNum, 0},  // score 1.5: size first
+  };
+  for (const Case& tc : kCases) {
+    SCOPED_TRACE("num_l0_files=" + std::to_string(tc.num_l0_files));
+    env_->SetMockSleep();
+    Options options = FadeTestOptions(CurrentOptions(), /*dth=*/1000,
+                                      /*num_levels=*/3);
+    options.level0_file_num_compaction_trigger = 2;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+
+    for (int i = 0; i < 100; i++) {
+      ASSERT_OK(Put(Key(i), "v"));
+    }
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(2);
+    for (int i = 0; i < 50; i++) {
+      ASSERT_OK(Delete(Key(i)));
+    }
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(1);
+    ASSERT_EQ("0,1,1", FilesPerLevel());
+
+    // Expire the L1 tombstone file (D_1 = D_th = 1000s), then build up L0
+    // with files that hold no tombstones (not FADE candidates themselves).
+    env_->MockSleepForSeconds(2000);
+    for (int f = 0; f < tc.num_l0_files; f++) {
+      ASSERT_OK(Put("zz" + std::to_string(f), "x"));
+      ASSERT_OK(Flush());
+    }
+    {
+      dbfull()->TEST_LockMutex();
+      VersionStorageInfo* vstorage = FadeStorageInfo(db_.get());
+      ASSERT_EQ(1u, vstorage->FadeExpiredFiles().size());
+      ASSERT_EQ(1, vstorage->FadeExpiredFiles()[0].first);
+      dbfull()->TEST_UnlockMutex();
+    }
+
+    std::vector<std::pair<CompactionReason, int>> picked;
+    SyncPoint::GetInstance()->SetCallBack(
+        "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+          Compaction* c = static_cast<Compaction*>(arg);
+          if (c != nullptr) {
+            picked.emplace_back(c->compaction_reason(), c->start_level());
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    ASSERT_OK(dbfull()->SetOptions({{"disable_auto_compactions", "false"}}));
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    ASSERT_FALSE(picked.empty());
+    EXPECT_EQ(tc.expected_first_reason, picked.front().first);
+    EXPECT_EQ(tc.expected_first_start_level, picked.front().second);
+    // Either way the expired tombstones are eventually pushed down and
+    // purged.
+    bool fade_from_l1 = false;
+    for (const std::pair<CompactionReason, int>& p : picked) {
+      fade_from_l1 |= p.first == CompactionReason::kFadeTtl && p.second == 1;
+    }
+    EXPECT_TRUE(fade_from_l1);
+    {
+      dbfull()->TEST_LockMutex();
+      VersionStorageInfo* vstorage = FadeStorageInfo(db_.get());
+      for (FileMetaData* f : vstorage->LevelFiles(2)) {
+        EXPECT_EQ(kNoTombstoneTime, f->oldest_tombstone_time);
+      }
+      dbfull()->TEST_UnlockMutex();
+    }
+    for (int i = 0; i < 50; i++) {
+      ASSERT_EQ("NOT_FOUND", Get(Key(i)));
+    }
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

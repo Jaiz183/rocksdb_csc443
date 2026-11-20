@@ -229,6 +229,7 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
       insert_with_hint_prefix_extractor_(
           ioptions.memtable_insert_with_hint_prefix_extractor.get()),
       oldest_key_time_(std::numeric_limits<uint64_t>::max()),
+      oldest_tombstone_time_(std::numeric_limits<uint64_t>::max()),
       approximate_memory_usage_(0),
       memtable_max_range_deletions_(
           mutable_cf_options.memtable_max_range_deletions),
@@ -398,6 +399,22 @@ void MemTable::UpdateOldestKeyTime() {
       // If fail, the timestamp is already set.
       oldest_key_time_.compare_exchange_strong(
           oldest_key_time, static_cast<uint64_t>(current_time),
+          std::memory_order_relaxed, std::memory_order_relaxed);
+    }
+  }
+}
+
+void MemTable::UpdateOldestTombstoneTime() {
+  // Same pattern as UpdateOldestKeyTime(): only the first tombstone pays for a
+  // clock read; every later tombstone is a single relaxed load.
+  uint64_t oldest = oldest_tombstone_time_.load(std::memory_order_relaxed);
+  if (oldest == std::numeric_limits<uint64_t>::max()) {
+    int64_t current_time = 0;
+    auto s = clock_->GetCurrentTime(&current_time);
+    if (s.ok()) {
+      assert(current_time >= 0);
+      oldest_tombstone_time_.compare_exchange_strong(
+          oldest, static_cast<uint64_t>(current_time),
           std::memory_order_relaxed, std::memory_order_relaxed);
     }
   }
@@ -1295,6 +1312,10 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
     is_range_del_table_empty_.StoreRelaxed(false);
   }
   UpdateOldestKeyTime();
+  if (type == kTypeDeletion || type == kTypeSingleDeletion ||
+      type == kTypeDeletionWithTimestamp || type == kTypeRangeDeletion) {
+    UpdateOldestTombstoneTime();
+  }
   TEST_SYNC_POINT_CALLBACK("MemTable::Add:BeforeReturn:Encoded", &encoded);
   return Status::OK();
 }

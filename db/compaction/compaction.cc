@@ -592,6 +592,13 @@ bool Compaction::IsTrivialMove() const {
     return false;
   }
 
+  if (compaction_reason_ == CompactionReason::kFadeTtl && bottommost_level_) {
+    // [FADE] Moving a file with expired tombstones into the bottommost level
+    // without rewriting it would keep the tombstones (and the data they
+    // invalidate) alive. The rewrite is what persists the delete.
+    return false;
+  }
+
   // Used in universal compaction, where trivial move can be done if the
   // input files are non overlapping
   if ((mutable_cf_options_.compaction_options_universal.allow_trivial_move) &&
@@ -1044,6 +1051,28 @@ uint64_t Compaction::MinInputFileOldestAncestorTime(
     }
   }
   return min_oldest_ancestor_time;
+}
+
+uint64_t Compaction::MinInputFileOldestTombstoneTime(
+    const InternalKey* start, const InternalKey* end) const {
+  uint64_t min_tombstone_time = std::numeric_limits<uint64_t>::max();
+  const InternalKeyComparator& icmp =
+      column_family_data()->internal_comparator();
+  for (const auto& level_files : inputs_) {
+    for (const auto& file : level_files.files) {
+      if (start != nullptr && icmp.Compare(file->largest, *start) < 0) {
+        continue;
+      }
+      if (end != nullptr && icmp.Compare(file->smallest, *end) > 0) {
+        continue;
+      }
+      uint64_t t = file->TryGetOldestTombstoneTime();
+      if (t != kNoTombstoneTime) {
+        min_tombstone_time = std::min(min_tombstone_time, t);
+      }
+    }
+  }
+  return min_tombstone_time;
 }
 
 uint64_t Compaction::MinInputFileEpochNumber() const {

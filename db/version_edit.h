@@ -121,6 +121,9 @@ enum NewFileCustomTag : uint32_t {
   kFileOpenMetadata = 17,
   kDbOwnershipStartTime = 18,
   kDataFileProvenance = 19,
+  // [FADE / Lethe] Unix time of the oldest (point or range) tombstone in the
+  // file. Safe to ignore by older readers (bit 6 not set).
+  kOldestTombstoneTime = 20,
 
   // If this bit for the custom tag is set, opening DB should fail if
   // we don't know this field.
@@ -137,6 +140,8 @@ constexpr uint64_t kUnknownOldestAncestorTime = 0;
 constexpr uint64_t kUnknownNewestKeyTime = 0;
 constexpr uint64_t kUnknownFileCreationTime = 0;
 constexpr uint64_t kUnknownDbOwnershipStartTime = 0;
+// [FADE] 0 means the file holds no tombstones (or the time is unknown).
+constexpr uint64_t kNoTombstoneTime = 0;
 constexpr uint64_t kUnknownEpochNumber = 0;
 // If `Options::cf_allow_ingest_behind` is true, this epoch number
 // will be dedicated to files ingested behind.
@@ -332,6 +337,21 @@ struct FileMetaData {
   // 0 means the information is not available.
   uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
 
+  // [FADE / Lethe] Unix time (seconds) at which the oldest point or range
+  // tombstone contained in this file was inserted into the memtable. This is
+  // the paper's a_max expressed as an absolute time: a_max = now - this value.
+  //
+  // - Flush output: earliest tombstone insertion time over the flushed
+  //   memtables (tracked in MemTable::Add).
+  // - Compaction output: min over the input files that carry tombstones, if
+  //   the output file itself still contains tombstones (conservative: it may
+  //   over-estimate a_max, never under-estimate it, so D_th still holds).
+  // - Trivial move / manifest rewrite: carried over unchanged.
+  //
+  // kNoTombstoneTime (0) means no tombstones or unknown. Persisted in the
+  // MANIFEST under NewFileCustomTag::kOldestTombstoneTime.
+  uint64_t oldest_tombstone_time = kNoTombstoneTime;
+
   // Unix time when the SST file's contents were built (by flush or
   // compaction, in this DB or another, or by SstFileWriter). Preserved when
   // the file is moved between levels or copied to another temperature.
@@ -453,6 +473,27 @@ struct FileMetaData {
     }
     return kUnknownOldestAncestorTime;
   }
+
+  // [FADE] Best-known insertion time of the oldest tombstone in this file.
+  // Falls back to the oldest ancestor time (never newer than any entry in the
+  // file) for files that hold tombstones but predate FADE bookkeeping.
+  // Returns kNoTombstoneTime (0) if the file has no known tombstones.
+  uint64_t TryGetOldestTombstoneTime() {
+    if (oldest_tombstone_time != kNoTombstoneTime) {
+      return oldest_tombstone_time;
+    }
+    if (num_deletions > 0 || num_range_deletions > 0) {
+      return TryGetOldestAncestorTime();
+    }
+    return kNoTombstoneTime;
+  }
+
+  // [FADE] The paper's b_f: estimated number of entries invalidated by this
+  // file's tombstones. RocksDB's num_deletions already includes range
+  // deletions; we use it directly as p_f + (number of range tombstones),
+  // i.e. each range tombstone is counted as invalidating one entry because we
+  // have no cheap system-wide key histogram (see report for discussion).
+  uint64_t FadeInvalidatedEntriesEstimate() const { return num_deletions; }
 
   uint64_t TryGetFileCreationTime() {
     if (file_creation_time != kUnknownFileCreationTime) {

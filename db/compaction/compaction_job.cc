@@ -170,6 +170,8 @@ const char* GetCompactionReasonString(CompactionReason compaction_reason) {
       return "RefitLevel";
     case CompactionReason::kReadTriggered:
       return "ReadTriggered";
+    case CompactionReason::kFadeTtl:
+      return "FadeTtl";
     case CompactionReason::kNumOfReasons:
       // fall through
     default:
@@ -2438,6 +2440,29 @@ Status CompactionJob::FinishCompactionOutputFile(
         }
       }
     }
+
+    // [FADE] Carry a_max forward. If tombstones survived into this output
+    // file, it inherits the oldest tombstone time of the overlapping inputs.
+    // This is conservative (it may pick a tombstone that was actually
+    // dropped), so FADE can only compact earlier than strictly needed, never
+    // later. If no tombstones survived (e.g. bottommost compaction), clear it.
+    const TableProperties tp = outputs.GetTableProperties();
+    meta->oldest_tombstone_time = kNoTombstoneTime;
+    if (tp.num_deletions > 0 || tp.num_range_deletions > 0) {
+      uint64_t t = sub_compact->compaction->MinInputFileOldestTombstoneTime(
+          meta->smallest.size() > 0 ? &(meta->smallest) : nullptr,
+          meta->largest.size() > 0 ? &(meta->largest) : nullptr);
+      if (t != std::numeric_limits<uint64_t>::max()) {
+        meta->oldest_tombstone_time = t;
+      } else {
+        // Inputs had no recorded tombstone time; fall back to the oldest
+        // ancestor time, which is never newer than any entry in the file.
+        meta->oldest_tombstone_time = meta->oldest_ancestor_time;
+      }
+    }
+    TEST_SYNC_POINT_CALLBACK(
+        "CompactionJob::FinishCompactionOutputFile:oldest_tombstone_time",
+        &meta->oldest_tombstone_time);
   }
 
   // Finish and check for file errors

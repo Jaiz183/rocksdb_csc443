@@ -211,6 +211,7 @@ void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
           f.file_open_metadata);
   FileMetaData& added = new_files_.back().second;
   added.db_ownership_start_time = f.db_ownership_start_time;
+  added.oldest_tombstone_time = f.oldest_tombstone_time;
   added.data_file_provenance = f.data_file_provenance | provenance_flags_to_set;
 }
 
@@ -515,6 +516,12 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     PutVarint32(&varint_data_file_provenance, f.data_file_provenance);
     PutLengthPrefixedSlice(dst, Slice(varint_data_file_provenance));
   }
+  if (f.oldest_tombstone_time != kNoTombstoneTime) {
+    PutVarint32(dst, NewFileCustomTag::kOldestTombstoneTime);
+    std::string varint_oldest_tombstone_time;
+    PutVarint64(&varint_oldest_tombstone_time, f.oldest_tombstone_time);
+    PutLengthPrefixedSlice(dst, Slice(varint_oldest_tombstone_time));
+  }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
 
@@ -671,6 +678,11 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
         case kDataFileProvenance:
           if (!GetVarint32(&field, &f.data_file_provenance)) {
             return "invalid data file provenance";
+          }
+          break;
+        case kOldestTombstoneTime:
+          if (!GetVarint64(&field, &f.oldest_tombstone_time)) {
+            return "invalid oldest tombstone time";
           }
           break;
         default:
@@ -1179,6 +1191,10 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     AppendNumberTo(&r, f.file_creation_time);
     r.append(" epoch_number:");
     AppendNumberTo(&r, f.epoch_number);
+    if (f.oldest_tombstone_time != kNoTombstoneTime) {
+      r.append(" oldest_tombstone_time:");
+      AppendNumberTo(&r, f.oldest_tombstone_time);
+    }
     if (f.db_ownership_start_time != kUnknownDbOwnershipStartTime) {
       r.append(" db_ownership_start_time:");
       AppendNumberTo(&r, f.db_ownership_start_time);

@@ -92,6 +92,7 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       report_bg_io_stats(options.report_bg_io_stats),
       disallow_memtable_writes(options.disallow_memtable_writes),
       ttl(options.ttl),
+      delete_persistence_threshold(options.delete_persistence_threshold),
       periodic_compaction_seconds(options.periodic_compaction_seconds),
       sample_for_compression(options.sample_for_compression),
       last_level_temperature(options.last_level_temperature),
@@ -423,6 +424,9 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    disallow_memtable_writes);
   ROCKS_LOG_HEADER(log, "                              Options.ttl: %" PRIu64,
                    ttl);
+  ROCKS_LOG_HEADER(log,
+                   "             Options.delete_persistence_threshold: %" PRIu64,
+                   delete_persistence_threshold);
   ROCKS_LOG_HEADER(log,
                    "         Options.periodic_compaction_seconds: %" PRIu64,
                    periodic_compaction_seconds);

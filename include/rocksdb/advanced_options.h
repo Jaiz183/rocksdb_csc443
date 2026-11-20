@@ -893,6 +893,33 @@ struct AdvancedColumnFamilyOptions {
   // instead.
   uint64_t ttl = 0xfffffffffffffffe;
 
+  // [FADE, from "Lethe: A Tunable Delete-Aware LSM Engine" (SIGMOD'20)]
+  // Delete persistence threshold D_th, in seconds. When non-zero (and
+  // compaction_style == kCompactionStyleLevel), RocksDB guarantees on a
+  // best-effort basis that every point/range tombstone reaches the last
+  // non-empty level (where it is purged) within D_th seconds of being written.
+  //
+  // D_th is split into exponentially growing per-level TTLs
+  //   d_0 = D_th * (T - 1) / (T^n - 1),  d_i = T * d_{i-1}
+  // where T = max_bytes_for_level_multiplier and n is the number of levels a
+  // tombstone has to leave (L0 and base_level .. last_non_empty_level - 1).
+  // A file at stage i whose oldest tombstone is older than d_0 + ... + d_i is
+  // compacted into the next level with CompactionReason::kFadeTtl. Among such
+  // files, the smallest level wins, then the oldest tombstone, then the most
+  // tombstones (FADE's DD mode). These compactions run ahead of
+  // size-triggered compactions only while every level's compaction score is
+  // below 1.5. Beyond that, size-triggered compactions choose the level first
+  // (preferring a file with expired tombstones within it), so that FADE
+  // cannot starve them and let the tree's shape degrade.
+  //
+  // Like `ttl`, expiry is only evaluated when a new Version is installed (on
+  // flush/compaction) so an idle DB will not act on expired files.
+  //
+  // unit: seconds. 0 disables FADE (default).
+  //
+  // Dynamically changeable through SetOptions() API
+  uint64_t delete_persistence_threshold = 0;
+
   // This option has different meanings for different compaction styles:
   //
   // Leveled: files older than `periodic_compaction_seconds` will be picked up

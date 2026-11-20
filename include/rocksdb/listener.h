@@ -160,6 +160,10 @@ enum class CompactionReason : int {
   kRefitLevel,
   // Compaction triggered by high read frequency on SST files
   kReadTriggered,
+  // [FADE / Lethe, SIGMOD'20] Delete-driven compaction: a file holds a
+  // tombstone older than its level's cumulative TTL derived from
+  // delete_persistence_threshold.
+  kFadeTtl,
   // total number of compaction reasons, new reasons must be added above this.
   kNumOfReasons,
 };

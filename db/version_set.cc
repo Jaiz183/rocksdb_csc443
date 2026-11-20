@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <list>
 #include <map>
@@ -3971,6 +3972,7 @@ void VersionStorageInfo::ComputeCompactionScore(
           immutable_options.allow_ingest_behind,
       immutable_options.user_comparator, full_history_ts_low);
   ComputeExpiredTtlFiles(immutable_options, mutable_cf_options.ttl);
+  ComputeFadeExpiredFiles(immutable_options, mutable_cf_options);
   ComputeFilesMarkedForPeriodicCompaction(
       immutable_options, mutable_cf_options.periodic_compaction_seconds,
       max_output_level);
@@ -3988,7 +3990,8 @@ void VersionStorageInfo::ComputeCompactionScore(
 void VersionStorageInfo::RemoveFilesBeingCompactedFromCompactionCandidates() {
   for (auto* candidates :
        {&files_marked_for_compaction_, &bottommost_files_marked_for_compaction_,
-        &expired_ttl_files_, &files_marked_for_periodic_compaction_,
+        &expired_ttl_files_, &fade_expired_files_,
+        &files_marked_for_periodic_compaction_,
         &files_marked_for_forced_blob_gc_, &read_triggered_compaction_files_}) {
     const size_t remaining =
         std::remove_if(candidates->begin(), candidates->end(),
@@ -4061,6 +4064,127 @@ void VersionStorageInfo::ComputeExpiredTtlFiles(
         }
       }
     }
+  }
+}
+
+// [FADE] Lethe (SIGMOD'20) Sec. 4.1.
+//
+// Level mapping. The paper's tree has a memory buffer ("level 0") followed by
+// disk levels, and every level i gets a TTL d_i with sum(d_i) = D_th. In
+// RocksDB a tombstone travels memtable -> L0 -> base_level -> ... -> last
+// non-empty level, where the compaction that brings it there purges it. We
+// therefore assign one TTL *stage* to every level a tombstone still has to
+// leave:
+//   stage 0       : L0 (the memtable's residency is folded into this stage,
+//                   because the tombstone's clock starts at memtable insert)
+//   stage 1..n-1  : base_level .. last_non_empty_level - 1
+// Levels 1..base_level-1 are always empty under dynamic level sizing and get
+// no stage. The last non-empty level gets no stage either.
+//
+// With size ratio T and n stages:
+//   d_0 = D_th * (T - 1) / (T^n - 1),  d_k = T * d_{k-1}
+// and, since a_max is measured from the tombstone's insertion (not from when
+// it arrived at the current level), the trigger compares a_max against the
+// cumulative deadline
+//   D_k = d_0 + ... + d_k = D_th * (T^(k+1) - 1) / (T^n - 1),   D_{n-1} = D_th
+// This matches the cumulative d[i] in the pseudo-code of the paper's Fig. 4.
+//
+// The stages are recomputed whenever a Version is built (i.e. after every
+// flush and compaction), which covers "recompute d_i when the tree grows".
+void VersionStorageInfo::ComputeFadeExpiredFiles(
+    const ImmutableOptions& ioptions,
+    const MutableCFOptions& mutable_cf_options) {
+  fade_expired_files_.clear();
+  fade_level_deadline_.assign(num_levels(), 0);
+  const uint64_t dth = mutable_cf_options.delete_persistence_threshold;
+  if (dth == 0 || compaction_style_ != CompactionStyle::kCompactionStyleLevel ||
+      num_levels() < 2) {
+    return;
+  }
+
+  int64_t _current_time;
+  auto status = ioptions.clock->GetCurrentTime(&_current_time);
+  if (!status.ok()) {
+    return;
+  }
+  const uint64_t current_time = static_cast<uint64_t>(_current_time);
+
+  // Last non-empty level: tombstones are purged on the way into it.
+  int last_level = 0;
+  for (int level = num_levels() - 1; level > 0; level--) {
+    if (!files_[level].empty()) {
+      last_level = level;
+      break;
+    }
+  }
+
+  // Levels governed by FADE, in stage order.
+  std::vector<int> stage_levels;
+  stage_levels.push_back(0);
+  if (last_level > 0) {
+    for (int level = std::max(1, base_level_); level < last_level; level++) {
+      stage_levels.push_back(level);
+    }
+  }
+  const int n = static_cast<int>(stage_levels.size());
+
+  const double t = mutable_cf_options.max_bytes_for_level_multiplier;
+  for (int k = 0; k < n; k++) {
+    double cumulative;
+    if (t > 1.0) {
+      cumulative = static_cast<double>(dth) * (std::pow(t, k + 1) - 1.0) /
+                   (std::pow(t, n) - 1.0);
+    } else {
+      // Degenerate size ratio: fall back to the uniform split D_th / n.
+      cumulative = static_cast<double>(dth) * (k + 1) / n;
+    }
+    // Never 0 (0 means "not governed") and never above D_th.
+    uint64_t deadline = static_cast<uint64_t>(cumulative);
+    deadline = std::min<uint64_t>(std::max<uint64_t>(deadline, 1), dth);
+    fade_level_deadline_[stage_levels[k]] = deadline;
+  }
+  // Guarantee the final stage is exactly D_th despite rounding.
+  fade_level_deadline_[stage_levels[n - 1]] = dth;
+
+  for (int level : stage_levels) {
+    const uint64_t deadline = fade_level_deadline_[level];
+    for (FileMetaData* f : files_[level]) {
+      if (f->being_compacted) {
+        continue;
+      }
+      const uint64_t tombstone_time = f->TryGetOldestTombstoneTime();
+      if (tombstone_time == kNoTombstoneTime ||
+          tombstone_time > current_time) {
+        continue;
+      }
+      // a_max = now - tombstone_time
+      if (current_time - tombstone_time > deadline) {
+        fade_expired_files_.emplace_back(level, f);
+      }
+    }
+  }
+
+  // DD-mode ordering: smallest level first (avoid write stalls), then the
+  // file with the oldest tombstone, then the file with the largest b_f.
+  std::vector<std::pair<int, FileMetaData*>> sorted(
+      fade_expired_files_.begin(), fade_expired_files_.end());
+  std::sort(sorted.begin(), sorted.end(),
+            [](const std::pair<int, FileMetaData*>& a,
+               const std::pair<int, FileMetaData*>& b) {
+              if (a.first != b.first) {
+                return a.first < b.first;
+              }
+              const uint64_t ta = a.second->TryGetOldestTombstoneTime();
+              const uint64_t tb = b.second->TryGetOldestTombstoneTime();
+              if (ta != tb) {
+                return ta < tb;
+              }
+              return a.second->FadeInvalidatedEntriesEstimate() >
+                     b.second->FadeInvalidatedEntriesEstimate();
+            });
+  fade_expired_files_.clear();
+  for (const auto& level_file : sorted) {
+    fade_expired_files_.push_back(level_file);
   }
 }
 

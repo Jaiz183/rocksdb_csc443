@@ -152,6 +152,7 @@ struct MutableCFOptions {
         max_bytes_for_level_base(options.max_bytes_for_level_base),
         max_bytes_for_level_multiplier(options.max_bytes_for_level_multiplier),
         ttl(options.ttl),
+        delete_persistence_threshold(options.delete_persistence_threshold),
         periodic_compaction_seconds(options.periodic_compaction_seconds),
         read_triggered_compaction_threshold(
             options.read_triggered_compaction_threshold),
@@ -235,6 +236,7 @@ struct MutableCFOptions {
         max_bytes_for_level_base(0),
         max_bytes_for_level_multiplier(0),
         ttl(0),
+        delete_persistence_threshold(0),
         periodic_compaction_seconds(0),
         read_triggered_compaction_threshold(0.0),
         compaction_options_fifo(),
@@ -339,6 +341,7 @@ struct MutableCFOptions {
   uint64_t max_bytes_for_level_base;
   double max_bytes_for_level_multiplier;
   uint64_t ttl;
+  uint64_t delete_persistence_threshold;  // [FADE] D_th, 0 = disabled
   uint64_t periodic_compaction_seconds;
   double read_triggered_compaction_threshold;
   std::vector<int> max_bytes_for_level_multiplier_additional;
