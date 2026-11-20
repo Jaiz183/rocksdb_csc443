@@ -1,0 +1,234 @@
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench_main label=nodel_main put_frac=1.0
+== nodel_main dth=0 ==
+ops put=1200100 del=0 rdel=0 wall=60.0s thr=20000 ops/s cpu=27.2s (22.65 us/op)
+io flush_w=153.4MB comp_w=1150.0MB comp_r=1283.4MB wal=171.6MB user=153.6MB WA=8.48
+compactions L0FilesNum:55/0tm LevelMaxSize:244/27tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=0.0s max_age(read/idle)=0.0s viol_samples=0/237 avg_live=0 max_live=0 final_live=0
+space sst=145.6MB logical=128.0MB SA=1.137
+reads gets=276140/s scans=40722/s (100.0 keys/scan) cpu=10.0s tomb_skipped=0 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=nodel put_frac=1.0 dth=0
+== nodel dth=0 ==
+ops put=1200100 del=0 rdel=0 wall=60.0s thr=20001 ops/s cpu=27.2s (22.69 us/op)
+io flush_w=153.4MB comp_w=1150.0MB comp_r=1283.4MB wal=171.6MB user=153.6MB WA=8.48
+compactions L0FilesNum:55/0tm LevelMaxSize:244/27tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=0.0s max_age(read/idle)=0.0s viol_samples=0/237 avg_live=0 max_live=0 final_live=0
+space sst=145.6MB logical=128.0MB SA=1.137
+reads gets=280300/s scans=39871/s (100.0 keys/scan) cpu=10.0s tomb_skipped=0 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=nodel put_frac=1.0 dth=20
+== nodel dth=20 ==
+ops put=1200100 del=0 rdel=0 wall=60.0s thr=20001 ops/s cpu=27.3s (22.77 us/op)
+io flush_w=153.4MB comp_w=1150.0MB comp_r=1283.4MB wal=171.6MB user=153.6MB WA=8.48
+compactions L0FilesNum:55/0tm LevelMaxSize:244/27tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=0.0s max_age(read/idle)=0.0s viol_samples=0/237 avg_live=0 max_live=0 final_live=0
+space sst=145.6MB logical=128.0MB SA=1.137
+reads gets=274560/s scans=40321/s (100.0 keys/scan) cpu=10.0s tomb_skipped=0 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench_main label=del10_main put_frac=0.9
+== del10_main dth=0 ==
+ops put=1079571 del=120529 rdel=0 wall=60.0s thr=20001 ops/s cpu=27.3s (22.74 us/op)
+io flush_w=139.7MB comp_w=1045.4MB comp_r=1175.3MB wal=158.0MB user=140.1MB WA=8.46
+compactions L0FilesNum:53/0tm LevelMaxSize:234/28tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=36.2s max_age(read/idle)=36.5s viol_samples=0/237 avg_live=12711 max_live=17254 final_live=13298
+space sst=135.3MB logical=119.0MB SA=1.137
+reads gets=295080/s scans=41196/s (100.0 keys/scan) cpu=10.0s tomb_skipped=308433 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=del10 put_frac=0.9 dth=0
+== del10 dth=0 ==
+ops put=1079571 del=120529 rdel=0 wall=60.0s thr=20001 ops/s cpu=27.5s (22.89 us/op)
+io flush_w=139.7MB comp_w=1045.4MB comp_r=1175.3MB wal=158.0MB user=140.1MB WA=8.46
+compactions L0FilesNum:53/0tm LevelMaxSize:234/28tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=36.2s max_age(read/idle)=36.5s viol_samples=0/237 avg_live=12737 max_live=17535 final_live=13298
+space sst=135.3MB logical=119.0MB SA=1.137
+reads gets=295140/s scans=41149/s (100.0 keys/scan) cpu=10.0s tomb_skipped=308101 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=del10 put_frac=0.9 dth=40
+== del10 dth=40 ==
+ops put=1079571 del=120529 rdel=0 wall=60.0s thr=20001 ops/s cpu=27.5s (22.89 us/op)
+io flush_w=139.7MB comp_w=1119.4MB comp_r=1254.5MB wal=158.0MB user=140.1MB WA=8.99
+compactions FadeTtl:78/8tm L0FilesNum:48/0tm LevelMaxSize:169/17tm | fade=78 fade_w=336.5MB
+tombstones max_age(write)=33.5s max_age(read/idle)=24.5s viol_samples=0/237 avg_live=11832 max_live=16708 final_live=9065
+space sst=130.0MB logical=119.0MB SA=1.092
+reads gets=315840/s scans=48021/s (100.0 keys/scan) cpu=10.0s tomb_skipped=260807 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=del10 put_frac=0.9 dth=20
+== del10 dth=20 ==
+ops put=1079571 del=120529 rdel=0 wall=60.0s thr=20001 ops/s cpu=25.7s (21.42 us/op)
+io flush_w=139.7MB comp_w=1352.0MB comp_r=1486.1MB wal=158.0MB user=140.1MB WA=10.65
+compactions FadeTtl:116/3tm L0FilesNum:49/2tm LevelMaxSize:151/17tm | fade=116 fade_w=784.2MB
+tombstones max_age(write)=21.5s max_age(read/idle)=30.9s viol_samples=14/237 avg_live=9760 max_live=14315 final_live=10075
+space sst=131.0MB logical=119.0MB SA=1.100
+reads gets=289580/s scans=44441/s (100.0 keys/scan) cpu=10.0s tomb_skipped=262120 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=del10 put_frac=0.9 dth=10
+== del10 dth=10 ==
+ops put=1079571 del=120529 rdel=0 wall=60.0s thr=20001 ops/s cpu=24.9s (20.74 us/op)
+io flush_w=139.7MB comp_w=1413.5MB comp_r=1544.6MB wal=158.0MB user=140.1MB WA=11.09
+compactions FadeTtl:140/10tm L0FilesNum:49/0tm LevelMaxSize:134/17tm | fade=140 fade_w=1006.4MB
+tombstones max_age(write)=11.8s max_age(read/idle)=19.5s viol_samples=36/237 avg_live=8617 max_live=14436 final_live=12563
+space sst=134.1MB logical=119.0MB SA=1.127
+reads gets=286820/s scans=38306/s (100.0 keys/scan) cpu=10.0s tomb_skipped=274218 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench_main label=del25_main put_frac=0.75
+== del25_main dth=0 ==
+ops put=899988 del=300012 rdel=0 wall=60.0s thr=19999 ops/s cpu=21.3s (17.76 us/op)
+io flush_w=119.0MB comp_w=866.4MB comp_r=991.0MB wal=137.7MB user=120.0MB WA=8.21
+compactions L0FilesNum:50/0tm LevelMaxSize:221/29tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=36.1s max_age(read/idle)=34.5s viol_samples=0/237 avg_live=35615 max_live=50330 final_live=31540
+space sst=119.8MB logical=105.7MB SA=1.134
+reads gets=304060/s scans=42688/s (100.0 keys/scan) cpu=10.0s tomb_skipped=873685 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=del25 put_frac=0.75 dth=0
+== del25 dth=0 ==
+ops put=900066 del=300034 rdel=0 wall=60.0s thr=20001 ops/s cpu=24.9s (20.73 us/op)
+io flush_w=119.0MB comp_w=866.4MB comp_r=991.0MB wal=137.7MB user=120.0MB WA=8.21
+compactions L0FilesNum:50/0tm LevelMaxSize:221/29tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=36.1s max_age(read/idle)=34.5s viol_samples=0/237 avg_live=35607 max_live=50330 final_live=31540
+space sst=119.8MB logical=105.7MB SA=1.134
+reads gets=320100/s scans=43211/s (100.0 keys/scan) cpu=10.0s tomb_skipped=884662 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=del25 put_frac=0.75 dth=20
+== del25 dth=20 ==
+ops put=900066 del=300034 rdel=0 wall=60.0s thr=20001 ops/s cpu=23.5s (19.54 us/op)
+io flush_w=119.0MB comp_w=1194.4MB comp_r=1319.4MB wal=137.7MB user=120.0MB WA=10.94
+compactions FadeTtl:113/7tm L0FilesNum:41/2tm LevelMaxSize:143/17tm | fade=113 fade_w=740.0MB
+tombstones max_age(write)=21.3s max_age(read/idle)=28.9s viol_samples=12/237 avg_live=24851 max_live=37834 final_live=30832
+space sst=119.4MB logical=105.7MB SA=1.130
+reads gets=285720/s scans=40542/s (100.0 keys/scan) cpu=10.0s tomb_skipped=813738 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench_main label=rdel_main put_frac=0.9 range_del_frac=0.01
+== rdel_main dth=0 ==
+ops put=1079571 del=108451 rdel=12078 wall=60.0s thr=20001 ops/s cpu=23.2s (19.37 us/op)
+io flush_w=138.9MB comp_w=1406.7MB comp_r=1599.1MB wal=158.2MB user=140.3MB WA=11.02
+compactions L0FilesNum:68/0tm LevelMaxSize:244/38tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=15.3s max_age(read/idle)=16.8s viol_samples=0/237 avg_live=5410 max_live=8633 final_live=4618
+space sst=70.4MB logical=64.3MB SA=1.095
+reads gets=416900/s scans=47439/s (100.0 keys/scan) cpu=10.0s tomb_skipped=256233 rdel_reseeks=92226
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=rdel put_frac=0.9 range_del_frac=0.01 dth=0
+== rdel dth=0 ==
+ops put=1079571 del=108451 rdel=12078 wall=60.0s thr=20000 ops/s cpu=22.1s (18.42 us/op)
+io flush_w=138.9MB comp_w=1406.7MB comp_r=1599.1MB wal=158.2MB user=140.3MB WA=11.02
+compactions L0FilesNum:68/0tm LevelMaxSize:244/38tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=15.2s max_age(read/idle)=16.7s viol_samples=0/237 avg_live=5393 max_live=8633 final_live=4618
+space sst=70.4MB logical=64.3MB SA=1.095
+reads gets=423180/s scans=47810/s (100.0 keys/scan) cpu=10.0s tomb_skipped=258614 rdel_reseeks=92739
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=rdel put_frac=0.9 range_del_frac=0.01 dth=20
+== rdel dth=20 ==
+ops put=1079571 del=108451 rdel=12078 wall=60.0s thr=20000 ops/s cpu=20.8s (17.32 us/op)
+io flush_w=138.9MB comp_w=1685.6MB comp_r=1878.6MB wal=158.2MB user=140.3MB WA=13.00
+compactions FadeTtl:79/16tm L0FilesNum:69/2tm LevelMaxSize:206/23tm | fade=79 fade_w=229.2MB
+tombstones max_age(write)=17.3s max_age(read/idle)=15.3s viol_samples=0/237 avg_live=4679 max_live=7922 final_live=4127
+space sst=69.7MB logical=64.3MB SA=1.085
+reads gets=406200/s scans=48085/s (100.0 keys/scan) cpu=10.0s tomb_skipped=241576 rdel_reseeks=69893
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench_main label=skew_main put_frac=0.9 hot_frac=0.1
+== skew_main dth=0 ==
+ops put=1080274 del=119826 rdel=0 wall=60.0s thr=20001 ops/s cpu=23.2s (19.31 us/op)
+io flush_w=133.7MB comp_w=703.6MB comp_r=822.6MB wal=158.1MB user=140.2MB WA=5.97
+compactions L0FilesNum:53/0tm LevelMaxSize:184/43tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=59.9s max_age(read/idle)=69.8s viol_samples=0/237 avg_live=9909 max_live=15810 final_live=12847
+space sst=140.4MB logical=124.3MB SA=1.130
+reads gets=283300/s scans=42554/s (100.0 keys/scan) cpu=10.0s tomb_skipped=297280 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=skew put_frac=0.9 hot_frac=0.1 dth=0
+== skew dth=0 ==
+ops put=1079645 del=119755 rdel=0 wall=60.0s thr=19988 ops/s cpu=24.8s (20.67 us/op)
+io flush_w=133.7MB comp_w=703.6MB comp_r=822.6MB wal=158.0MB user=140.1MB WA=5.98
+compactions L0FilesNum:53/0tm LevelMaxSize:184/43tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=59.9s max_age(read/idle)=69.8s viol_samples=0/237 avg_live=9915 max_live=15644 final_live=12847
+space sst=140.4MB logical=124.3MB SA=1.130
+reads gets=184340/s scans=36553/s (100.0 keys/scan) cpu=9.2s tomb_skipped=253784 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=skew put_frac=0.9 hot_frac=0.1 dth=20
+== skew dth=20 ==
+ops put=1080274 del=119826 rdel=0 wall=60.0s thr=20000 ops/s cpu=23.4s (19.52 us/op)
+io flush_w=133.7MB comp_w=964.5MB comp_r=1085.1MB wal=158.1MB user=140.2MB WA=7.83
+compactions FadeTtl:103/12tm L0FilesNum:47/0tm LevelMaxSize:123/17tm | fade=103 fade_w=826.5MB
+tombstones max_age(write)=22.0s max_age(read/idle)=28.1s viol_samples=19/236 avg_live=8213 max_live=14325 final_live=11694
+space sst=138.7MB logical=124.3MB SA=1.116
+reads gets=271500/s scans=41668/s (100.0 keys/scan) cpu=10.0s tomb_skipped=262916 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench_main label=unpaced_main put_frac=0.9 rate=0
+== unpaced_main dth=0 ==
+ops put=6375677 del=710623 rdel=0 wall=60.0s thr=118101 ops/s cpu=57.2s (8.07 us/op)
+io flush_w=829.8MB comp_w=6088.3MB comp_r=6897.9MB wal=933.0MB user=827.5MB WA=8.36
+compactions L0FilesNum:192/0tm LevelMaxSize:928/86tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=6.4s max_age(read/idle)=12.2s viol_samples=0/237 avg_live=14361 max_live=17561 final_live=12463
+space sst=129.6MB logical=115.2MB SA=1.125
+reads gets=317720/s scans=44676/s (100.0 keys/scan) cpu=10.1s tomb_skipped=304997 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=unpaced put_frac=0.9 rate=0 dth=0
+== unpaced dth=0 ==
+ops put=5539112 del=617588 rdel=0 wall=60.0s thr=102603 ops/s cpu=52.9s (8.60 us/op)
+io flush_w=721.7MB comp_w=5257.6MB comp_r=5961.8MB wal=810.6MB user=718.9MB WA=8.32
+compactions L0FilesNum:170/0tm LevelMaxSize:823/80tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=8.3s max_age(read/idle)=12.5s viol_samples=0/237 avg_live=14439 max_live=17561 final_live=10690
+space sst=127.4MB logical=115.2MB SA=1.106
+reads gets=295240/s scans=38448/s (100.0 keys/scan) cpu=10.0s tomb_skipped=240380 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=unpaced put_frac=0.9 rate=0 dth=20
+== unpaced dth=20 ==
+ops put=5630265 del=627735 rdel=0 wall=60.0s thr=104299 ops/s cpu=55.9s (8.93 us/op)
+io flush_w=733.4MB comp_w=5469.6MB comp_r=6188.0MB wal=824.0MB user=730.7MB WA=8.49
+compactions FadeTtl:71/4tm L0FilesNum:172/0tm LevelMaxSize:780/74tm | fade=71 fade_w=308.5MB
+tombstones max_age(write)=6.7s max_age(read/idle)=13.4s viol_samples=0/237 avg_live=14161 max_live=17994 final_live=12623
+space sst=129.8MB logical=115.2MB SA=1.127
+reads gets=212220/s scans=29486/s (100.0 keys/scan) cpu=8.9s tomb_skipped=214105 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench_main label=del10_main_s7 put_frac=0.9 seed=7
+== del10_main_s7 dth=0 ==
+ops put=1079569 del=120531 rdel=0 wall=60.0s thr=20001 ops/s cpu=22.1s (18.43 us/op)
+io flush_w=139.7MB comp_w=1021.5MB comp_r=1151.1MB wal=158.0MB user=140.1MB WA=8.29
+compactions L0FilesNum:53/0tm LevelMaxSize:228/26tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=36.2s max_age(read/idle)=26.0s viol_samples=0/236 avg_live=12756 max_live=17986 final_live=13647
+space sst=135.6MB logical=119.0MB SA=1.139
+reads gets=233260/s scans=35443/s (100.0 keys/scan) cpu=9.9s tomb_skipped=269722 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=del10_s7 put_frac=0.9 dth=0 seed=7
+== del10_s7 dth=0 ==
+ops put=1079569 del=120531 rdel=0 wall=60.0s thr=20001 ops/s cpu=24.3s (20.25 us/op)
+io flush_w=139.7MB comp_w=1021.5MB comp_r=1151.1MB wal=158.0MB user=140.1MB WA=8.29
+compactions L0FilesNum:53/0tm LevelMaxSize:228/26tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=36.1s max_age(read/idle)=25.9s viol_samples=0/236 avg_live=12831 max_live=17932 final_live=13647
+space sst=135.6MB logical=119.0MB SA=1.139
+reads gets=253360/s scans=37062/s (100.0 keys/scan) cpu=9.9s tomb_skipped=282460 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=del10_s7 put_frac=0.9 dth=20 seed=7
+== del10_s7 dth=20 ==
+ops put=1079569 del=120531 rdel=0 wall=60.0s thr=20001 ops/s cpu=19.9s (16.60 us/op)
+io flush_w=139.7MB comp_w=1333.6MB comp_r=1464.2MB wal=158.0MB user=140.1MB WA=10.51
+compactions FadeTtl:124/3tm L0FilesNum:51/7tm LevelMaxSize:148/14tm | fade=124 fade_w=831.9MB
+tombstones max_age(write)=21.9s max_age(read/idle)=27.3s viol_samples=9/237 avg_live=9624 max_live=14128 final_live=12766
+space sst=134.6MB logical=119.0MB SA=1.130
+reads gets=245040/s scans=36783/s (100.0 keys/scan) cpu=9.9s tomb_skipped=265838 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench_main label=del10_main_s99 put_frac=0.9 seed=99
+== del10_main_s99 dth=0 ==
+ops put=1080785 del=119315 rdel=0 wall=60.0s thr=20001 ops/s cpu=21.6s (18.01 us/op)
+io flush_w=139.7MB comp_w=1045.9MB comp_r=1176.1MB wal=158.1MB user=140.2MB WA=8.45
+compactions L0FilesNum:53/0tm LevelMaxSize:238/29tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=32.0s max_age(read/idle)=28.0s viol_samples=0/237 avg_live=12838 max_live=17815 final_live=12975
+space sst=135.0MB logical=119.1MB SA=1.134
+reads gets=250780/s scans=38566/s (100.0 keys/scan) cpu=9.9s tomb_skipped=285423 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=del10_s99 put_frac=0.9 dth=0 seed=99
+== del10_s99 dth=0 ==
+ops put=1080785 del=119315 rdel=0 wall=60.0s thr=20001 ops/s cpu=25.0s (20.85 us/op)
+io flush_w=139.7MB comp_w=1045.9MB comp_r=1176.1MB wal=158.1MB user=140.2MB WA=8.45
+compactions L0FilesNum:53/0tm LevelMaxSize:238/29tm | fade=0 fade_w=0.0MB
+tombstones max_age(write)=32.0s max_age(read/idle)=28.1s viol_samples=0/237 avg_live=12824 max_live=17815 final_live=12975
+space sst=135.0MB logical=119.1MB SA=1.134
+reads gets=209260/s scans=35316/s (100.0 keys/scan) cpu=9.6s tomb_skipped=260953 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
+>>> /private/tmp/claude-501/-Users-stephenscott-Documents-Documents-my-Mac-UofT-2026-27-Fall-26-CSC443-project/cdffdf61-54d2-4750-a5b7-10cded621269/scratchpad/fade_bench label=del10_s99 put_frac=0.9 dth=20 seed=99
+== del10_s99 dth=20 ==
+ops put=1080785 del=119315 rdel=0 wall=60.0s thr=20000 ops/s cpu=23.8s (19.82 us/op)
+io flush_w=139.7MB comp_w=1364.8MB comp_r=1496.5MB wal=158.1MB user=140.2MB WA=10.73
+compactions FadeTtl:124/8tm L0FilesNum:47/0tm LevelMaxSize:149/19tm | fade=124 fade_w=807.2MB
+tombstones max_age(write)=21.7s max_age(read/idle)=27.4s viol_samples=14/236 avg_live=9269 max_live=14101 final_live=11704
+space sst=133.5MB logical=119.1MB SA=1.121
+reads gets=256160/s scans=37367/s (100.0 keys/scan) cpu=9.9s tomb_skipped=251107 rdel_reseeks=0
+verify before_reopen=OK after_reopen=OK  
