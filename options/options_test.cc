@@ -1776,7 +1776,9 @@ TEST_F(OptionsTest, KiWiTableOptions) {
       config_options, "kiwi_tile_pages=8;kiwi_delete_key_offset=16;"));
   ASSERT_EQ(bbto->kiwi_tile_pages, 8U);
   ASSERT_EQ(bbto->kiwi_delete_key_offset, 16U);
-  ASSERT_OK(cf_opts.table_factory->ValidateOptions(db_opts, cf_opts));
+  // TODO(kiwi): becomes ASSERT_OK once the table reader supports KiWi files.
+  ASSERT_EQ(cf_opts.table_factory->ValidateOptions(db_opts, cf_opts).code(),
+            Status::kNotSupported);
   std::string printed = cf_opts.table_factory->GetPrintableOptions();
   ASSERT_NE(printed.find("kiwi_tile_pages: 8"), std::string::npos);
   ASSERT_NE(printed.find("kiwi_delete_key_offset: 16"), std::string::npos);
@@ -1809,9 +1811,6 @@ TEST_F(OptionsTest, KiWiTableOptions) {
       "index_type=kTwoLevelIndexSearch;partition_filters=true;",
       [](ColumnFamilyOptions*) {});
   expect_not_supported("", [](ColumnFamilyOptions* cfo) {
-    cfo->compression_opts.parallel_threads = 2;
-  });
-  expect_not_supported("", [](ColumnFamilyOptions* cfo) {
     cfo->bottommost_compression_opts.max_dict_bytes = 4096;
   });
   expect_not_supported("", [](ColumnFamilyOptions* cfo) {
@@ -1825,7 +1824,7 @@ TEST_F(OptionsTest, KiWiTableOptions) {
     ASSERT_OK(cfo.table_factory->ConfigureFromString(
         config_options, "kiwi_tile_pages=1;index_type=kTwoLevelIndexSearch;"
                         "partition_filters=true;"));
-    cfo.compression_opts.parallel_threads = 2;
+    cfo.bottommost_compression_opts.max_dict_bytes = 4096;
     ASSERT_OK(cfo.table_factory->ValidateOptions(db_opts, cfo));
   }
 }

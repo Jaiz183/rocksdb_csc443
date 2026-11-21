@@ -58,6 +58,7 @@
 #include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/full_filter_block.h"
 #include "table/block_based/index_builder.h"
+#include "table/block_based/kiwi_tile.h"
 #include "table/block_based/partitioned_filter_block.h"
 #include "table/block_based/user_defined_index_wrapper.h"
 #include "table/format.h"
@@ -1316,6 +1317,16 @@ struct BlockBasedTableBuilder::Rep {
 
   BlockHandle pending_handle;  // Handle to add to index block
 
+  // State of the KiWi tile being assembled. Non-null iff the file is written
+  // with delete tiles (table_options.kiwi_tile_pages >= 2).
+  struct KiWiState {
+    KiWiState(uint32_t delete_key_offset, uint32_t tile_pages, size_t page_size)
+        : packer(delete_key_offset, tile_pages, page_size) {}
+    kiwi::TilePacker packer;
+    std::vector<kiwi::TilePage> pages;  // scratch, reused across tiles
+  };
+  std::unique_ptr<KiWiState> kiwi;
+
   GrowableBuffer single_threaded_compressed_output;
   std::unique_ptr<FlushBlockPolicy> flush_block_policy;
 
@@ -1792,9 +1803,11 @@ struct BlockBasedTableBuilder::Rep {
     // single-threaded compression. The UDI parallel-support check happens after
     // builder construction (each IndexFactoryBuilder votes via
     // SupportsParallelAddEntry).
+    // KiWi tiles are reordered before any page is compressed, so they are
+    // written by the emit thread as well.
     if ((table_opt.partition_filters &&
          !table_opt.decouple_partitioned_filters) ||
-        embedded_blob_options) {
+        embedded_blob_options || table_opt.kiwi_tile_pages >= 2) {
       compression_parallel_threads = 1;
     }
 
@@ -1991,6 +2004,20 @@ struct BlockBasedTableBuilder::Rep {
           ioptions, tbo.moptions, filter_context,
           use_delta_encoding_for_index_values, index_builder.get(), ts_sz,
           persist_user_defined_timestamps, use_common_prefix_index));
+    }
+
+    if (table_opt.kiwi_tile_pages >= 2) {
+      if (embedded_blob_options || ts_sz > 0 || state != State::kUnbuffered) {
+        SetStatus(Status::NotSupported(
+            "KiWi delete tiles cannot be combined with embedded blob SSTs, "
+            "user-defined timestamps or compression dictionaries"));
+      } else {
+        // KiWi keeps a filter per page instead of one for the whole file.
+        filter_builder.reset();
+        kiwi = std::make_unique<KiWiState>(table_opt.kiwi_delete_key_offset,
+                                           table_opt.kiwi_tile_pages,
+                                           table_opt.block_size);
+      }
     }
 
     assert(tbo.internal_tbl_prop_coll_factories);
@@ -2288,10 +2315,19 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
       }
     }
 
-    auto should_flush = r->flush_block_policy->Update(entry_ikey, entry_value);
+    // With KiWi, a "block" boundary is a tile boundary.
+    const bool is_kiwi = r->kiwi != nullptr;
+    auto should_flush = is_kiwi
+                            ? r->kiwi->packer.full()
+                            : r->flush_block_policy->Update(entry_ikey,
+                                                            entry_value);
     if (should_flush) {
-      assert(!r->data_block.empty());
-      Flush(/*first_key_in_next_block=*/&entry_ikey);
+      if (is_kiwi) {
+        FlushTile(/*first_key_in_next_tile=*/&entry_ikey);
+      } else {
+        assert(!r->data_block.empty());
+        Flush(/*first_key_in_next_block=*/&entry_ikey);
+      }
     }
 
     // Note: PartitionedFilterBlockBuilder with
@@ -2309,7 +2345,15 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
     }
 
     // NOTE: WriteBatch guarantees keys < 4GB; value size checked above
-    r->data_block.AddWithLastKey(entry_ikey, entry_value, r->last_ikey);
+    if (is_kiwi) {
+      // Fails, loudly, on a value too short to hold the delete key.
+      r->SetStatus(r->kiwi->packer.Add(entry_ikey, entry_value));
+      if (UNLIKELY(!ok())) {
+        return;
+      }
+    } else {
+      r->data_block.AddWithLastKey(entry_ikey, entry_value, r->last_ikey);
+    }
     r->last_ikey.assign(entry_ikey.data(), entry_ikey.size());
     assert(!r->last_ikey.empty());
     if (r->state == Rep::State::kBuffered) {
@@ -2465,6 +2509,61 @@ void BlockBasedTableBuilder::Flush(const Slice* first_key_in_next_block) {
     }
     r->data_block.Reset();
   }
+}
+
+void BlockBasedTableBuilder::FlushTile(const Slice* first_key_in_next_tile) {
+  Rep* r = rep_.get();
+  assert(r->kiwi != nullptr);
+  assert(r->state == Rep::State::kUnbuffered);
+  assert(!r->IsParallelCompressionActive());
+  kiwi::TilePacker& packer = r->kiwi->packer;
+  if (UNLIKELY(!ok()) || packer.empty()) {
+    return;
+  }
+  std::vector<kiwi::TilePage>& pages = r->kiwi->pages;
+  packer.Pack(&pages);
+
+  // Write the pages in delete key order. They are ordinary data blocks.
+  BlockHandle first_page;
+  BlockHandle last_page;
+  bool skip_delta_encoding = false;
+  for (size_t p = 0; p < pages.size(); ++p) {
+    Slice prev_key;
+    for (size_t pos : pages[p].entries) {
+      const Slice key = packer.key(pos);
+      r->data_block.AddWithLastKey(key, packer.value(pos), prev_key);
+      prev_key = key;
+    }
+    const size_t page_bytes = r->data_block.Finish().size();
+    NotifyCollectTableCollectorsOnBlockAdd(r->table_properties_collectors,
+                                           page_bytes, 0, 0);
+    ++r->props.num_data_blocks;
+    bool page_skip_delta_encoding = false;
+    WriteBlock(r->data_block.MutableBuffer(), &r->pending_handle,
+               BlockType::kData, &page_skip_delta_encoding);
+    TEST_SYNC_POINT_CALLBACK("BlockBasedTableBuilder::FlushTile:PageWritten",
+                             &r->pending_handle);
+    r->data_block.Reset();
+    if (UNLIKELY(!ok())) {
+      return;
+    }
+    if (p == 0) {
+      first_page = r->pending_handle;
+      skip_delta_encoding = page_skip_delta_encoding;
+    }
+    last_page = r->pending_handle;
+  }
+
+  // One index entry per tile, covering all of its pages. Its handle is
+  // contiguous with the next tile's, as plain index delta encoding assumes.
+  r->pending_handle =
+      BlockHandle(first_page.offset(),
+                  last_page.offset() + last_page.size() - first_page.offset());
+  TEST_SYNC_POINT_CALLBACK("BlockBasedTableBuilder::FlushTile:TileWritten",
+                           &r->pending_handle);
+  r->ForwardAddIndexEntryToAll(packer.last_key(), first_key_in_next_tile,
+                               r->pending_handle, skip_delta_encoding);
+  packer.Clear();
 }
 
 void BlockBasedTableBuilder::EmitBlockForParallel(
@@ -4066,6 +4165,9 @@ Status BlockBasedTableBuilder::Finish() {
 #endif  // !NDEBUG
   // To make sure properties block is able to keep the accurate size of index
   // block, we will finish writing all index entries first, in Flush().
+  if (r->kiwi != nullptr) {
+    FlushTile(/*first_key_in_next_tile=*/nullptr);
+  }
   Flush(/*first_key_in_next_block=*/nullptr);
   if (rep_->state == Rep::State::kBuffered) {
     MaybeEnterUnbuffered(nullptr);
@@ -4174,6 +4276,9 @@ uint64_t BlockBasedTableBuilder::EstimatedFileSize() const {
   if (rep_->IsParallelCompressionActive()) {
     // Use upper bound on "inflight" data size to estimate
     return FileSize() + rep_->pc_rep->estimated_inflight_size.LoadRelaxed();
+  } else if (rep_->kiwi != nullptr) {
+    // Entries of the tile being assembled are not written yet.
+    return FileSize() + rep_->kiwi->packer.buffered_bytes();
   } else {
     return FileSize();
   }

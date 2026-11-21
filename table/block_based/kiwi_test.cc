@@ -7,16 +7,29 @@
 #include <cinttypes>
 #include <cstdio>
 #include <limits>
+#include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "db/dbformat.h"
+#include "file/writable_file_writer.h"
+#include "options/cf_options.h"
 #include "port/stack_trace.h"
+#include "rocksdb/convenience.h"
 #include "rocksdb/env.h"
+#include "rocksdb/table.h"
+#include "table/block_based/block.h"
+#include "table/block_based/block_based_table_factory.h"
+#include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/kiwi_tile.h"
+#include "table/meta_blocks.h"
+#include "table/table_builder.h"
+#include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/compression.h"
 #include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -442,6 +455,387 @@ TEST(KiWiDirectoryTest, RandomCorruptionIsSafe) {
     }
   }
 }
+
+#ifndef NDEBUG
+namespace {
+
+struct Entry {
+  std::string ikey;
+  std::string value;
+};
+
+// What the builder wrote for one tile.
+struct TileLayout {
+  std::vector<BlockHandle> pages;
+  BlockHandle handle;  // what the index entry of the tile points to
+};
+
+struct BuiltTable {
+  std::string contents;
+  std::vector<TileLayout> tiles;
+  std::unique_ptr<TableProperties> props;
+};
+
+struct BuildParams {
+  uint32_t tile_pages = 4;
+  size_t block_size = 256;
+  uint32_t delete_key_offset = 0;
+  CompressionType compression = kNoCompression;
+  uint32_t parallel_threads = 1;
+  const Comparator* comparator = BytewiseComparator();
+};
+
+// Writes `entries` (already in internal key order) as a KiWi table, recording
+// the handles of the pages and tiles through sync points.
+void BuildKiWiTable(const std::vector<Entry>& entries, const BuildParams& bp,
+                    BuiltTable* out) {
+  Options options;
+  options.comparator = bp.comparator;
+  options.compression_opts.parallel_threads = bp.parallel_threads;
+  const ImmutableOptions ioptions(options);
+  const MutableCFOptions moptions(options);
+  InternalKeyComparator ikc(options.comparator);
+
+  BlockBasedTableOptions bbto;
+  bbto.kiwi_tile_pages = bp.tile_pages;
+  bbto.block_size = bp.block_size;
+  bbto.kiwi_delete_key_offset = bp.delete_key_offset;
+  bbto.filter_policy = nullptr;
+  BlockBasedTableFactory factory(bbto);
+
+  std::unique_ptr<FSWritableFile> sink(new test::StringSink());
+  std::unique_ptr<WritableFileWriter> file_writer(new WritableFileWriter(
+      std::move(sink), "" /* don't care */, FileOptions()));
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
+  std::string column_family_name;
+  const ReadOptions read_options;
+  const WriteOptions write_options;
+
+  out->tiles.clear();
+  TileLayout current;
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTableBuilder::FlushTile:PageWritten", [&](void* arg) {
+        current.pages.push_back(*static_cast<BlockHandle*>(arg));
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTableBuilder::FlushTile:TileWritten", [&](void* arg) {
+        current.handle = *static_cast<BlockHandle*>(arg);
+        out->tiles.push_back(current);
+        current = TileLayout();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
+      TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
+                          &internal_tbl_prop_coll_factories, bp.compression,
+                          options.compression_opts,
+                          TablePropertiesCollectorFactory::Context::
+                              kUnknownColumnFamily,
+                          column_family_name, /*level=*/-1,
+                          kUnknownNewestKeyTime),
+      file_writer.get()));
+  for (const Entry& e : entries) {
+    builder->Add(e.ikey, e.value);
+  }
+  ASSERT_OK(builder->status());
+  ASSERT_OK(builder->Finish());
+  ASSERT_OK(file_writer->Flush(IOOptions()));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(builder->NumEntries(), entries.size());
+  auto* ss = static_cast<test::StringSink*>(file_writer->writable_file());
+  out->contents = ss->contents();
+  ASSERT_EQ(out->contents.size(), builder->FileSize());
+
+  std::unique_ptr<FSRandomAccessFile> source(
+      new test::StringSource(out->contents, 72242, true));
+  std::unique_ptr<RandomAccessFileReader> file_reader(
+      new RandomAccessFileReader(std::move(source), "test"));
+  ASSERT_OK(ReadTableProperties(file_reader.get(), out->contents.size(),
+                                kBlockBasedTableMagicNumber, ioptions,
+                                read_options, &out->props));
+}
+
+// Entries in internal key order: ascending user keys, several versions each
+// (newest first), a mix of values and deletions.
+std::vector<Entry> MakeEntries(Random64* rnd, size_t num_keys,
+                               uint32_t delete_key_offset,
+                               size_t max_value_size) {
+  std::vector<Entry> entries;
+  for (size_t k = 0; k < num_keys; ++k) {
+    const size_t versions = 1 + rnd->Uniform(3);
+    for (size_t v = 0; v < versions; ++v) {
+      const bool deletion = rnd->OneIn(8);
+      Entry e;
+      e.ikey = MakeInternalKey(k, 1000 - v, deletion ? kTypeDeletion
+                                                      : kTypeValue);
+      if (!deletion) {
+        // Few distinct delete keys sometimes, to exercise ties.
+        const uint64_t d = rnd->OneIn(3) ? rnd->Uniform(8) : rnd->Next();
+        e.value = MakeValue(d, delete_key_offset,
+                            kDeleteKeySize + rnd->Uniform(max_value_size));
+      }
+      entries.push_back(std::move(e));
+    }
+  }
+  return entries;
+}
+
+// Decodes an uncompressed page into its entries.
+void DecodePage(const std::string& file, const BlockHandle& handle,
+                const InternalKeyComparator& ikc, std::vector<Entry>* out) {
+  std::string bytes = file.substr(handle.offset(), handle.size());
+  BlockContents contents;
+  contents.data = Slice(bytes);
+  Block block(std::move(contents));
+  std::unique_ptr<DataBlockIter> iter(block.NewDataIterator(
+      ikc.user_comparator(), kDisableGlobalSequenceNumber));
+  out->clear();
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    out->push_back(Entry{iter->key().ToString(), iter->value().ToString()});
+  }
+  ASSERT_OK(iter->status());
+}
+
+}  // namespace
+
+TEST(KiWiBuilderTest, WritesTilesWithKiWiInvariants) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  InternalKeyComparator ikc(BytewiseComparator());
+
+  for (int iter = 0; iter < 20; ++iter) {
+    BuildParams bp;
+    bp.tile_pages = 2 + static_cast<uint32_t>(rnd.Uniform(7));
+    bp.block_size = 64 + rnd.Uniform(400);
+    bp.delete_key_offset = static_cast<uint32_t>(rnd.Uniform(10));
+    const std::vector<Entry> entries =
+        MakeEntries(&rnd, 50 + rnd.Uniform(300), bp.delete_key_offset, 60);
+
+    BuiltTable table;
+    BuildKiWiTable(entries, bp, &table);
+    ASSERT_GE(table.tiles.size(), 1U);
+
+    std::map<std::string, std::string> expected;
+    for (const Entry& e : entries) {
+      expected[e.ikey] = e.value;
+    }
+    std::map<std::string, std::string> seen;
+    size_t total_pages = 0;
+    std::string prev_tile_last_key;
+    for (size_t t = 0; t < table.tiles.size(); ++t) {
+      const TileLayout& tile = table.tiles[t];
+      ASSERT_GE(tile.pages.size(), 1U);
+      ASSERT_LE(tile.pages.size(), bp.tile_pages);
+      total_pages += tile.pages.size();
+
+      // The tile handle spans exactly its pages; each page is followed by its
+      // block trailer, and tiles are laid out back to back.
+      ASSERT_EQ(tile.handle.offset(), tile.pages.front().offset());
+      ASSERT_EQ(tile.handle.offset() + tile.handle.size(),
+                tile.pages.back().offset() + tile.pages.back().size());
+      for (size_t i = 1; i < tile.pages.size(); ++i) {
+        ASSERT_EQ(tile.pages[i].offset(),
+                  tile.pages[i - 1].offset() + tile.pages[i - 1].size() +
+                      BlockBasedTable::kBlockTrailerSize);
+      }
+      if (t > 0) {
+        const BlockHandle& prev = table.tiles[t - 1].handle;
+        ASSERT_EQ(tile.handle.offset(),
+                  prev.offset() + prev.size() +
+                      BlockBasedTable::kBlockTrailerSize);
+      }
+
+      std::string tile_first_key, tile_last_key;
+      uint64_t prev_page_max_d = 0;
+      for (size_t i = 0; i < tile.pages.size(); ++i) {
+        std::vector<Entry> page;
+        DecodePage(table.contents, tile.pages[i], ikc, &page);
+        ASSERT_FALSE(page.empty());
+        uint64_t min_d = kNoDeleteKey;
+        uint64_t max_d = 0;
+        for (size_t j = 0; j < page.size(); ++j) {
+          if (j > 0) {
+            // Entries stay in internal key order inside a page.
+            ASSERT_LT(ikc.Compare(page[j - 1].ikey, page[j].ikey), 0);
+          }
+          uint64_t d = 0;
+          ASSERT_OK(ExtractDeleteKey(ExtractValueType(page[j].ikey),
+                                     page[j].value, bp.delete_key_offset, &d));
+          min_d = std::min(min_d, d);
+          max_d = std::max(max_d, d);
+          ASSERT_TRUE(seen.emplace(page[j].ikey, page[j].value).second)
+              << "entry written twice";
+          if (tile_first_key.empty() ||
+              ikc.Compare(page[j].ikey, tile_first_key) < 0) {
+            tile_first_key = page[j].ikey;
+          }
+          if (tile_last_key.empty() ||
+              ikc.Compare(page[j].ikey, tile_last_key) > 0) {
+            tile_last_key = page[j].ikey;
+          }
+        }
+        // Pages of a tile are ordered by delete key.
+        if (i > 0) {
+          ASSERT_LE(prev_page_max_d, min_d);
+        }
+        prev_page_max_d = max_d;
+      }
+      // Tiles do not overlap in key.
+      if (t > 0) {
+        ASSERT_LT(ikc.Compare(prev_tile_last_key, tile_first_key), 0);
+      }
+      prev_tile_last_key = tile_last_key;
+    }
+    ASSERT_EQ(seen, expected);
+    ASSERT_EQ(table.props->num_entries, entries.size());
+    ASSERT_EQ(table.props->num_data_blocks, total_pages);
+    // KiWi files have no whole-file filter.
+    ASSERT_EQ(table.props->filter_size, 0U);
+  }
+}
+
+TEST(KiWiBuilderTest, ManyTilesWithTinyPages) {
+  Random64 rnd(5);
+  BuildParams bp;
+  bp.tile_pages = 3;
+  bp.block_size = 100;
+  const std::vector<Entry> entries = MakeEntries(&rnd, 400, 0, 40);
+  BuiltTable table;
+  BuildKiWiTable(entries, bp, &table);
+  // ~100 bytes/entry-key-and-value, 3 pages of 100 bytes per tile.
+  ASSERT_GT(table.tiles.size(), 10U);
+}
+
+TEST(KiWiBuilderTest, ShortValueFailsTheBuilder) {
+  Options options;
+  const ImmutableOptions ioptions(options);
+  const MutableCFOptions moptions(options);
+  InternalKeyComparator ikc(options.comparator);
+  BlockBasedTableOptions bbto;
+  bbto.kiwi_tile_pages = 4;
+  bbto.kiwi_delete_key_offset = 4;  // needs values of at least 12 bytes
+  BlockBasedTableFactory factory(bbto);
+  std::unique_ptr<FSWritableFile> sink(new test::StringSink());
+  std::unique_ptr<WritableFileWriter> file_writer(new WritableFileWriter(
+      std::move(sink), "" /* don't care */, FileOptions()));
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
+  std::string column_family_name;
+  const ReadOptions read_options;
+  const WriteOptions write_options;
+  std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
+      TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
+                          &internal_tbl_prop_coll_factories, kNoCompression,
+                          options.compression_opts,
+                          TablePropertiesCollectorFactory::Context::
+                              kUnknownColumnFamily,
+                          column_family_name, /*level=*/-1,
+                          kUnknownNewestKeyTime),
+      file_writer.get()));
+  builder->Add(MakeInternalKey(1, 5, kTypeValue), MakeValue(1, 4, 12));
+  ASSERT_OK(builder->status());
+  builder->Add(MakeInternalKey(2, 4, kTypeValue), std::string(11, 'x'));
+  ASSERT_EQ(builder->status().code(), Status::kInvalidArgument);
+  // Finish() reports the sticky error and closes the builder.
+  ASSERT_EQ(builder->Finish().code(), Status::kInvalidArgument);
+}
+
+TEST(KiWiBuilderTest, UserDefinedTimestampsAreNotSupported) {
+  Options options;
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  const ImmutableOptions ioptions(options);
+  const MutableCFOptions moptions(options);
+  InternalKeyComparator ikc(options.comparator);
+  BlockBasedTableOptions bbto;
+  bbto.kiwi_tile_pages = 4;
+  BlockBasedTableFactory factory(bbto);
+  std::unique_ptr<FSWritableFile> sink(new test::StringSink());
+  std::unique_ptr<WritableFileWriter> file_writer(new WritableFileWriter(
+      std::move(sink), "" /* don't care */, FileOptions()));
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
+  std::string column_family_name;
+  const ReadOptions read_options;
+  const WriteOptions write_options;
+  std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
+      TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
+                          &internal_tbl_prop_coll_factories, kNoCompression,
+                          options.compression_opts,
+                          TablePropertiesCollectorFactory::Context::
+                              kUnknownColumnFamily,
+                          column_family_name, /*level=*/-1,
+                          kUnknownNewestKeyTime),
+      file_writer.get()));
+  ASSERT_EQ(builder->status().code(), Status::kNotSupported);
+  builder->Abandon();
+}
+
+TEST(KiWiBuilderTest, EstimatedFileSizeCountsBufferedTile) {
+  Options options;
+  const ImmutableOptions ioptions(options);
+  const MutableCFOptions moptions(options);
+  InternalKeyComparator ikc(options.comparator);
+  BlockBasedTableOptions bbto;
+  bbto.kiwi_tile_pages = 8;
+  bbto.block_size = 4096;
+  BlockBasedTableFactory factory(bbto);
+  std::unique_ptr<FSWritableFile> sink(new test::StringSink());
+  std::unique_ptr<WritableFileWriter> file_writer(new WritableFileWriter(
+      std::move(sink), "" /* don't care */, FileOptions()));
+  InternalTblPropCollFactories internal_tbl_prop_coll_factories;
+  std::string column_family_name;
+  const ReadOptions read_options;
+  const WriteOptions write_options;
+  std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
+      TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
+                          &internal_tbl_prop_coll_factories, kNoCompression,
+                          options.compression_opts,
+                          TablePropertiesCollectorFactory::Context::
+                              kUnknownColumnFamily,
+                          column_family_name, /*level=*/-1,
+                          kUnknownNewestKeyTime),
+      file_writer.get()));
+  uint64_t last = builder->EstimatedFileSize();
+  for (uint64_t i = 0; i < 100; ++i) {
+    builder->Add(MakeInternalKey(i, 1, kTypeValue), MakeValue(i, 0, 100));
+    // A tile holds 8 x 4KB, so nothing is written yet, but the size estimate
+    // used to cut compaction outputs keeps growing.
+    ASSERT_EQ(builder->FileSize(), 0U);
+    ASSERT_GT(builder->EstimatedFileSize(), last);
+    last = builder->EstimatedFileSize();
+  }
+  ASSERT_OK(builder->Finish());
+  ASSERT_GT(builder->FileSize(), 0U);
+}
+
+TEST(KiWiBuilderTest, ParallelCompressionRequestIsDowngraded) {
+  CompressionType type = kNoCompression;
+  for (CompressionType t : GetSupportedCompressions()) {
+    if (t != kNoCompression) {
+      type = t;
+      break;
+    }
+  }
+  if (type == kNoCompression) {
+    ROCKSDB_GTEST_SKIP("No compression library available");
+    return;
+  }
+  Random64 rnd(11);
+  BuildParams bp;
+  bp.compression = type;
+  bp.parallel_threads = 4;
+  const std::vector<Entry> entries = MakeEntries(&rnd, 300, 0, 60);
+  BuiltTable table;
+  BuildKiWiTable(entries, bp, &table);
+  ASSERT_GT(table.tiles.size(), 1U);
+  size_t pages = 0;
+  for (const TileLayout& t : table.tiles) {
+    pages += t.pages.size();
+  }
+  ASSERT_EQ(table.props->num_data_blocks, pages);
+}
+#endif  // !NDEBUG
 
 }  // namespace kiwi
 }  // namespace ROCKSDB_NAMESPACE

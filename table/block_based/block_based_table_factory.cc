@@ -980,15 +980,15 @@ Status BlockBasedTableFactory::ValidateOptions(
     }
     for (const CompressionOptions* copts :
          {&cf_opts.compression_opts, &cf_opts.bottommost_compression_opts}) {
-      if (copts->parallel_threads > 1) {
-        return Status::NotSupported(
-            "kiwi_tile_pages is incompatible with parallel compression");
-      }
       if (copts->max_dict_bytes > 0 || copts->zstd_max_train_bytes > 0) {
         return Status::NotSupported(
             "kiwi_tile_pages is incompatible with compression dictionaries");
       }
     }
+    // TODO(kiwi): remove once the table reader can read KiWi files. Until
+    // then a database must not write them.
+    return Status::NotSupported(
+        "kiwi_tile_pages: reading KiWi files is not implemented yet");
   }
   if (table_options_.data_block_index_type ==
           BlockBasedTableOptions::kDataBlockBinaryAndHash &&

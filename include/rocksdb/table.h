@@ -870,10 +870,11 @@ struct BlockBasedTableOptions {
   // more page filters and short range scans read more pages per tile. 0 or 1
   // disables KiWi (the default); only newly written files are affected.
   //
-  // KiWi files have no whole-file filter, and cannot be combined with
-  // parallel compression, compression dictionaries, kHashSearch indexes,
-  // partitioned filters, user_defined_index_factory or user-defined
-  // timestamps; such combinations are rejected by ValidateOptions().
+  // KiWi files have no whole-file filter, are always compressed by one thread
+  // (CompressionOptions::parallel_threads is ignored for them), and cannot be
+  // combined with compression dictionaries, kHashSearch indexes, partitioned
+  // filters, user_defined_index_factory or user-defined timestamps; those
+  // combinations are rejected by ValidateOptions().
   //
   // Files written with KiWi cannot be read by binaries that predate it.
   //

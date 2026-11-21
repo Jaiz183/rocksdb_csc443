@@ -238,6 +238,11 @@ class BlockBasedTableBuilder : public TableBuilder {
   // REQUIRES: Finish(), Abandon() have not been called
   void Flush(const Slice* first_key_in_next_block);
 
+  // KiWi counterpart of Flush(): packs the buffered tile into pages ordered by
+  // delete key, writes them and adds one index entry for the whole tile.
+  // `first_key_in_next_tile` is nullptr at the end of the file.
+  void FlushTile(const Slice* first_key_in_next_tile);
+
   // Some compression libraries fail when the uncompressed size is bigger than
   // int. If uncompressed size is bigger than kCompressionSizeLimit, don't
   // compress it
