@@ -198,6 +198,7 @@ Status TableCache::GetTableReader(
     // Route same-file ("embedded") blob reads through the CFD's BlobSource for
     // caching + stats. nullptr in non-DB contexts (e.g. repair).
     table_reader_options.blob_source = blob_source_;
+    table_reader_options.kiwi_delete_floor = file_meta.kiwi_delete_floor;
     s = mutable_cf_options.table_factory->NewTableReader(
         ro, table_reader_options, std::move(file_reader),
         file_meta.fd.GetFileSize(), table_reader,

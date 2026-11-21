@@ -412,6 +412,11 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   bool TEST_FilterBlockInCache() const;
   // nullptr unless the file was written with KiWi delete tiles.
   const kiwi::Directory* TEST_GetKiWiDirectory() const;
+  uint64_t TEST_GetKiWiDeleteFloor() const;
+
+  // Applies a secondary delete recorded for this file (see
+  // FileMetaData::kiwi_delete_floor). Only a KiWi file can have one.
+  Status SetKiWiDeleteFloor(uint64_t floor);
   bool TEST_IndexBlockInCache() const;
 
   // IndexReader is the interface that provides the functionality for index
@@ -943,6 +948,10 @@ struct BlockBasedTable::Rep {
   // Per-page filters and delete key fences of a KiWi file, pinned for the life
   // of the reader; null if the file was not written with delete tiles.
   std::unique_ptr<kiwi::Directory> kiwi_directory;
+  // Where the delete key sits in a value of this KiWi file, and the entries
+  // below the delete floor are deleted (0: none).
+  uint32_t kiwi_delete_key_offset = 0;
+  uint64_t kiwi_delete_floor = 0;
 
   // BlobSource for routing same-file ("embedded") blob reads through the blob
   // value cache + BLOB_DB_* statistics. Owned by the ColumnFamilyData; this

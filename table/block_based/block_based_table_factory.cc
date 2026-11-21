@@ -792,7 +792,7 @@ Status BlockBasedTableFactory::NewTableReader(
     std::unique_ptr<RandomAccessFileReader>&& file, uint64_t file_size,
     std::unique_ptr<TableReader>* table_reader,
     bool prefetch_index_and_filter_in_cache) const {
-  return BlockBasedTable::Open(
+  Status s = BlockBasedTable::Open(
       ro, table_reader_options.ioptions, table_reader_options.env_options,
       table_options_, table_reader_options.internal_comparator, std::move(file),
       file_size, table_reader_options.block_protection_bytes_per_key,
@@ -813,6 +813,14 @@ Status BlockBasedTableFactory::NewTableReader(
       table_reader_options.user_defined_timestamps_persisted,
       table_reader_options.avoid_shared_metadata_cache,
       table_reader_options.blob_source);
+  if (s.ok() && table_reader_options.kiwi_delete_floor != 0) {
+    s = static_cast_with_check<BlockBasedTable>(table_reader->get())
+            ->SetKiWiDeleteFloor(table_reader_options.kiwi_delete_floor);
+    if (!s.ok()) {
+      table_reader->reset();
+    }
+  }
+  return s;
 }
 
 TableBuilder* BlockBasedTableFactory::NewTableBuilder(

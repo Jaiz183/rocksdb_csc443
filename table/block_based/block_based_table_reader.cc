@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -1722,10 +1723,36 @@ Status BlockBasedTable::ReadKiWiDirectory(const ReadOptions& ro,
   }
   auto directory = std::make_unique<kiwi::Directory>();
   s = directory->Decode(contents.data.ToString());
-  if (s.ok()) {
-    rep_->kiwi_directory = std::move(directory);
+  if (!s.ok()) {
+    return s;
   }
-  return s;
+  const auto offset_prop = props.find(kiwi::kPropDeleteKeyOffset);
+  bool offset_ok = offset_prop != props.end();
+  if (offset_ok) {
+    const std::string& text = offset_prop->second;
+    const char* end = text.data() + text.size();
+    const auto parsed = std::from_chars(text.data(), end,
+                                        rep_->kiwi_delete_key_offset);
+    offset_ok = parsed.ec == std::errc() && parsed.ptr == end;
+  }
+  if (!offset_ok) {
+    return Status::Corruption("KiWi file without a valid delete key offset");
+  }
+  rep_->kiwi_directory = std::move(directory);
+  return Status::OK();
+}
+
+Status BlockBasedTable::SetKiWiDeleteFloor(uint64_t floor) {
+  if (rep_->kiwi_directory == nullptr) {
+    return Status::Corruption(
+        "KiWi delete floor recorded for a file without KiWi tiles");
+  }
+  rep_->kiwi_delete_floor = floor;
+  return Status::OK();
+}
+
+uint64_t BlockBasedTable::TEST_GetKiWiDeleteFloor() const {
+  return rep_->kiwi_delete_floor;
 }
 
 Status BlockBasedTable::DataBlockHandlesOf(

@@ -601,7 +601,7 @@ struct OpenedTable {
 // Opens `contents` (a file written by BuildKiWiTable) with the block-based
 // table reader.
 Status OpenTable(const std::string& contents, const BuildParams& bp,
-                 OpenedTable* out) {
+                 OpenedTable* out, uint64_t delete_floor = 0) {
   out->options.comparator = bp.comparator;
   out->options.statistics = CreateDBStatistics();
   out->ioptions = std::make_unique<ImmutableOptions>(out->options);
@@ -617,18 +617,17 @@ Status OpenTable(const std::string& contents, const BuildParams& bp,
       new test::StringSource(contents, 1, /*mmap=*/false));
   std::unique_ptr<RandomAccessFileReader> file_reader(
       new RandomAccessFileReader(std::move(source), "test"));
-  return out->factory->NewTableReader(
-      TableReaderOptions(*out->ioptions, out->moptions->prefix_extractor,
-                         out->moptions->compression_manager.get(),
-                         EnvOptions(), *out->ikc,
-                         /*block_protection_bytes_per_key=*/0,
-                         /*skip_filters=*/false, /*immortal=*/false,
-                         /*force_direct_prefetch=*/false, /*level=*/-1,
-                         /*block_cache_tracer=*/nullptr,
-                         out->moptions->write_buffer_size, "",
-                         /*cur_file_num=*/1, kNullUniqueId64x2,
-                         /*largest_seqno=*/0),
-      std::move(file_reader), contents.size(), &out->reader);
+  TableReaderOptions reader_options(
+      *out->ioptions, out->moptions->prefix_extractor,
+      out->moptions->compression_manager.get(), EnvOptions(), *out->ikc,
+      /*block_protection_bytes_per_key=*/0,
+      /*skip_filters=*/false, /*immortal=*/false,
+      /*force_direct_prefetch=*/false, /*level=*/-1,
+      /*block_cache_tracer=*/nullptr, out->moptions->write_buffer_size, "",
+      /*cur_file_num=*/1, kNullUniqueId64x2, /*largest_seqno=*/0);
+  reader_options.kiwi_delete_floor = delete_floor;
+  return out->factory->NewTableReader(reader_options, std::move(file_reader),
+                                      contents.size(), &out->reader);
 }
 
 // Entries in internal key order: ascending user keys, several versions each
@@ -996,6 +995,35 @@ TEST(KiWiReaderTest, PlainFileHasNoDirectory) {
   ASSERT_OK(OpenTable(table.contents, bp, &opened));
   const auto* table_reader = static_cast<BlockBasedTable*>(opened.reader.get());
   ASSERT_EQ(table_reader->TEST_GetKiWiDirectory(), nullptr);
+}
+
+TEST(KiWiReaderTest, DeleteFloorIsHandedToKiWiFilesOnly) {
+  Random64 rnd(5);
+  BuildParams bp;
+  BuiltTable kiwi_table;
+  BuildKiWiTable(MakeEntries(&rnd, 100, 3, 50), bp, &kiwi_table);
+  OpenedTable opened;
+  ASSERT_OK(OpenTable(kiwi_table.contents, bp, &opened, /*floor=*/777));
+  const auto* reader = static_cast<BlockBasedTable*>(opened.reader.get());
+  ASSERT_EQ(reader->TEST_GetKiWiDeleteFloor(), 777U);
+  OpenedTable no_floor;
+  ASSERT_OK(OpenTable(kiwi_table.contents, bp, &no_floor));
+  ASSERT_EQ(static_cast<BlockBasedTable*>(no_floor.reader.get())
+                ->TEST_GetKiWiDeleteFloor(),
+            0U);
+
+  // A floor on a file that has no tiles is metadata corruption: fail the open
+  // instead of ignoring a delete.
+  BuildParams plain_bp = bp;
+  plain_bp.tile_pages = 1;
+  BuiltTable plain_table;
+  BuildKiWiTable(MakeEntries(&rnd, 100, 0, 50), plain_bp, &plain_table);
+  OpenedTable plain;
+  ASSERT_EQ(OpenTable(plain_table.contents, plain_bp, &plain, 777).code(),
+            Status::kCorruption);
+  ASSERT_EQ(plain.reader, nullptr);
+  OpenedTable plain_ok;
+  ASSERT_OK(OpenTable(plain_table.contents, plain_bp, &plain_ok));
 }
 
 TEST(KiWiReaderTest, CorruptDirectoryFailsOpen) {
