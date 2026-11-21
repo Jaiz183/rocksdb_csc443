@@ -444,6 +444,12 @@ static struct BlockBasedTableTypeInfo {
          {offsetof(struct BlockBasedTableOptions,
                    separate_key_value_in_data_block),
           OptionType::kBoolean, OptionVerificationType::kNormal}},
+        {"kiwi_tile_pages",
+         {offsetof(struct BlockBasedTableOptions, kiwi_tile_pages),
+          OptionType::kUInt32T, OptionVerificationType::kNormal}},
+        {"kiwi_delete_key_offset",
+         {offsetof(struct BlockBasedTableOptions, kiwi_delete_key_offset),
+          OptionType::kUInt32T, OptionVerificationType::kNormal}},
         {"uniform_cv_threshold",
          {offsetof(struct BlockBasedTableOptions, uniform_cv_threshold),
           OptionType::kDouble, OptionVerificationType::kNormal}},
@@ -957,6 +963,33 @@ Status BlockBasedTableFactory::ValidateOptions(
     return Status::InvalidArgument(
         "Super block alignment space overhead is too high");
   }
+  if (table_options_.kiwi_tile_pages >= 2) {
+    // Unsupported combinations are rejected rather than silently producing
+    // files that would be misread or lose KiWi semantics.
+    if (table_options_.index_type == BlockBasedTableOptions::kHashSearch ||
+        table_options_.partition_filters ||
+        table_options_.user_defined_index_factory != nullptr) {
+      return Status::NotSupported(
+          "kiwi_tile_pages is incompatible with kHashSearch, "
+          "partition_filters and user_defined_index_factory");
+    }
+    if (cf_opts.comparator != nullptr &&
+        cf_opts.comparator->timestamp_size() > 0) {
+      return Status::NotSupported(
+          "kiwi_tile_pages is incompatible with user-defined timestamps");
+    }
+    for (const CompressionOptions* copts :
+         {&cf_opts.compression_opts, &cf_opts.bottommost_compression_opts}) {
+      if (copts->parallel_threads > 1) {
+        return Status::NotSupported(
+            "kiwi_tile_pages is incompatible with parallel compression");
+      }
+      if (copts->max_dict_bytes > 0 || copts->zstd_max_train_bytes > 0) {
+        return Status::NotSupported(
+            "kiwi_tile_pages is incompatible with compression dictionaries");
+      }
+    }
+  }
   if (table_options_.data_block_index_type ==
           BlockBasedTableOptions::kDataBlockBinaryAndHash &&
       table_options_.data_block_hash_table_util_ratio <= 0) {
@@ -1212,6 +1245,12 @@ std::string BlockBasedTableFactory::GetPrintableOptions() const {
            "  super_block_alignment_space_overhead_ratio: %" ROCKSDB_PRIszt
            "\n",
            table_options_.super_block_alignment_space_overhead_ratio);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  kiwi_tile_pages: %" PRIu32 "\n",
+           table_options_.kiwi_tile_pages);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  kiwi_delete_key_offset: %" PRIu32 "\n",
+           table_options_.kiwi_delete_key_offset);
   ret.append(buffer);
   snprintf(buffer, kBufferSize,
            "  max_auto_readahead_size: %" ROCKSDB_PRIszt "\n",

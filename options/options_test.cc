@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cinttypes>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <type_traits>
@@ -1753,6 +1754,80 @@ TEST_F(OptionsTest, CheckBlockBasedTableOptions) {
                                                        "no_block_cache=0;"));
   ASSERT_NE(bbto->block_cache.get(), nullptr);
   ASSERT_OK(cf_opts.table_factory->ValidateOptions(db_opts, cf_opts));
+}
+
+TEST_F(OptionsTest, KiWiTableOptions) {
+  ConfigOptions config_options;
+  DBOptions db_opts;
+  ColumnFamilyOptions cf_opts;
+  ASSERT_OK(TableFactory::CreateFromString(
+      config_options, "BlockBasedTable", &cf_opts.table_factory));
+  const auto* bbto =
+      cf_opts.table_factory->GetOptions<BlockBasedTableOptions>();
+  ASSERT_NE(bbto, nullptr);
+
+  // Off by default, and the default configuration validates.
+  ASSERT_EQ(bbto->kiwi_tile_pages, 0U);
+  ASSERT_EQ(bbto->kiwi_delete_key_offset, 0U);
+  ASSERT_OK(cf_opts.table_factory->ValidateOptions(db_opts, cf_opts));
+
+  // Parses from a string and shows up in the printable options.
+  ASSERT_OK(cf_opts.table_factory->ConfigureFromString(
+      config_options, "kiwi_tile_pages=8;kiwi_delete_key_offset=16;"));
+  ASSERT_EQ(bbto->kiwi_tile_pages, 8U);
+  ASSERT_EQ(bbto->kiwi_delete_key_offset, 16U);
+  ASSERT_OK(cf_opts.table_factory->ValidateOptions(db_opts, cf_opts));
+  std::string printed = cf_opts.table_factory->GetPrintableOptions();
+  ASSERT_NE(printed.find("kiwi_tile_pages: 8"), std::string::npos);
+  ASSERT_NE(printed.find("kiwi_delete_key_offset: 16"), std::string::npos);
+
+  // Round-trips through the options string.
+  std::string str;
+  ASSERT_OK(cf_opts.table_factory->GetOptionString(config_options, &str));
+  std::shared_ptr<TableFactory> copy;
+  ASSERT_OK(TableFactory::CreateFromString(config_options, "BlockBasedTable",
+                                           &copy));
+  ASSERT_OK(copy->ConfigureFromString(config_options, str));
+  ASSERT_EQ(copy->GetOptions<BlockBasedTableOptions>()->kiwi_tile_pages, 8U);
+
+  // Each unsupported combination is rejected with NotSupported. Every case
+  // gets a fresh factory so settings do not leak between cases.
+  const auto expect_not_supported =
+      [&](const std::string& extra_tbl_opts,
+          const std::function<void(ColumnFamilyOptions*)>& tweak_cf) {
+        ColumnFamilyOptions cfo;
+        ASSERT_OK(TableFactory::CreateFromString(
+            config_options, "BlockBasedTable", &cfo.table_factory));
+        ASSERT_OK(cfo.table_factory->ConfigureFromString(
+            config_options, "kiwi_tile_pages=4;" + extra_tbl_opts));
+        tweak_cf(&cfo);
+        ASSERT_EQ(cfo.table_factory->ValidateOptions(db_opts, cfo).code(),
+                  Status::kNotSupported)
+            << extra_tbl_opts;
+      };
+  expect_not_supported(
+      "index_type=kTwoLevelIndexSearch;partition_filters=true;",
+      [](ColumnFamilyOptions*) {});
+  expect_not_supported("", [](ColumnFamilyOptions* cfo) {
+    cfo->compression_opts.parallel_threads = 2;
+  });
+  expect_not_supported("", [](ColumnFamilyOptions* cfo) {
+    cfo->bottommost_compression_opts.max_dict_bytes = 4096;
+  });
+  expect_not_supported("", [](ColumnFamilyOptions* cfo) {
+    cfo->comparator = test::BytewiseComparatorWithU64TsWrapper();
+  });
+  // kiwi_tile_pages <= 1 means KiWi is off, so nothing is rejected.
+  {
+    ColumnFamilyOptions cfo;
+    ASSERT_OK(TableFactory::CreateFromString(
+        config_options, "BlockBasedTable", &cfo.table_factory));
+    ASSERT_OK(cfo.table_factory->ConfigureFromString(
+        config_options, "kiwi_tile_pages=1;index_type=kTwoLevelIndexSearch;"
+                        "partition_filters=true;"));
+    cfo.compression_opts.parallel_threads = 2;
+    ASSERT_OK(cfo.table_factory->ValidateOptions(db_opts, cfo));
+  }
 }
 
 TEST_F(OptionsTest, MutableTableOptions) {

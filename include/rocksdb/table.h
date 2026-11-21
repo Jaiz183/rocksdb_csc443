@@ -857,6 +857,40 @@ struct BlockBasedTableOptions {
   // Default: false
   bool separate_key_value_in_data_block = false;
 
+  // Key Weaving Storage Layout (KiWi) from the Lethe paper. When
+  // kiwi_tile_pages >= 2, newly written SST files group every
+  // `kiwi_tile_pages` consecutive data blocks ("pages") into a delete tile.
+  // Tiles remain ordered by key; inside a tile, pages are ordered by a
+  // secondary "delete key" D, and entries inside each page stay ordered by key.
+  // Each page gets its own Bloom filter (built from `filter_policy`), and the
+  // per-page filters and D ranges are kept in memory, so a secondary range
+  // delete can skip whole pages without reading them.
+  //
+  // Larger values make secondary deletes cheaper but make point lookups probe
+  // more page filters and short range scans read more pages per tile. 0 or 1
+  // disables KiWi (the default); only newly written files are affected.
+  //
+  // KiWi files have no whole-file filter, and cannot be combined with
+  // parallel compression, compression dictionaries, kHashSearch indexes,
+  // partitioned filters, user_defined_index_factory or user-defined
+  // timestamps; such combinations are rejected by ValidateOptions().
+  //
+  // Files written with KiWi cannot be read by binaries that predate it.
+  //
+  // Default: 0 (disabled)
+  uint32_t kiwi_tile_pages = 0;
+
+  // Where the delete key D lives in a value when kiwi_tile_pages >= 2: D is
+  // the 8-byte big-endian unsigned integer starting at this byte offset of the
+  // value of every kTypeValue entry. Entries of other types (tombstones, merge
+  // operands, blob indexes, wide columns) have no delete key and are never
+  // dropped by a secondary delete. Writing a value shorter than
+  // kiwi_delete_key_offset + 8 bytes to a KiWi file fails the write of that
+  // file. Ignored when KiWi is disabled.
+  //
+  // Default: 0
+  uint32_t kiwi_delete_key_offset = 0;
+
   // Coefficient of variation (CV) threshold used to determine if keys in an
   // index block are uniformly distributed. Lower CV means more "uniform", and
   // the more likely interpolation search will outperform binary search.

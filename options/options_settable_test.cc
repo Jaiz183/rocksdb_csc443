@@ -249,6 +249,7 @@ TEST_F(OptionsSettableTest, BlockBasedTableOptionsAllFieldsSettable) {
       "initial_auto_readahead_size=0;"
       "num_file_reads_for_auto_readahead=0;"
       "separate_key_value_in_data_block=true;"
+      "kiwi_tile_pages=4;kiwi_delete_key_offset=8;"
       "uniform_cv_threshold=0.2",
       new_bbto));
 
