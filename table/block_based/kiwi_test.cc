@@ -477,6 +477,7 @@ struct BuiltTable {
   std::vector<TileLayout> tiles;
   std::unique_ptr<TableProperties> props;
   std::string directory;  // contents of the KiWi directory meta block
+  uint64_t directory_offset = 0;
 };
 
 struct BuildParams {
@@ -564,14 +565,61 @@ void BuildKiWiTable(const std::vector<Entry>& entries, const BuildParams& bp,
                                 kBlockBasedTableMagicNumber, ioptions,
                                 read_options, &out->props));
 
-  BlockHandle directory_handle;
-  ASSERT_OK(FindMetaBlockInFile(file_reader.get(), out->contents.size(),
-                                kBlockBasedTableMagicNumber, ioptions,
-                                read_options, kDirectoryBlockName,
-                                &directory_handle));
-  // Stored uncompressed; the checksum trailer follows the payload.
-  out->directory =
-      out->contents.substr(directory_handle.offset(), directory_handle.size());
+  out->directory.clear();
+  if (bp.tile_pages >= 2) {
+    BlockHandle directory_handle;
+    ASSERT_OK(FindMetaBlockInFile(file_reader.get(), out->contents.size(),
+                                  kBlockBasedTableMagicNumber, ioptions,
+                                  read_options, kDirectoryBlockName,
+                                  &directory_handle));
+    // Stored uncompressed; the checksum trailer follows the payload.
+    out->directory = out->contents.substr(directory_handle.offset(),
+                                          directory_handle.size());
+    out->directory_offset = directory_handle.offset();
+  }
+}
+
+// A table reader and everything it refers to for as long as it lives: the
+// reader keeps references to the options, comparator and table factory.
+struct OpenedTable {
+  Options options;
+  std::unique_ptr<ImmutableOptions> ioptions;
+  std::unique_ptr<MutableCFOptions> moptions;
+  std::unique_ptr<InternalKeyComparator> ikc;
+  std::unique_ptr<BlockBasedTableFactory> factory;
+  std::unique_ptr<TableReader> reader;
+};
+
+// Opens `contents` (a file written by BuildKiWiTable) with the block-based
+// table reader.
+Status OpenTable(const std::string& contents, const BuildParams& bp,
+                 OpenedTable* out) {
+  out->options.comparator = bp.comparator;
+  out->ioptions = std::make_unique<ImmutableOptions>(out->options);
+  out->moptions = std::make_unique<MutableCFOptions>(out->options);
+  out->ikc = std::make_unique<InternalKeyComparator>(out->options.comparator);
+  BlockBasedTableOptions bbto;
+  bbto.block_size = bp.block_size;
+  if (bp.filters) {
+    bbto.filter_policy.reset(NewBloomFilterPolicy(10));
+  }
+  out->factory = std::make_unique<BlockBasedTableFactory>(bbto);
+  std::unique_ptr<FSRandomAccessFile> source(
+      new test::StringSource(contents, 1, /*mmap=*/false));
+  std::unique_ptr<RandomAccessFileReader> file_reader(
+      new RandomAccessFileReader(std::move(source), "test"));
+  return out->factory->NewTableReader(
+      TableReaderOptions(*out->ioptions, out->moptions->prefix_extractor,
+                         out->moptions->compression_manager.get(),
+                         EnvOptions(), *out->ikc,
+                         /*block_protection_bytes_per_key=*/0,
+                         /*skip_filters=*/false, /*immortal=*/false,
+                         /*force_direct_prefetch=*/false, /*level=*/-1,
+                         /*block_cache_tracer=*/nullptr,
+                         out->moptions->write_buffer_size, "",
+                         /*cur_file_num=*/1, kNullUniqueId64x2,
+                         /*largest_seqno=*/0),
+      std::move(file_reader), contents.size(), &out->reader);
 }
 
 // Entries in internal key order: ascending user keys, several versions each
@@ -887,6 +935,74 @@ TEST(KiWiBuilderTest, ParallelCompressionRequestIsDowngraded) {
     pages += t.pages.size();
   }
   ASSERT_EQ(table.props->num_data_blocks, pages);
+}
+TEST(KiWiReaderTest, DirectoryIsLoadedAndPinned) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  for (int iter = 0; iter < 10; ++iter) {
+    BuildParams bp;
+    bp.tile_pages = 2 + static_cast<uint32_t>(rnd.Uniform(7));
+    bp.block_size = 64 + rnd.Uniform(300);
+    bp.filters = !rnd.OneIn(4);
+    BuiltTable table;
+    BuildKiWiTable(MakeEntries(&rnd, 100 + rnd.Uniform(200), 0, 50), bp,
+                   &table);
+
+    OpenedTable opened;
+    ASSERT_OK(OpenTable(table.contents, bp, &opened));
+    const kiwi::Directory* dir =
+        static_cast<BlockBasedTable*>(opened.reader.get())
+            ->TEST_GetKiWiDirectory();
+    ASSERT_NE(dir, nullptr);
+
+    Directory expected;
+    ASSERT_OK(expected.Decode(table.directory));
+    ASSERT_EQ(dir->num_tiles(), expected.num_tiles());
+    for (size_t t = 0; t < dir->num_tiles(); ++t) {
+      const Directory::TileView got = dir->tile(t);
+      const Directory::TileView want = expected.tile(t);
+      ASSERT_EQ(got.num_pages, want.num_pages);
+      for (size_t i = 0; i < got.num_pages; ++i) {
+        ASSERT_EQ(got.pages[i].handle, want.pages[i].handle);
+        ASSERT_EQ(got.pages[i].min_delete_key, want.pages[i].min_delete_key);
+        ASSERT_EQ(got.pages[i].max_delete_key, want.pages[i].max_delete_key);
+        ASSERT_EQ(got.pages[i].bloom.ToString(),
+                  want.pages[i].bloom.ToString());
+      }
+    }
+    // The pinned directory is part of the reader's accounted memory.
+    ASSERT_GE(opened.reader->ApproximateMemoryUsage(), table.directory.size());
+  }
+}
+
+TEST(KiWiReaderTest, PlainFileHasNoDirectory) {
+  Random64 rnd(3);
+  BuildParams bp;
+  bp.tile_pages = 1;  // KiWi off
+  BuiltTable table;
+  BuildKiWiTable(MakeEntries(&rnd, 100, 0, 50), bp, &table);
+  ASSERT_TRUE(table.tiles.empty());
+  OpenedTable opened;
+  ASSERT_OK(OpenTable(table.contents, bp, &opened));
+  const auto* table_reader = static_cast<BlockBasedTable*>(opened.reader.get());
+  ASSERT_EQ(table_reader->TEST_GetKiWiDirectory(), nullptr);
+}
+
+TEST(KiWiReaderTest, CorruptDirectoryFailsOpen) {
+  Random64 rnd(9);
+  BuildParams bp;
+  BuiltTable table;
+  BuildKiWiTable(MakeEntries(&rnd, 200, 0, 50), bp, &table);
+  ASSERT_GT(table.directory.size(), 8U);
+  // Flip one payload byte of the directory: the checksum must catch it.
+  std::string bad = table.contents;
+  bad[table.directory_offset + table.directory.size() / 2] ^= 0x55;
+  OpenedTable opened;
+  ASSERT_EQ(OpenTable(bad, bp, &opened).code(), Status::kCorruption);
+  // The untouched file still opens.
+  OpenedTable intact;
+  ASSERT_OK(OpenTable(table.contents, bp, &intact));
 }
 #endif  // !NDEBUG
 

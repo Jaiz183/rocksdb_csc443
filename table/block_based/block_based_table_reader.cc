@@ -1000,6 +1000,11 @@ Status BlockBasedTable::Open(
   if (!s.ok()) {
     return s;
   }
+  s = new_table->ReadKiWiDirectory(ro, prefetch_buffer.get(),
+                                   metaindex_iter.get());
+  if (!s.ok()) {
+    return s;
+  }
   rep->verify_checksum_set_on_open = ro.verify_checksums;
   s = new_table->PrefetchIndexAndFilterBlocks(
       ro, prefetch_buffer.get(), metaindex_iter.get(), new_table.get(),
@@ -1679,6 +1684,47 @@ Status BlockBasedTable::ResolveEmbeddedValueForGet(
   return s;
 }
 
+Status BlockBasedTable::ReadKiWiDirectory(const ReadOptions& ro,
+                                          FilePrefetchBuffer* prefetch_buffer,
+                                          InternalIterator* meta_iter) {
+  const auto& props = rep_->table_properties->user_collected_properties;
+  if (props.find(kiwi::kPropTilePages) == props.end()) {
+    return Status::OK();
+  }
+  // A KiWi file cannot be read without its directory: fail the open.
+  BlockHandle handle;
+  Status s = FindMetaBlock(meta_iter, kiwi::kDirectoryBlockName, &handle);
+  if (!s.ok()) {
+    return Status::Corruption("KiWi file without a directory block: " +
+                              s.ToString());
+  }
+  // The directory outlives open and every lookup depends on it, so always
+  // verify its checksum.
+  ReadOptions verified_ro = ro;
+  verified_ro.verify_checksums = true;
+  BlockContents contents;
+  BlockFetcher fetcher(rep_->file.get(), prefetch_buffer, rep_->footer,
+                       verified_ro, handle, &contents, rep_->ioptions,
+                       /*do_uncompress=*/false, /*maybe_compressed=*/false,
+                       BlockType::kProperties, /*decompressor=*/nullptr,
+                       PersistentCacheOptions::kEmpty,
+                       GetMemoryAllocator(rep_->table_options));
+  s = fetcher.ReadBlockContents();
+  if (!s.ok()) {
+    return s;
+  }
+  auto directory = std::make_unique<kiwi::Directory>();
+  s = directory->Decode(contents.data.ToString());
+  if (s.ok()) {
+    rep_->kiwi_directory = std::move(directory);
+  }
+  return s;
+}
+
+const kiwi::Directory* BlockBasedTable::TEST_GetKiWiDirectory() const {
+  return rep_->kiwi_directory.get();
+}
+
 Status BlockBasedTable::ReadRangeDelBlock(
     const ReadOptions& read_options, FilePrefetchBuffer* prefetch_buffer,
     InternalIterator* meta_iter,
@@ -2109,6 +2155,9 @@ size_t BlockBasedTable::ApproximateMemoryUsage() const {
   }
   if (rep_->table_properties) {
     usage += rep_->table_properties->ApproximateMemoryUsage();
+  }
+  if (rep_->kiwi_directory) {
+    usage += rep_->kiwi_directory->ApproximateMemoryUsage();
   }
   // Cached block memory is charged to the block cache. Count the retained raw
   // custom-index block here only when the table reader owns it directly.
