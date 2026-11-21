@@ -206,6 +206,7 @@ LIB_SOURCES =                                                   \
   table/block_based/full_filter_block.cc                        \
   table/block_based/hash_index_reader.cc                        \
   table/block_based/index_builder.cc                            \
+  table/block_based/kiwi_table_iterator.cc                      \
   table/block_based/kiwi_tile.cc                                \
   table/block_based/index_reader_common.cc                      \
   table/block_based/parsed_full_filter_block.cc                 \

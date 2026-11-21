@@ -538,6 +538,8 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
 
   friend class UncompressionDictReader;
 
+  friend class KiWiTableIterator;
+
  protected:
   Rep* rep_;
   explicit BlockBasedTable(Rep* rep, BlockCacheTracer* const block_cache_tracer)

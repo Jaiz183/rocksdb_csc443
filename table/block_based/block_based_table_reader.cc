@@ -63,6 +63,7 @@
 #include "table/block_based/filter_block.h"
 #include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/full_filter_block.h"
+#include "table/block_based/kiwi_table_iterator.h"
 #include "table/block_based/hash_index_reader.h"
 #include "table/block_based/partitioned_filter_block.h"
 #include "table/block_based/partitioned_index_reader.h"
@@ -2861,6 +2862,23 @@ InternalIterator* BlockBasedTable::NewIteratorImpl(
     size_t compaction_readahead_size, bool allow_unprepared_value,
     const Slice* seek_target) {
   BlockCacheLookupContext lookup_context{caller};
+  if (UNLIKELY(rep_->kiwi_directory != nullptr)) {
+    // Pages of a KiWi tile are not in key order, so the block-based iterator
+    // cannot be used. KiWi files have no whole-file filter to consult.
+    std::unique_ptr<InternalIteratorBase<IndexValue>> kiwi_index_iter(
+        NewIndexIterator(read_options, /*disable_prefix_seek=*/false,
+                         /*input_iter=*/nullptr, /*get_context=*/nullptr,
+                         &lookup_context));
+    if (arena == nullptr) {
+      return new KiWiTableIterator(
+          this, read_options, rep_->internal_comparator,
+          std::move(kiwi_index_iter), caller);
+    }
+    auto* mem = arena->AllocateAligned(sizeof(KiWiTableIterator));
+    return new (mem) KiWiTableIterator(this, read_options,
+                                       rep_->internal_comparator,
+                                       std::move(kiwi_index_iter), caller);
+  }
   bool need_upper_bound_check =
       read_options.auto_prefix_mode || PrefixExtractorChanged(prefix_extractor);
   bool check_filter =

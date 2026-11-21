@@ -26,11 +26,13 @@
 #include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/kiwi_tile.h"
+#include "table/internal_iterator.h"
 #include "table/meta_blocks.h"
 #include "table/table_builder.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "memory/arena.h"
 #include "util/compression.h"
 #include "util/random.h"
 
@@ -1004,6 +1006,162 @@ TEST(KiWiReaderTest, CorruptDirectoryFailsOpen) {
   OpenedTable intact;
   ASSERT_OK(OpenTable(table.contents, bp, &intact));
 }
+namespace {
+
+InternalIterator* NewIter(TableReader* reader, Arena* arena = nullptr) {
+  // ReadOptions must outlive the iterator.
+  static const ReadOptions kReadOptions;
+  return reader->NewIterator(kReadOptions, /*prefix_extractor=*/nullptr, arena,
+                             /*skip_filters=*/false,
+                             TableReaderCaller::kUncategorized);
+}
+
+// A table pair built from the same entries: a plain file and a KiWi file.
+struct TablePair {
+  BuiltTable plain_table;
+  BuiltTable kiwi_table;
+  OpenedTable plain;
+  OpenedTable kiwi;
+};
+
+void BuildTablePair(const std::vector<Entry>& entries,
+                    const BuildParams& kiwi_bp, TablePair* out) {
+  BuildParams plain_bp = kiwi_bp;
+  plain_bp.tile_pages = 1;
+  BuildKiWiTable(entries, plain_bp, &out->plain_table);
+  BuildKiWiTable(entries, kiwi_bp, &out->kiwi_table);
+  ASSERT_OK(OpenTable(out->plain_table.contents, plain_bp, &out->plain));
+  ASSERT_OK(OpenTable(out->kiwi_table.contents, kiwi_bp, &out->kiwi));
+}
+
+std::string MakeInternalKeyFromUserKey(const std::string& user_key,
+                                       SequenceNumber seq) {
+  return InternalKey(user_key, seq, kTypeValue).Encode().ToString();
+}
+
+// Same position and same contents.
+void ExpectSameIterator(InternalIterator* expected, InternalIterator* actual) {
+  ASSERT_EQ(expected->Valid(), actual->Valid());
+  if (expected->Valid()) {
+    ASSERT_EQ(expected->key().ToString(), actual->key().ToString());
+    ASSERT_EQ(expected->value().ToString(), actual->value().ToString());
+  }
+  ASSERT_OK(actual->status());
+}
+
+}  // namespace
+
+TEST(KiWiIteratorTest, ForwardScanMatchesPlainTable) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  for (int iter = 0; iter < 15; ++iter) {
+    BuildParams bp;
+    bp.tile_pages = 2 + static_cast<uint32_t>(rnd.Uniform(8));
+    bp.block_size = 64 + rnd.Uniform(400);
+    bp.delete_key_offset = static_cast<uint32_t>(rnd.Uniform(8));
+    TablePair tables;
+    BuildTablePair(MakeEntries(&rnd, 1 + rnd.Uniform(400),
+                               bp.delete_key_offset, 60),
+                   bp, &tables);
+
+    // Both heap and arena allocation.
+    Arena arena;
+    std::unique_ptr<InternalIterator> expected(
+        NewIter(tables.plain.reader.get()));
+    InternalIterator* actual_raw =
+        NewIter(tables.kiwi.reader.get(), rnd.OneIn(2) ? &arena : nullptr);
+    const bool in_arena = arena.MemoryAllocatedBytes() > 0;
+    ASSERT_FALSE(actual_raw->Valid());  // initially invalid
+
+    size_t count = 0;
+    for (expected->SeekToFirst(), actual_raw->SeekToFirst(); expected->Valid();
+         expected->Next(), actual_raw->Next()) {
+      ExpectSameIterator(expected.get(), actual_raw);
+      ++count;
+    }
+    ExpectSameIterator(expected.get(), actual_raw);  // both at the end
+    ASSERT_FALSE(actual_raw->Valid());
+    ASSERT_GT(count, 0U);
+    if (in_arena) {
+      actual_raw->~InternalIterator();
+    } else {
+      delete actual_raw;
+    }
+  }
+}
+
+TEST(KiWiIteratorTest, SeekMatchesPlainTable) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  for (int iter = 0; iter < 10; ++iter) {
+    BuildParams bp;
+    bp.tile_pages = 2 + static_cast<uint32_t>(rnd.Uniform(8));
+    bp.block_size = 64 + rnd.Uniform(300);
+    const size_t num_keys = 20 + rnd.Uniform(300);
+    TablePair tables;
+    BuildTablePair(MakeEntries(&rnd, num_keys, 0, 60), bp, &tables);
+    std::unique_ptr<InternalIterator> expected(
+        NewIter(tables.plain.reader.get()));
+    std::unique_ptr<InternalIterator> actual(NewIter(tables.kiwi.reader.get()));
+
+    for (int probe = 0; probe < 300; ++probe) {
+      // Existing keys, keys between them, before the first and after the last.
+      const uint64_t id = rnd.Uniform(num_keys + 2);
+      char buf[16];
+      snprintf(buf, sizeof(buf), "key%08" PRIu64, id);
+      std::string user_key(buf);
+      if (rnd.OneIn(3)) {
+        user_key.append("x");  // falls between two keys
+      }
+      const std::string target =
+          MakeInternalKeyFromUserKey(user_key, 1000 - rnd.Uniform(5));
+      expected->Seek(target);
+      actual->Seek(target);
+      ExpectSameIterator(expected.get(), actual.get());
+      // Keep going: tile boundaries are crossed when stepping.
+      for (int step = 0; step < 40 && expected->Valid(); ++step) {
+        expected->Next();
+        actual->Next();
+        ExpectSameIterator(expected.get(), actual.get());
+      }
+    }
+    // Seeking again after reaching the end works.
+    expected->SeekToFirst();
+    actual->SeekToFirst();
+    ExpectSameIterator(expected.get(), actual.get());
+  }
+}
+
+TEST(KiWiIteratorTest, CorruptPageSurfacesAsError) {
+  Random64 rnd(21);
+  BuildParams bp;
+  TablePair tables;
+  BuildTablePair(MakeEntries(&rnd, 200, 0, 50), bp, &tables);
+  ASSERT_GT(tables.kiwi_table.tiles.size(), 3U);
+
+  // Corrupt one page in the middle of the file.
+  const TileLayout& tile =
+      tables.kiwi_table.tiles[tables.kiwi_table.tiles.size() / 2];
+  std::string bad = tables.kiwi_table.contents;
+  const BlockHandle& page = tile.pages[tile.pages.size() / 2];
+  bad[page.offset() + page.size() / 2] ^= 0x55;
+  OpenedTable opened;
+  ASSERT_OK(OpenTable(bad, bp, &opened));  // pages are read lazily
+
+  std::unique_ptr<InternalIterator> it(NewIter(opened.reader.get()));
+  size_t seen = 0;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    ++seen;
+  }
+  // The scan stops with an error at the corrupted tile; it never silently
+  // skips it.
+  ASSERT_EQ(it->status().code(), Status::kCorruption);
+  ASSERT_FALSE(it->Valid());
+  ASSERT_LT(seen, tables.kiwi_table.props->num_entries);
+}
+
 #endif  // !NDEBUG
 
 }  // namespace kiwi
