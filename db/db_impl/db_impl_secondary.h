@@ -215,6 +215,11 @@ class DBImplSecondary : public DBImpl {
                       const Slice* /*begin*/, const Slice* /*end*/) override {
     return Status::NotSupported("Not supported operation in secondary mode.");
   }
+  using DBImpl::SecondaryDeleteBelow;
+  Status SecondaryDeleteBelow(ColumnFamilyHandle* /*column_family*/,
+                              uint64_t /*delete_key_floor*/) override {
+    return Status::NotSupported("Not supported operation in secondary mode.");
+  }
 
   using DBImpl::CompactFiles;
   Status CompactFiles(

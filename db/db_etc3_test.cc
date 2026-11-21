@@ -9,6 +9,7 @@
 #include "rocksdb/metadata.h"
 #include "rocksdb/sst_file_writer.h"
 #include "rocksdb/utilities/options_util.h"
+#include "rocksdb/utilities/stackable_db.h"
 #include "table/block_based/kiwi_tile.h"
 #include "util/defer.h"
 #include "util/random.h"
@@ -1578,6 +1579,53 @@ TEST_F(DBKiWiSecondaryDeleteTest, BusyWhileACompactionRewritesAFile) {
   VerifyModel(model);
   ASSERT_OK(db_->SecondaryDeleteBelow(150));
   EraseBelow(&model, 150);
+  VerifyModel(model);
+}
+
+TEST_F(DBKiWiSecondaryDeleteTest, ReadOnlyAndSecondaryInstancesRefuse) {
+  Options options = KiWiOptions(4);
+  DestroyAndReopen(options);
+  Random64 rnd(17);
+  for (uint64_t i = 0; i < 50; ++i) {
+    ASSERT_OK(Put(KiWiKey(i), TimestampedValue(i, &rnd)));
+  }
+  ASSERT_OK(Flush());
+
+  std::unique_ptr<DB> read_only;
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname_, &read_only));
+  ASSERT_EQ(read_only->SecondaryDeleteBelow(1000).code(),
+            Status::kNotSupported);
+
+  options.max_open_files = -1;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(DB::OpenAsSecondary(options, dbname_, dbname_ + "/secondary",
+                                &secondary));
+  ASSERT_EQ(secondary->SecondaryDeleteBelow(1000).code(),
+            Status::kNotSupported);
+  // The refusal leaves the read-only instance serving its data. (What a
+  // secondary instance sees right after open depends on timing, so it is not
+  // asserted here.)
+  std::string value;
+  ASSERT_OK(read_only->Get(ReadOptions(), KiWiKey(1), &value));
+}
+
+TEST_F(DBKiWiSecondaryDeleteTest, StackableDBForwardsTheCall) {
+  Options options = KiWiOptions(4);
+  DestroyAndReopen(options);
+  Random64 rnd(19);
+  Model model;
+  for (uint64_t i = 0; i < 100; ++i) {
+    const std::string value = TimestampedValue(i, &rnd);
+    ASSERT_OK(Put(KiWiKey(i), value));
+    model[KiWiKey(i)] = value;
+  }
+  // Shares the database with the fixture instead of owning it alone.
+  std::shared_ptr<DB> shared_db(db_.get(), [](DB*) {});
+  StackableDB stackable(shared_db);
+  ASSERT_OK(stackable.SecondaryDeleteBelow(40));
+  ASSERT_OK(
+      stackable.SecondaryDeleteBelow(stackable.DefaultColumnFamily(), 40));
+  EraseBelow(&model, 40);
   VerifyModel(model);
 }
 
