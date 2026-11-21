@@ -3121,6 +3121,11 @@ bool CompactionJob::UpdateInternalStatsFromInputFiles(
     for (size_t i = 0; i < num_input_files; ++i) {
       const FileMetaData* file_meta = flevel->files[i].file_metadata;
       *bytes_read += file_meta->fd.GetFileSize();
+      if (file_meta->kiwi_delete_floor != 0) {
+        // Entries below the floor are hidden from the input, so the number of
+        // records compaction processes is smaller than the file's entry count.
+        job_stats_->has_accurate_num_input_records = false;
+      }
       uint64_t file_input_entries = file_meta->num_entries;
       uint64_t file_num_range_del = file_meta->num_range_deletions;
       if (file_input_entries == 0) {

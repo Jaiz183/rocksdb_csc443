@@ -711,6 +711,38 @@ class DB {
                              ColumnFamilyHandle* column_family,
                              const Slice& begin_key, const Slice& end_key,
                              const Slice& ts);
+
+  // KiWi secondary delete (Lethe). Deletes every entry of the column family
+  // whose delete key (see BlockBasedTableOptions::kiwi_tile_pages and
+  // kiwi_delete_key_offset) is below `delete_key_floor`, without a full
+  // compaction: the deletion is recorded in the MANIFEST per file and costs no
+  // data I/O. Reads stop seeing the entries when this returns; the space is
+  // reclaimed by background compaction. Calling it again with a floor that is
+  // not higher has no effect.
+  //
+  // Contract: for any user key, the delete key of a newer version must not be
+  // smaller than that of an older version (true for write-time timestamps).
+  // Then a version being deleted implies that all older versions are, so no
+  // stale value can reappear. Only entries written as plain values have a
+  // delete key; deletions, merge operands, blob references and wide-column
+  // entities are never removed by this call.
+  //
+  // Entries still in the memtable are flushed first. Writes made after this
+  // returns are not affected, whatever their delete key. Snapshots and
+  // iterators taken before the call may stop seeing the deleted entries.
+  //
+  // Returns NotSupported if a live file was not written with KiWi delete tiles
+  // (for example because kiwi_tile_pages was enabled later): compact those
+  // files first. Returns Busy, changing nothing, if a compaction is rewriting
+  // a file that has entries to delete or the column family kept changing;
+  // retry later.
+  virtual Status SecondaryDeleteBelow(ColumnFamilyHandle* /*column_family*/,
+                                      uint64_t /*delete_key_floor*/) {
+    return Status::NotSupported("SecondaryDeleteBelow");
+  }
+  virtual Status SecondaryDeleteBelow(uint64_t delete_key_floor) {
+    return SecondaryDeleteBelow(DefaultColumnFamily(), delete_key_floor);
+  }
   virtual Status DeleteRange(const WriteOptions& options,
                              const Slice& begin_key, const Slice& end_key) {
     return DeleteRange(options, DefaultColumnFamily(), begin_key, end_key);

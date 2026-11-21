@@ -216,6 +216,14 @@ void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
   added.kiwi_delete_floor = f.kiwi_delete_floor;
 }
 
+void VersionEdit::AddFileWithKiWiDeleteFloor(int level, const FileMetaData& f,
+                                             uint64_t floor) {
+  AddExistingFile(level, f, /*provenance_flags_to_set=*/0);
+  FileMetaData& added = new_files_.back().second;
+  added.kiwi_delete_floor = floor;
+  added.marked_for_compaction = true;
+}
+
 bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
     uint64_t current_log_number) const {
   return (HasLogNumber() && GetLogNumber() > current_log_number) ||

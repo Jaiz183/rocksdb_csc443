@@ -1362,6 +1362,225 @@ TEST_F(DBKiWiTest, OptionsFileRoundTrip) {
   ASSERT_EQ(bbto->kiwi_delete_key_offset, 3U);
 }
 
+// Secondary delete: entries with a delete key below a floor disappear without
+// a full compaction.
+class DBKiWiSecondaryDeleteTest : public DBKiWiTest {
+ public:
+  // Values carry a delete key that never decreases for a key, as write-time
+  // timestamps do: the contract of SecondaryDeleteBelow().
+  static std::string TimestampedValue(uint64_t timestamp, Random64* rnd) {
+    std::string value(8 + rnd->Uniform(40), 'v');
+    for (size_t i = 0; i < 8; ++i) {
+      value[i] = static_cast<char>((timestamp >> (8 * (7 - i))) & 0xff);
+    }
+    return value;
+  }
+  static uint64_t DeleteKeyOf(const std::string& value) {
+    uint64_t d = 0;
+    for (size_t i = 0; i < 8; ++i) {
+      d = (d << 8) | static_cast<unsigned char>(value[i]);
+    }
+    return d;
+  }
+
+  // Applies the secondary delete to the model as well.
+  static void EraseBelow(Model* model, uint64_t floor) {
+    for (auto it = model->begin(); it != model->end();) {
+      it = DeleteKeyOf(it->second) < floor ? model->erase(it) : std::next(it);
+    }
+  }
+
+  // Busy means a compaction is rewriting an affected file: wait and retry.
+  Status DeleteBelow(uint64_t floor) {
+    Status s;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+      s = db_->SecondaryDeleteBelow(floor);
+      if (!s.IsBusy()) {
+        break;
+      }
+      EXPECT_OK(dbfull()->TEST_WaitForCompact());
+    }
+    return s;
+  }
+
+  // Sum of the entries stored in all files (deleted ones included until
+  // compaction rewrites the files).
+  uint64_t StoredEntries() {
+    TablePropertiesCollection props;
+    EXPECT_OK(db_->GetPropertiesOfAllTables(&props));
+    uint64_t total = 0;
+    for (const auto& file : props) {
+      total += file.second->num_entries;
+    }
+    return total;
+  }
+};
+
+TEST_F(DBKiWiSecondaryDeleteTest, DeletesBelowTheFloorAndSurvivesRestarts) {
+  Random64 rnd(Env::Default()->NowMicros());
+  for (uint32_t tile_pages : {2U, 5U}) {
+    SCOPED_TRACE("tile_pages=" + std::to_string(tile_pages));
+    Options options = KiWiOptions(tile_pages);
+    DestroyAndReopen(options);
+    Model model;
+    uint64_t clock = 1000;
+    // Overwrites (newer versions have larger delete keys), deletes, flushes
+    // and compactions, so that versions of a key sit in several files.
+    for (int op = 0; op < 3000; ++op) {
+      const std::string key = KiWiKey(rnd.Uniform(kNumKeys));
+      if (rnd.OneIn(10)) {
+        ASSERT_OK(Delete(key));
+        model.erase(key);
+      } else {
+        const std::string value = TimestampedValue(clock++, &rnd);
+        ASSERT_OK(Put(key, value));
+        model[key] = value;
+      }
+      if (op % 400 == 399) {
+        ASSERT_OK(Flush());
+      }
+    }
+    VerifyModel(model);
+
+    // Delete the oldest third of what was written.
+    const uint64_t floor = 1000 + (clock - 1000) / 3;
+    ASSERT_OK(DeleteBelow(floor));
+    EraseBelow(&model, floor);
+    VerifyModel(model);
+    ASSERT_GT(CountKiWiFiles(), 0U);
+
+    // Idempotent, and a lower floor changes nothing.
+    ASSERT_OK(DeleteBelow(floor));
+    ASSERT_OK(DeleteBelow(floor / 2));
+    VerifyModel(model);
+
+    // Persistent: the floors are in the MANIFEST.
+    Reopen(options);
+    VerifyModel(model);
+
+    // Space is reclaimed by background compaction, which reads through the
+    // floor, and a later, higher floor still applies.
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    VerifyModel(model);
+    // Rewriting every file, bottommost ones included, drops what was deleted.
+    CompactRangeOptions rewrite_all;
+    rewrite_all.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(rewrite_all, nullptr, nullptr));
+    VerifyModel(model);
+    ASSERT_EQ(StoredEntries(), model.size());
+    const uint64_t floor2 = 1000 + (clock - 1000) * 2 / 3;
+    ASSERT_OK(DeleteBelow(floor2));
+    EraseBelow(&model, floor2);
+    VerifyModel(model);
+    Reopen(options);
+    VerifyModel(model);
+  }
+}
+
+TEST_F(DBKiWiSecondaryDeleteTest, FloorCoversEntriesInTheMemtable) {
+  Options options = KiWiOptions(4);
+  DestroyAndReopen(options);
+  Random64 rnd(7);
+  Model model;
+  for (uint64_t i = 0; i < 100; ++i) {
+    const std::string value = TimestampedValue(100 + i, &rnd);
+    ASSERT_OK(Put(KiWiKey(i), value));
+    model[KiWiKey(i)] = value;
+  }
+  // Nothing was flushed: the call flushes first.
+  ASSERT_OK(DeleteBelow(150));
+  EraseBelow(&model, 150);
+  VerifyModel(model);
+  // New writes are not affected, even with a delete key below the floor.
+  const std::string late = TimestampedValue(1, &rnd);
+  ASSERT_OK(Put(KiWiKey(3), late));
+  model[KiWiKey(3)] = late;
+  ASSERT_OK(Flush());
+  VerifyModel(model);
+}
+
+TEST_F(DBKiWiSecondaryDeleteTest, FloorBelowEverythingChangesNothing) {
+  Options options = KiWiOptions(4);
+  DestroyAndReopen(options);
+  Random64 rnd(11);
+  Model model;
+  for (uint64_t i = 0; i < 300; ++i) {
+    const std::string value = TimestampedValue(5000 + i, &rnd);
+    ASSERT_OK(Put(KiWiKey(i), value));
+    model[KiWiKey(i)] = value;
+  }
+  ASSERT_OK(Flush());
+  const uint64_t manifest_before = dbfull()->TEST_Current_Manifest_FileNo();
+  ASSERT_OK(db_->SecondaryDeleteBelow(5000));  // below every delete key
+  ASSERT_OK(db_->SecondaryDeleteBelow(0));
+  VerifyModel(model);
+  ASSERT_EQ(manifest_before, dbfull()->TEST_Current_Manifest_FileNo());
+}
+
+TEST_F(DBKiWiSecondaryDeleteTest, FilesWithoutDeleteTilesAreRejected) {
+  // A database that was not using KiWi when its files were written.
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", std::string(16, 'x')));
+  ASSERT_OK(Flush());
+  Status s = db_->SecondaryDeleteBelow(100);
+  ASSERT_EQ(s.code(), Status::kNotSupported) << s.ToString();
+
+  // Enabling KiWi later does not fix old files, and nothing was half deleted.
+  Reopen(KiWiOptions(4));
+  ASSERT_EQ(db_->SecondaryDeleteBelow(100).code(), Status::kNotSupported);
+  ASSERT_EQ(Get("a"), std::string(16, 'x'));
+  // After they are rewritten with tiles, it works. An overlapping file makes
+  // the compaction merge (and so rewrite) instead of just moving the old file.
+  ASSERT_OK(Put("a", std::string(16, 'y')));
+  ASSERT_OK(Put("b", std::string(16, 'z')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(DeleteBelow(std::numeric_limits<uint64_t>::max()));
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+}
+
+TEST_F(DBKiWiSecondaryDeleteTest, BusyWhileACompactionRewritesAFile) {
+  Options options = KiWiOptions(4);
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  Random64 rnd(13);
+  Model model;
+  for (int round = 0; round < 2; ++round) {
+    for (uint64_t i = 0; i < 200; ++i) {
+      const std::string value = TimestampedValue(100 * (round + 1) + i, &rnd);
+      ASSERT_OK(Put(KiWiKey(i), value));
+      model[KiWiKey(i)] = value;
+    }
+    ASSERT_OK(Flush());
+  }
+
+  // A manual compaction claims its input files, then is held back until the
+  // test is done with them.
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BackgroundCompaction:NonTrivial:BeforeRun",
+        "DBKiWiSecondaryDeleteTest::CompactionHasItsFiles"},
+       {"DBKiWiSecondaryDeleteTest::DeleteWasRefused",
+        "CompactionJob::Run():Start"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  ROCKSDB_NAMESPACE::port::Thread compaction([&]() {
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  });
+  TEST_SYNC_POINT("DBKiWiSecondaryDeleteTest::CompactionHasItsFiles");
+  Status s = db_->SecondaryDeleteBelow(150);
+  ASSERT_EQ(s.code(), Status::kBusy) << s.ToString();
+  TEST_SYNC_POINT("DBKiWiSecondaryDeleteTest::DeleteWasRefused");
+  compaction.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Nothing changed, and it works once the compaction is over.
+  VerifyModel(model);
+  ASSERT_OK(db_->SecondaryDeleteBelow(150));
+  EraseBelow(&model, 150);
+  VerifyModel(model);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

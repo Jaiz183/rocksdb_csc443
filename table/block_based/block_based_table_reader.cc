@@ -1751,7 +1751,7 @@ Status BlockBasedTable::SetKiWiDeleteFloor(uint64_t floor) {
   return Status::OK();
 }
 
-uint64_t BlockBasedTable::TEST_GetKiWiDeleteFloor() const {
+uint64_t BlockBasedTable::KiWiDeleteFloor() const {
   return rep_->kiwi_delete_floor;
 }
 

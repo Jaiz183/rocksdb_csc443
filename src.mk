@@ -58,6 +58,7 @@ LIB_SOURCES =                                                   \
   db/db_impl/db_impl_experimental.cc                            \
   db/db_impl/db_impl_files.cc                                   \
   db/db_impl/db_impl_follower.cc                                \
+  db/db_impl/db_impl_kiwi.cc                                    \
   db/db_impl/db_impl_open.cc                                    \
   db/db_impl/db_impl_readonly.cc                                \
   db/db_impl/db_impl_secondary.cc                               \

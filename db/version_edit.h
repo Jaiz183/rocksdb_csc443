@@ -946,6 +946,12 @@ class VersionEdit {
   void AddExistingFile(int level, const FileMetaData& f,
                        uint32_t provenance_flags_to_set);
 
+  // AddExistingFile() for a KiWi secondary delete: the file keeps its number
+  // and level but gets `floor` as its delete floor, and is marked for
+  // compaction so that background compaction reclaims the deleted entries.
+  void AddFileWithKiWiDeleteFloor(int level, const FileMetaData& f,
+                                  uint64_t floor);
+
   const NewFiles& GetNewFiles() const { return new_files_; }
 
   NewFiles& GetMutableNewFiles() { return new_files_; }

@@ -665,6 +665,10 @@ class DBImpl : public DB
                              const RangeOpt* ranges, size_t n,
                              bool include_end = true);
 
+  using DB::SecondaryDeleteBelow;
+  Status SecondaryDeleteBelow(ColumnFamilyHandle* column_family,
+                              uint64_t delete_key_floor) override;
+
   void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) override;
 
   Status GetLiveFilesChecksumInfo(FileChecksumList* checksum_list) override;

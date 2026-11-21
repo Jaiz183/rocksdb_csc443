@@ -816,6 +816,7 @@ set(SOURCES
         db/db_impl/db_impl_compaction_flush.cc
         db/db_impl/db_impl_files.cc
         db/db_impl/db_impl_follower.cc
+        db/db_impl/db_impl_kiwi.cc
         db/db_impl/db_impl_open.cc
         db/db_impl/db_impl_debug.cc
         db/db_impl/db_impl_experimental.cc

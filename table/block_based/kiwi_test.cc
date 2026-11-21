@@ -1005,12 +1005,10 @@ TEST(KiWiReaderTest, DeleteFloorIsHandedToKiWiFilesOnly) {
   OpenedTable opened;
   ASSERT_OK(OpenTable(kiwi_table.contents, bp, &opened, /*floor=*/777));
   const auto* reader = static_cast<BlockBasedTable*>(opened.reader.get());
-  ASSERT_EQ(reader->TEST_GetKiWiDeleteFloor(), 777U);
+  ASSERT_EQ(reader->KiWiDeleteFloor(), 777U);
   OpenedTable no_floor;
   ASSERT_OK(OpenTable(kiwi_table.contents, bp, &no_floor));
-  ASSERT_EQ(static_cast<BlockBasedTable*>(no_floor.reader.get())
-                ->TEST_GetKiWiDeleteFloor(),
-            0U);
+  ASSERT_EQ(no_floor.reader->KiWiDeleteFloor(), 0U);
 
   // A floor on a file that has no tiles is metadata corruption: fail the open
   // instead of ignoring a delete.

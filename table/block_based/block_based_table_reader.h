@@ -412,7 +412,8 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   bool TEST_FilterBlockInCache() const;
   // nullptr unless the file was written with KiWi delete tiles.
   const kiwi::Directory* TEST_GetKiWiDirectory() const;
-  uint64_t TEST_GetKiWiDeleteFloor() const;
+
+  uint64_t KiWiDeleteFloor() const override;
 
   // Applies a secondary delete recorded for this file (see
   // FileMetaData::kiwi_delete_floor). Only a KiWi file can have one.
