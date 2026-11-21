@@ -20,6 +20,9 @@
 #include "rocksdb/convenience.h"
 #include "rocksdb/env.h"
 #include "rocksdb/filter_policy.h"
+#include "rocksdb/statistics.h"
+#include "table/get_context.h"
+#include "table/multiget_context.h"
 #include "rocksdb/table.h"
 #include "table/block_based/block.h"
 #include "table/block_based/block_based_table_factory.h"
@@ -33,6 +36,7 @@
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "memory/arena.h"
+#include "util/autovector.h"
 #include "util/compression.h"
 #include "util/random.h"
 
@@ -597,6 +601,7 @@ struct OpenedTable {
 Status OpenTable(const std::string& contents, const BuildParams& bp,
                  OpenedTable* out) {
   out->options.comparator = bp.comparator;
+  out->options.statistics = CreateDBStatistics();
   out->ioptions = std::make_unique<ImmutableOptions>(out->options);
   out->moptions = std::make_unique<MutableCFOptions>(out->options);
   out->ikc = std::make_unique<InternalKeyComparator>(out->options.comparator);
@@ -1273,6 +1278,256 @@ TEST(KiWiIteratorTest, CorruptPageSurfacesAsError) {
   ASSERT_EQ(it->status().code(), Status::kCorruption);
   ASSERT_FALSE(it->Valid());
   ASSERT_LT(seen, tables.kiwi_table.props->num_entries);
+}
+
+namespace {
+
+struct GetResult {
+  GetContext::GetState state = GetContext::kNotFound;
+  std::string value;
+};
+
+// Looks up `user_key` as of `snapshot_seq`.
+Status DoGet(const OpenedTable& table, const std::string& user_key,
+             SequenceNumber snapshot_seq, GetResult* out) {
+  PinnableSlice value;
+  const InternalKey lkey(user_key, snapshot_seq, kValueTypeForSeek);
+  GetContext get_context(BytewiseComparator(), nullptr, nullptr,
+                         table.options.statistics.get(), GetContext::kNotFound,
+                         user_key, &value, nullptr, nullptr, nullptr, nullptr,
+                         true /* do_merge */, nullptr, nullptr, nullptr,
+                         nullptr, nullptr, nullptr);
+  static const ReadOptions kReadOptions;
+  Status s =
+      table.reader->Get(kReadOptions, lkey.Encode(), &get_context, nullptr);
+  get_context.ReportCounters();  // as Version::Get() does
+  out->state = get_context.State();
+  out->value = value.ToString();
+  return s;
+}
+
+// Keys with 1..max_versions versions each, newest first.
+std::vector<Entry> MakeVersionedEntries(Random64* rnd, size_t num_keys,
+                                        size_t max_versions) {
+  std::vector<Entry> entries;
+  for (size_t k = 0; k < num_keys; ++k) {
+    const size_t versions = 1 + rnd->Uniform(max_versions);
+    for (size_t v = 0; v < versions; ++v) {
+      const bool deletion = rnd->OneIn(6);
+      Entry e;
+      e.ikey = MakeInternalKey(k, 1000 - v, deletion ? kTypeDeletion
+                                                      : kTypeValue);
+      if (!deletion) {
+        e.value = MakeValue(rnd->Next(), 0, kDeleteKeySize + rnd->Uniform(40));
+      }
+      entries.push_back(std::move(e));
+    }
+  }
+  return entries;
+}
+
+}  // namespace
+
+TEST(KiWiGetTest, GetMatchesPlainTable) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  for (int iter = 0; iter < 10; ++iter) {
+    BuildParams bp;
+    bp.tile_pages = 2 + static_cast<uint32_t>(rnd.Uniform(8));
+    bp.block_size = 64 + rnd.Uniform(300);
+    bp.filters = !rnd.OneIn(4);
+    const size_t num_keys = 10 + rnd.Uniform(60);
+    // Up to 60 versions: many keys span several pages and tiles.
+    TablePair tables;
+    BuildTablePair(MakeVersionedEntries(&rnd, num_keys, 60), bp, &tables);
+
+    for (int probe = 0; probe < 400; ++probe) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), "key%08" PRIu64, rnd.Uniform(num_keys + 2));
+      std::string user_key(buf);
+      if (rnd.OneIn(4)) {
+        user_key.append("x");  // between two keys: absent
+      }
+      const SequenceNumber snapshot =
+          rnd.OneIn(4) ? kMaxSequenceNumber : 1000 - rnd.Uniform(70);
+      GetResult expected;
+      GetResult actual;
+      ASSERT_OK(DoGet(tables.plain, user_key, snapshot, &expected));
+      ASSERT_OK(DoGet(tables.kiwi, user_key, snapshot, &actual));
+      ASSERT_EQ(expected.state, actual.state) << user_key << "@" << snapshot;
+      ASSERT_EQ(expected.value, actual.value) << user_key << "@" << snapshot;
+    }
+  }
+}
+
+TEST(KiWiGetTest, PageFiltersAvoidReadingPages) {
+  Random64 rnd(17);
+  BuildParams bp;
+  bp.tile_pages = 8;
+  bp.block_size = 256;
+  const std::vector<Entry> entries = MakeVersionedEntries(&rnd, 400, 1);
+  auto data_block_accesses = [](const OpenedTable& t) {
+    Statistics* stats = t.options.statistics.get();
+    return stats->getTickerCount(BLOCK_CACHE_DATA_HIT) +
+           stats->getTickerCount(BLOCK_CACHE_DATA_MISS);
+  };
+
+  // Absent keys that fall inside the key range, so a tile is always found.
+  auto lookup_absent = [&](OpenedTable* opened) {
+    for (uint64_t k = 0; k < 400; ++k) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), "key%08" PRIu64 "x", k);
+      GetResult r;
+      ASSERT_OK(DoGet(*opened, buf, kMaxSequenceNumber, &r));
+      ASSERT_EQ(r.state, GetContext::kNotFound);
+    }
+  };
+
+  BuiltTable with_filters;
+  bp.filters = true;
+  BuildKiWiTable(entries, bp, &with_filters);
+  OpenedTable filtered;
+  ASSERT_OK(OpenTable(with_filters.contents, bp, &filtered));
+  lookup_absent(&filtered);
+
+  BuiltTable without_filters;
+  bp.filters = false;
+  BuildKiWiTable(entries, bp, &without_filters);
+  OpenedTable unfiltered;
+  ASSERT_OK(OpenTable(without_filters.contents, bp, &unfiltered));
+  lookup_absent(&unfiltered);
+
+  // Without filters every lookup opens all pages of a tile; with them almost
+  // none (the Bloom false positive rate is about 1%).
+  ASSERT_GT(data_block_accesses(unfiltered), 400U * 4);
+  ASSERT_LT(data_block_accesses(filtered), data_block_accesses(unfiltered) / 4);
+  ASSERT_GT(filtered.options.statistics->getTickerCount(BLOOM_FILTER_USEFUL),
+            0U);
+  ASSERT_EQ(unfiltered.options.statistics->getTickerCount(BLOOM_FILTER_USEFUL),
+            0U);
+}
+
+TEST(KiWiGetTest, PresentKeysCountAsTruePositives) {
+  Random64 rnd(23);
+  BuildParams bp;
+  bp.tile_pages = 4;
+  BuiltTable table;
+  const std::vector<Entry> entries = MakeVersionedEntries(&rnd, 100, 1);
+  BuildKiWiTable(entries, bp, &table);
+  OpenedTable opened;
+  ASSERT_OK(OpenTable(table.contents, bp, &opened));
+  size_t found = 0;
+  for (uint64_t k = 0; k < 100; ++k) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "key%08" PRIu64, k);
+    GetResult r;
+    ASSERT_OK(DoGet(opened, buf, kMaxSequenceNumber, &r));
+    found += r.state == GetContext::kFound ? 1 : 0;
+  }
+  ASSERT_GT(found, 0U);
+  ASSERT_GE(opened.options.statistics->getTickerCount(
+                BLOOM_FILTER_FULL_TRUE_POSITIVE),
+            found);
+}
+
+// MultiGet on a KiWi file is a loop of Get(): same results for every key.
+TEST(KiWiGetTest, MultiGetMatchesGet) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  BuildParams bp;
+  bp.tile_pages = 4;
+  const size_t num_keys = 120;
+  TablePair tables;
+  BuildTablePair(MakeVersionedEntries(&rnd, num_keys, 20), bp, &tables);
+
+  // A sorted batch of present and absent keys.
+  std::set<std::string> batch;
+  while (batch.size() < MultiGetContext::MAX_BATCH_SIZE) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "key%08" PRIu64, rnd.Uniform(num_keys + 2));
+    batch.insert(rnd.OneIn(4) ? std::string(buf) + "x" : std::string(buf));
+  }
+  const std::vector<std::string> user_keys(batch.begin(), batch.end());
+  // KeyContext points at its key, so the slices must outlive the batch.
+  const std::vector<Slice> key_slices(user_keys.begin(), user_keys.end());
+  const SequenceNumber snapshot = 1000 - rnd.Uniform(10);
+
+  for (OpenedTable* table : {&tables.kiwi, &tables.plain}) {
+    std::vector<PinnableSlice> values(user_keys.size());
+    std::vector<Status> statuses(user_keys.size());
+    autovector<GetContext, MultiGetContext::MAX_BATCH_SIZE> get_contexts;
+    autovector<KeyContext, MultiGetContext::MAX_BATCH_SIZE> key_contexts;
+    autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE> sorted_keys;
+    for (size_t i = 0; i < user_keys.size(); ++i) {
+      get_contexts.emplace_back(BytewiseComparator(), nullptr, nullptr, nullptr,
+                                GetContext::kNotFound, user_keys[i], &values[i],
+                                nullptr, nullptr, nullptr, nullptr,
+                                true /* do_merge */, nullptr, nullptr, nullptr,
+                                nullptr, nullptr, nullptr);
+      key_contexts.emplace_back(nullptr, key_slices[i], &values[i], nullptr,
+                                nullptr, &statuses[i]);
+      key_contexts.back().get_context = &get_contexts.back();
+    }
+    for (auto& key_context : key_contexts) {
+      sorted_keys.emplace_back(&key_context);
+    }
+    static const ReadOptions kReadOptions;
+    MultiGetContext ctx(&sorted_keys, 0, sorted_keys.size(), snapshot,
+                        kReadOptions, FileSystem::Default().get(), nullptr);
+    MultiGetContext::Range range = ctx.GetMultiGetRange();
+    table->reader->MultiGet(kReadOptions, &range, nullptr);
+
+    for (size_t i = 0; i < user_keys.size(); ++i) {
+      ASSERT_OK(statuses[i]);
+      GetResult expected;
+      ASSERT_OK(DoGet(tables.plain, user_keys[i], snapshot, &expected));
+      ASSERT_EQ(get_contexts[i].State(), expected.state) << user_keys[i];
+      ASSERT_EQ(values[i].ToString(), expected.value) << user_keys[i];
+    }
+  }
+}
+
+TEST(KiWiGetTest, CorruptPageFailsGetOfItsKeysOnly) {
+  Random64 rnd(29);
+  BuildParams bp;
+  BuiltTable table;
+  const std::vector<Entry> entries = MakeVersionedEntries(&rnd, 300, 1);
+  BuildKiWiTable(entries, bp, &table);
+  ASSERT_GT(table.tiles.size(), 4U);
+  // Corrupt every page of one tile in the middle: all its keys are affected.
+  const TileLayout& tile = table.tiles[table.tiles.size() / 2];
+  std::string bad = table.contents;
+  for (const BlockHandle& page : tile.pages) {
+    bad[page.offset() + page.size() / 2] ^= 0x55;
+  }
+  OpenedTable opened;
+  ASSERT_OK(OpenTable(bad, bp, &opened));
+
+  OpenedTable intact;
+  ASSERT_OK(OpenTable(table.contents, bp, &intact));
+  size_t corrupt = 0;
+  size_t ok = 0;
+  for (uint64_t k = 0; k < 300; ++k) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "key%08" PRIu64, k);
+    GetResult expected;
+    ASSERT_OK(DoGet(intact, buf, kMaxSequenceNumber, &expected));
+    GetResult actual;
+    Status s = DoGet(opened, buf, kMaxSequenceNumber, &actual);
+    if (s.ok()) {
+      // Untouched tiles still answer correctly.
+      ASSERT_EQ(expected.state, actual.state);
+      ASSERT_EQ(expected.value, actual.value);
+      ++ok;
+    } else {
+      ASSERT_EQ(s.code(), Status::kCorruption);
+      ++corrupt;
+    }
+  }
+  ASSERT_GT(corrupt, 0U);
+  ASSERT_GT(ok, corrupt);
 }
 
 #endif  // !NDEBUG

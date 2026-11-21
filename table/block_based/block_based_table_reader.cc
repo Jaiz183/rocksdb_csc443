@@ -73,6 +73,7 @@
 #include "table/format.h"
 #include "table/get_context.h"
 #include "table/internal_iterator.h"
+#include "table/merging_iterator.h"
 #include "table/meta_blocks.h"
 #include "table/multiget_context.h"
 #include "table/persistent_cache_helper.h"
@@ -1718,6 +1719,101 @@ Status BlockBasedTable::ReadKiWiDirectory(const ReadOptions& ro,
   s = directory->Decode(contents.data.ToString());
   if (s.ok()) {
     rep_->kiwi_directory = std::move(directory);
+  }
+  return s;
+}
+
+Status BlockBasedTable::KiWiGet(const ReadOptions& read_options,
+                                const Slice& key, GetContext* get_context,
+                                bool skip_filters) {
+  const kiwi::Directory& dir = *rep_->kiwi_directory;
+  const Slice user_key = ExtractUserKey(key);
+  const Comparator* ucmp = rep_->internal_comparator.user_comparator();
+  BlockCacheLookupContext lookup_context{
+      TableReaderCaller::kUserGet, get_context->get_tracing_get_id(),
+      /*get_from_user_specified_snapshot=*/read_options.snapshot != nullptr};
+  std::unique_ptr<InternalIteratorBase<IndexValue>> iiter(NewIndexIterator(
+      read_options, /*disable_prefix_seek=*/false, /*input_iter=*/nullptr,
+      get_context, &lookup_context));
+  Statistics* stats = rep_->ioptions.stats;
+  Status s;
+  bool matched = false;
+  bool used_filter = false;
+  bool done = false;
+  for (iiter->Seek(key); iiter->Valid() && !done; iiter->Next()) {
+    const size_t tile_index = dir.FindTile(iiter->value().handle.offset());
+    if (tile_index == dir.num_tiles()) {
+      s = Status::Corruption("KiWi: index entry is not the start of a tile");
+      break;
+    }
+    // Only pages whose filter matches can hold the key.
+    const kiwi::Directory::TileView tile = dir.tile(tile_index);
+    std::vector<InternalIterator*> pages;
+    for (size_t i = 0; i < tile.num_pages; ++i) {
+      if (!skip_filters && tile.pages[i].bloom.size() > 0) {
+        used_filter = true;
+        if (!dir.PageMayMatch(&tile.pages[i], user_key)) {
+          RecordTick(stats, BLOOM_FILTER_USEFUL);
+          continue;
+        }
+        RecordTick(stats, BLOOM_FILTER_FULL_POSITIVE);
+      }
+      Status page_status;
+      pages.push_back(NewDataBlockIterator<DataBlockIter>(
+          read_options, tile.pages[i].handle, /*input_iter=*/nullptr,
+          BlockType::kData, get_context, &lookup_context,
+          /*prefetch_buffer=*/nullptr, /*for_compaction=*/false,
+          /*async_read=*/false, page_status,
+          /*use_block_cache_for_lookup=*/true));
+    }
+    if (!pages.empty()) {
+      // Versions of one key can sit on different pages, so merge them and let
+      // the context see them newest first, as for any other table.
+      std::unique_ptr<InternalIterator> merged(NewMergingIterator(
+          &rep_->internal_comparator, pages.data(),
+          static_cast<int>(pages.size())));
+      for (merged->Seek(key); merged->Valid(); merged->Next()) {
+        ParsedInternalKey parsed_key;
+        s = ParseInternalKey(merged->key(), &parsed_key,
+                             /*log_err_key=*/false);
+        if (!s.ok()) {
+          break;
+        }
+        Status read_status;
+        const bool more = get_context->SaveValue(parsed_key, merged->value(),
+                                                 &matched, &read_status);
+        if (!read_status.ok()) {
+          s = read_status;
+          break;
+        }
+        if (!more) {
+          done = true;
+          break;
+        }
+      }
+      if (s.ok()) {
+        s = merged->status();
+      }
+      if (s.IsIncomplete() && read_options.read_tier == kBlockCacheTier) {
+        // A page is not in the block cache: the key may exist.
+        get_context->MarkKeyMayExist();
+      }
+      if (!s.ok()) {
+        break;
+      }
+    }
+    // Later tiles only hold larger keys: stop unless this tile ends in the
+    // user key, in which case older versions may continue in the next tile.
+    if (!done && ucmp->CompareWithoutTimestamp(iiter->user_key(), user_key) !=
+                     0) {
+      done = true;
+    }
+  }
+  if (matched && used_filter) {
+    RecordTick(stats, BLOOM_FILTER_FULL_TRUE_POSITIVE);
+  }
+  if (s.ok() && !iiter->status().IsNotFound()) {
+    s = iiter->status();
   }
   return s;
 }

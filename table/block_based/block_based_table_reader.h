@@ -731,6 +731,10 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   Status ReadKiWiDirectory(const ReadOptions& ro,
                            FilePrefetchBuffer* prefetch_buffer,
                            InternalIterator* meta_iter);
+  // Get() for a KiWi file: the tile that may hold `key` is found through the
+  // index, and only its pages whose filter matches are read and merged.
+  Status KiWiGet(const ReadOptions& read_options, const Slice& key,
+                 GetContext* get_context, bool skip_filters);
   // If index and filter blocks do not need to be pinned, `prefetch_all`
   // determines whether they will be read and added to cache. When
   // `avoid_shared_metadata_cache` is set, open-time metadata reads avoid the

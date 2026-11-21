@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,9 @@
 #include "table/format.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class FilterBitsReader;
+
 namespace kiwi {
 
 // Delete key of an entry that has none (anything but kTypeValue). Such entries
@@ -166,7 +170,8 @@ class Directory {
     size_t num_pages;
   };
 
-  Directory() = default;
+  Directory();
+  ~Directory();
   Directory(const Directory&) = delete;
   Directory& operator=(const Directory&) = delete;
 
@@ -181,6 +186,10 @@ class Directory {
   // offset stored in the index entry of the tile), or num_tiles() if none.
   size_t FindTile(uint64_t first_page_offset) const;
 
+  // False only if the page filter proves that the page holds no entry with this
+  // user key. `page` must point into this directory (see tile()).
+  bool PageMayMatch(const DirectoryPage* page, const Slice& user_key) const;
+
   size_t ApproximateMemoryUsage() const;
 
  private:
@@ -188,6 +197,8 @@ class Directory {
   std::vector<DirectoryPage> pages_;
   // Position in pages_ of the first page of each tile.
   std::vector<size_t> tile_first_page_;
+  // One reader per page, parallel to pages_; null for a page without filter.
+  std::vector<std::unique_ptr<FilterBitsReader>> filters_;
 };
 
 }  // namespace kiwi

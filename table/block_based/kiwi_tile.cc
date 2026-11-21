@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <numeric>
 
+#include "table/block_based/filter_policy_internal.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
 
@@ -128,14 +129,19 @@ namespace {
 constexpr size_t kMinEncodedPageBytes = 2 + 2 * sizeof(uint64_t) + 1;
 }  // namespace
 
+Directory::Directory() = default;
+Directory::~Directory() = default;
+
 Status Directory::Decode(std::string contents) {
   pages_.clear();
   tile_first_page_.clear();
+  filters_.clear();
   contents_ = std::move(contents);
 
   const auto corrupt = [this](const char* what) {
     pages_.clear();
     tile_first_page_.clear();
+    filters_.clear();
     return Status::Corruption(std::string("KiWi directory: ") + what);
   };
 
@@ -187,6 +193,13 @@ Status Directory::Decode(std::string contents) {
   }
   // The directory is pinned in memory for the life of the table reader.
   pages_.shrink_to_fit();
+  filters_.reserve(pages_.size());
+  for (const DirectoryPage& page : pages_) {
+    filters_.emplace_back(
+        page.bloom.empty()
+            ? nullptr
+            : BuiltinFilterPolicy::GetBuiltinFilterBitsReader(page.bloom));
+  }
   return Status::OK();
 }
 
@@ -216,9 +229,20 @@ size_t Directory::FindTile(uint64_t first_page_offset) const {
   return tile_first_page_.size();
 }
 
+bool Directory::PageMayMatch(const DirectoryPage* page,
+                             const Slice& user_key) const {
+  assert(page >= pages_.data() && page < pages_.data() + pages_.size());
+  FilterBitsReader* filter = filters_[page - pages_.data()].get();
+  return filter == nullptr || filter->MayMatch(user_key);
+}
+
 size_t Directory::ApproximateMemoryUsage() const {
+  // The filter readers are small objects that point into contents_.
+  constexpr size_t kApproxFilterReaderBytes = 64;
   return contents_.capacity() + pages_.capacity() * sizeof(DirectoryPage) +
-         tile_first_page_.capacity() * sizeof(size_t);
+         tile_first_page_.capacity() * sizeof(size_t) +
+         filters_.capacity() * sizeof(filters_[0]) +
+         filters_.size() * kApproxFilterReaderBytes;
 }
 
 }  // namespace kiwi
