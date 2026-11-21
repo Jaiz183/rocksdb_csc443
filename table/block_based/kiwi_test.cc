@@ -262,6 +262,187 @@ TEST(KiWiTileTest, PackerRandomInvariants) {
   }
 }
 
+namespace {
+
+// A random directory: tiles of 1..16 pages at ascending file offsets.
+struct RandomDirectory {
+  // Owns the bloom bytes that the pages point to.
+  std::vector<std::string> blooms;
+  std::vector<std::vector<DirectoryPage>> tiles;
+  std::string encoded;
+};
+
+void MakeRandomDirectory(Random64* rnd, size_t num_tiles,
+                         RandomDirectory* out) {
+  size_t total_pages = 0;
+  std::vector<size_t> pages_per_tile;
+  for (size_t t = 0; t < num_tiles; ++t) {
+    pages_per_tile.push_back(1 + rnd->Uniform(16));
+    total_pages += pages_per_tile.back();
+  }
+  // Reserve so the Slices into `blooms` stay valid.
+  out->blooms.reserve(total_pages);
+  uint64_t offset = rnd->Uniform(100);
+  DirectoryBuilder builder;
+  for (size_t t = 0; t < num_tiles; ++t) {
+    std::vector<DirectoryPage> tile;
+    for (size_t i = 0; i < pages_per_tile[t]; ++i) {
+      DirectoryPage page;
+      const uint64_t size = 1 + rnd->Uniform(5000);
+      page.handle = BlockHandle(offset, size);
+      offset += size + 5;  // block trailer
+      page.min_delete_key = rnd->Uniform(1000000);
+      page.max_delete_key = page.min_delete_key + rnd->Uniform(1000);
+      out->blooms.push_back(
+          std::string(rnd->OneIn(4) ? 0 : rnd->Uniform(80), 'b'));
+      page.bloom = out->blooms.back();
+      tile.push_back(page);
+    }
+    builder.AddTile(tile);
+    out->tiles.push_back(std::move(tile));
+  }
+  builder.Finish(&out->encoded);
+}
+
+Status DecodeDirectory(const std::string& encoded, Directory* dir) {
+  return dir->Decode(encoded);
+}
+
+}  // namespace
+
+TEST(KiWiDirectoryTest, EmptyDirectory) {
+  DirectoryBuilder builder;
+  std::string encoded;
+  builder.Finish(&encoded);
+  Directory dir;
+  ASSERT_OK(DecodeDirectory(encoded, &dir));
+  ASSERT_EQ(dir.num_tiles(), 0U);
+  ASSERT_EQ(dir.FindTile(0), 0U);
+}
+
+TEST(KiWiDirectoryTest, RoundTripAndFindTile) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  for (int iter = 0; iter < 100; ++iter) {
+    const size_t num_tiles = 1 + rnd.Uniform(40);
+    RandomDirectory expected;
+    MakeRandomDirectory(&rnd, num_tiles, &expected);
+
+    Directory dir;
+    ASSERT_OK(DecodeDirectory(expected.encoded, &dir));
+    ASSERT_EQ(dir.num_tiles(), num_tiles);
+    ASSERT_GT(dir.ApproximateMemoryUsage(), expected.encoded.size());
+    for (size_t t = 0; t < num_tiles; ++t) {
+      const Directory::TileView tile = dir.tile(t);
+      ASSERT_EQ(tile.num_pages, expected.tiles[t].size());
+      for (size_t i = 0; i < tile.num_pages; ++i) {
+        const DirectoryPage& got = tile.pages[i];
+        const DirectoryPage& want = expected.tiles[t][i];
+        ASSERT_EQ(got.handle, want.handle);
+        ASSERT_EQ(got.min_delete_key, want.min_delete_key);
+        ASSERT_EQ(got.max_delete_key, want.max_delete_key);
+        ASSERT_EQ(got.bloom.ToString(), want.bloom.ToString());
+      }
+      // The index entry of a tile carries its first page's offset.
+      const uint64_t first = expected.tiles[t][0].handle.offset();
+      ASSERT_EQ(dir.FindTile(first), t);
+      ASSERT_EQ(dir.FindTile(first + 1), num_tiles) << "not a tile start";
+    }
+    ASSERT_EQ(dir.FindTile(std::numeric_limits<uint64_t>::max()), num_tiles);
+  }
+}
+
+TEST(KiWiDirectoryTest, EveryTruncationIsCorruption) {
+  Random64 rnd(301);
+  RandomDirectory expected;
+  MakeRandomDirectory(&rnd, 5, &expected);
+  for (size_t len = 0; len < expected.encoded.size(); ++len) {
+    Directory dir;
+    Status s = DecodeDirectory(expected.encoded.substr(0, len), &dir);
+    ASSERT_EQ(s.code(), Status::kCorruption) << "prefix length " << len;
+    // A rejected directory is left empty.
+    ASSERT_EQ(dir.num_tiles(), 0U);
+  }
+}
+
+TEST(KiWiDirectoryTest, RejectsMalformedDirectories) {
+  Random64 rnd(7);
+  RandomDirectory good;
+  MakeRandomDirectory(&rnd, 3, &good);
+  Directory dir;
+
+  std::string bad = good.encoded;
+  bad[0] = 99;  // unknown version
+  ASSERT_EQ(DecodeDirectory(bad, &dir).code(), Status::kCorruption);
+
+  bad = good.encoded + "x";  // trailing bytes
+  ASSERT_EQ(DecodeDirectory(bad, &dir).code(), Status::kCorruption);
+
+  // Absurd tile count (varint32 max) must fail without a huge allocation.
+  bad = std::string(1, DirectoryBuilder::kFormatVersion) +
+        std::string("\xff\xff\xff\xff\x0f");
+  ASSERT_EQ(DecodeDirectory(bad, &dir).code(), Status::kCorruption);
+
+  // A tile with zero pages.
+  bad = std::string(1, DirectoryBuilder::kFormatVersion) + std::string("\x01") +
+        std::string("\x00", 1);
+  ASSERT_EQ(DecodeDirectory(bad, &dir).code(), Status::kCorruption);
+
+  // Inverted delete key range.
+  DirectoryPage page;
+  page.handle = BlockHandle(0, 10);
+  page.min_delete_key = 9;
+  page.max_delete_key = 3;
+  DirectoryBuilder inverted;
+  inverted.AddTile({page});
+  inverted.Finish(&bad);
+  ASSERT_EQ(DecodeDirectory(bad, &dir).code(), Status::kCorruption);
+
+  // Tiles whose start offsets do not increase.
+  DirectoryPage a;
+  a.handle = BlockHandle(100, 10);
+  DirectoryPage b;
+  b.handle = BlockHandle(100, 10);
+  DirectoryBuilder unordered;
+  unordered.AddTile({a});
+  unordered.AddTile({b});
+  unordered.Finish(&bad);
+  ASSERT_EQ(DecodeDirectory(bad, &dir).code(), Status::kCorruption);
+
+  // The original is still fine.
+  ASSERT_OK(DecodeDirectory(good.encoded, &dir));
+}
+
+// Corrupted bytes must never crash the decoder, and whatever it accepts must
+// still be internally consistent.
+TEST(KiWiDirectoryTest, RandomCorruptionIsSafe) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  RandomDirectory good;
+  MakeRandomDirectory(&rnd, 20, &good);
+  for (int iter = 0; iter < 2000; ++iter) {
+    std::string bad = good.encoded;
+    const int flips = 1 + static_cast<int>(rnd.Uniform(4));
+    for (int f = 0; f < flips; ++f) {
+      bad[rnd.Uniform(bad.size())] ^= static_cast<char>(1 + rnd.Uniform(255));
+    }
+    Directory dir;
+    Status s = DecodeDirectory(bad, &dir);
+    if (s.ok()) {
+      for (size_t t = 0; t < dir.num_tiles(); ++t) {
+        const Directory::TileView tile = dir.tile(t);
+        ASSERT_GE(tile.num_pages, 1U);
+        ASSERT_EQ(dir.FindTile(tile.pages[0].handle.offset()), t);
+      }
+    } else {
+      ASSERT_EQ(s.code(), Status::kCorruption);
+      ASSERT_EQ(dir.num_tiles(), 0U);
+    }
+  }
+}
+
 }  // namespace kiwi
 }  // namespace ROCKSDB_NAMESPACE
 

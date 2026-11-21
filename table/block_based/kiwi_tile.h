@@ -19,6 +19,7 @@
 #include "db/dbformat.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
+#include "table/format.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace kiwi {
@@ -112,6 +113,81 @@ class TilePacker {
   // Key bytes immediately followed by value bytes, per entry.
   std::string arena_;
   std::vector<Ref> refs_;
+};
+
+
+
+// Names of the KiWi meta block and user-collected table properties. A file is
+// a KiWi file if and only if it has the kPropTilePages property.
+constexpr char kDirectoryBlockName[] = "rocksdb.kiwi.directory";
+constexpr char kPropTilePages[] = "rocksdb.kiwi.tile_pages";
+constexpr char kPropDeleteKeyOffset[] = "rocksdb.kiwi.delete_key_offset";
+constexpr char kPropMinDeleteKey[] = "rocksdb.kiwi.min_delete_key";
+constexpr char kPropMaxDeleteKey[] = "rocksdb.kiwi.max_delete_key";
+
+// What the directory records about one page: where it is, the range of delete
+// keys it holds (the paper's delete fence pointers) and its Bloom filter on
+// the sort key.
+struct DirectoryPage {
+  BlockHandle handle;
+  uint64_t min_delete_key = 0;
+  uint64_t max_delete_key = 0;
+  // Opaque filter bytes produced by the filter policy; may be empty.
+  Slice bloom;
+};
+
+// Encodes the KiWi directory meta block, one tile at a time in file order.
+//   directory := version(1 byte) varint32(num_tiles) tile*
+//   tile      := varint64(num_pages) page+
+//   page      := BlockHandle fixed64(min_d) fixed64(max_d) lp-bloom
+// where lp-bloom is a varint32 length followed by that many filter bytes.
+class DirectoryBuilder {
+ public:
+  static constexpr char kFormatVersion = 1;
+
+  // Appends a tile; `pages` must be non-empty and in file order.
+  void AddTile(const std::vector<DirectoryPage>& pages);
+  uint32_t num_tiles() const { return num_tiles_; }
+  // Produces the full block contents.
+  void Finish(std::string* out) const;
+
+ private:
+  std::string body_;
+  uint32_t num_tiles_ = 0;
+};
+
+// The decoded directory of a KiWi file, held in memory for the life of the
+// table reader. Page filters point into the owned buffer, so the object is
+// neither copyable nor movable.
+class Directory {
+ public:
+  struct TileView {
+    const DirectoryPage* pages;
+    size_t num_pages;
+  };
+
+  Directory() = default;
+  Directory(const Directory&) = delete;
+  Directory& operator=(const Directory&) = delete;
+
+  // Takes ownership of `contents` and decodes it. Anything malformed or
+  // inconsistent is reported as Corruption; the directory is left empty.
+  Status Decode(std::string contents);
+
+  size_t num_tiles() const { return tile_first_page_.size(); }
+  TileView tile(size_t i) const;
+
+  // Index of the tile whose first page starts at `first_page_offset` (the
+  // offset stored in the index entry of the tile), or num_tiles() if none.
+  size_t FindTile(uint64_t first_page_offset) const;
+
+  size_t ApproximateMemoryUsage() const;
+
+ private:
+  std::string contents_;
+  std::vector<DirectoryPage> pages_;
+  // Position in pages_ of the first page of each tile.
+  std::vector<size_t> tile_first_page_;
 };
 
 }  // namespace kiwi

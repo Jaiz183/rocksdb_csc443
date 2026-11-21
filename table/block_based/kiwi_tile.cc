@@ -9,6 +9,7 @@
 #include <numeric>
 
 #include "util/cast_util.h"
+#include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace kiwi {
@@ -99,6 +100,125 @@ void TilePacker::Pack(std::vector<TilePage>* pages) const {
   for (TilePage& page : *pages) {
     std::sort(page.entries.begin(), page.entries.end());
   }
+}
+
+void DirectoryBuilder::AddTile(const std::vector<DirectoryPage>& pages) {
+  assert(!pages.empty());
+  PutVarint64(&body_, lossless_cast<uint64_t>(pages.size()));
+  for (const DirectoryPage& page : pages) {
+    page.handle.EncodeTo(&body_);
+    PutFixed64(&body_, page.min_delete_key);
+    PutFixed64(&body_, page.max_delete_key);
+    PutLengthPrefixedSlice(&body_, page.bloom);
+  }
+  ++num_tiles_;
+}
+
+void DirectoryBuilder::Finish(std::string* out) const {
+  out->clear();
+  out->push_back(kFormatVersion);
+  PutVarint32(out, num_tiles_);
+  out->append(body_);
+}
+
+namespace {
+// Smallest possible encoded page: 1-byte offset and size varints, two fixed64
+// delete keys and a 1-byte bloom length. Bounds allocations from corrupt
+// counts.
+constexpr size_t kMinEncodedPageBytes = 2 + 2 * sizeof(uint64_t) + 1;
+}  // namespace
+
+Status Directory::Decode(std::string contents) {
+  pages_.clear();
+  tile_first_page_.clear();
+  contents_ = std::move(contents);
+
+  const auto corrupt = [this](const char* what) {
+    pages_.clear();
+    tile_first_page_.clear();
+    return Status::Corruption(std::string("KiWi directory: ") + what);
+  };
+
+  Slice input(contents_);
+  if (input.empty() || input[0] != DirectoryBuilder::kFormatVersion) {
+    return corrupt("unknown version");
+  }
+  input.remove_prefix(1);
+  uint32_t num_tiles = 0;
+  if (!GetVarint32(&input, &num_tiles)) {
+    return corrupt("bad tile count");
+  }
+  if (num_tiles > input.size() / (kMinEncodedPageBytes + 1)) {
+    return corrupt("tile count exceeds directory size");
+  }
+  tile_first_page_.reserve(num_tiles);
+
+  uint64_t prev_tile_offset = 0;
+  for (uint32_t t = 0; t < num_tiles; ++t) {
+    uint64_t num_pages = 0;
+    if (!GetVarint64(&input, &num_pages) || num_pages == 0 ||
+        num_pages > input.size() / kMinEncodedPageBytes) {
+      return corrupt("bad page count");
+    }
+    tile_first_page_.push_back(pages_.size());
+    for (uint64_t i = 0; i < num_pages; ++i) {
+      DirectoryPage page;
+      if (!page.handle.DecodeFrom(&input).ok() ||
+          !GetFixed64(&input, &page.min_delete_key) ||
+          !GetFixed64(&input, &page.max_delete_key) ||
+          !GetLengthPrefixedSlice(&input, &page.bloom)) {
+        return corrupt("truncated page record");
+      }
+      if (page.min_delete_key > page.max_delete_key) {
+        return corrupt("inverted delete key range");
+      }
+      if (i == 0) {
+        // Tile start offsets must strictly increase for FindTile().
+        if (t > 0 && page.handle.offset() <= prev_tile_offset) {
+          return corrupt("tiles out of order");
+        }
+        prev_tile_offset = page.handle.offset();
+      }
+      pages_.push_back(page);
+    }
+  }
+  if (!input.empty()) {
+    return corrupt("trailing bytes");
+  }
+  // The directory is pinned in memory for the life of the table reader.
+  pages_.shrink_to_fit();
+  return Status::OK();
+}
+
+Directory::TileView Directory::tile(size_t i) const {
+  assert(i < tile_first_page_.size());
+  const size_t begin = tile_first_page_[i];
+  const size_t end =
+      i + 1 < tile_first_page_.size() ? tile_first_page_[i + 1] : pages_.size();
+  return TileView{pages_.data() + begin, end - begin};
+}
+
+size_t Directory::FindTile(uint64_t first_page_offset) const {
+  size_t lo = 0;
+  size_t hi = tile_first_page_.size();
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (pages_[tile_first_page_[mid]].handle.offset() < first_page_offset) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  if (lo < tile_first_page_.size() &&
+      pages_[tile_first_page_[lo]].handle.offset() == first_page_offset) {
+    return lo;
+  }
+  return tile_first_page_.size();
+}
+
+size_t Directory::ApproximateMemoryUsage() const {
+  return contents_.capacity() + pages_.capacity() * sizeof(DirectoryPage) +
+         tile_first_page_.capacity() * sizeof(size_t);
 }
 
 }  // namespace kiwi
