@@ -37,6 +37,7 @@
 #include "test_util/testutil.h"
 #include "memory/arena.h"
 #include "util/autovector.h"
+#include "util/string_util.h"
 #include "util/compression.h"
 #include "util/random.h"
 
@@ -1528,6 +1529,131 @@ TEST(KiWiGetTest, CorruptPageFailsGetOfItsKeysOnly) {
   }
   ASSERT_GT(corrupt, 0U);
   ASSERT_GT(ok, corrupt);
+}
+
+// Everything that walks the index (checksum verification, dumps, prefetch,
+// size estimates) must treat an index entry of a KiWi file as a tile of pages.
+TEST(KiWiAuditTest, VerifyChecksumChecksEveryPage) {
+  Random64 rnd(41);
+  BuildParams bp;
+  BuiltTable table;
+  BuildKiWiTable(MakeEntries(&rnd, 300, 0, 50), bp, &table);
+  ASSERT_GT(table.tiles.size(), 3U);
+  OpenedTable intact;
+  ASSERT_OK(OpenTable(table.contents, bp, &intact));
+  // A tile is read as its pages, not as one oversized block.
+  ASSERT_OK(intact.reader->VerifyChecksum(
+      ReadOptions(), TableReaderCaller::kUserVerifyChecksum));
+
+  // Every single page is covered: corrupting any of them is detected.
+  for (const TileLayout& tile : table.tiles) {
+    for (const BlockHandle& page : tile.pages) {
+      std::string bad = table.contents;
+      bad[page.offset() + page.size() / 2] ^= 0x55;
+      OpenedTable opened;
+      ASSERT_OK(OpenTable(bad, bp, &opened));
+      ASSERT_EQ(opened.reader
+                    ->VerifyChecksum(ReadOptions(),
+                                     TableReaderCaller::kUserVerifyChecksum)
+                    .code(),
+                Status::kCorruption);
+    }
+  }
+}
+
+TEST(KiWiAuditTest, KVPairsAndDumpCoverEveryPage) {
+  Random64 rnd(43);
+  BuildParams bp;
+  const std::vector<Entry> entries = MakeEntries(&rnd, 200, 0, 50);
+  BuiltTable table;
+  BuildKiWiTable(entries, bp, &table);
+  OpenedTable opened;
+  ASSERT_OK(OpenTable(table.contents, bp, &opened));
+  size_t num_pages = 0;
+  for (const TileLayout& tile : table.tiles) {
+    num_pages += tile.pages.size();
+  }
+
+  auto* reader = static_cast<BlockBasedTable*>(opened.reader.get());
+  std::vector<KVPairBlock> blocks;
+  ASSERT_OK(reader->GetKVPairsFromDataBlocks(ReadOptions(), &blocks));
+  ASSERT_EQ(blocks.size(), num_pages);
+  std::map<std::string, std::string> seen;
+  for (const KVPairBlock& block : blocks) {
+    for (const auto& kv : block) {
+      ASSERT_TRUE(seen.insert(kv).second);
+    }
+  }
+  std::map<std::string, std::string> expected;
+  for (const Entry& e : entries) {
+    expected[e.ikey] = e.value;
+  }
+  ASSERT_EQ(seen, expected);
+
+  // The human readable dump lists every page and every entry.
+  const std::string path = test::PerThreadDBPath("kiwi_dump_test");
+  std::unique_ptr<WritableFile> out;
+  ASSERT_OK(Env::Default()->NewWritableFile(path, &out, EnvOptions()));
+  ASSERT_OK(reader->DumpTable(out.get()));
+  ASSERT_OK(out->Close());
+  std::string dump;
+  ASSERT_OK(ReadFileToString(Env::Default(), path, &dump));
+  ASSERT_OK(Env::Default()->DeleteFile(path));
+  size_t dumped_blocks = 0;
+  for (size_t pos = dump.find("Data Block # "); pos != std::string::npos;
+       pos = dump.find("Data Block # ", pos + 1)) {
+    ++dumped_blocks;
+  }
+  ASSERT_EQ(dumped_blocks, num_pages);
+  ASSERT_EQ(dump.find("Error reading the block"), std::string::npos);
+}
+
+TEST(KiWiAuditTest, PrefetchLoadsEveryPage) {
+  Random64 rnd(47);
+  BuildParams bp;
+  BuiltTable table;
+  BuildKiWiTable(MakeEntries(&rnd, 200, 0, 50), bp, &table);
+  OpenedTable opened;
+  ASSERT_OK(OpenTable(table.contents, bp, &opened));
+  auto* reader = static_cast<BlockBasedTable*>(opened.reader.get());
+  ASSERT_FALSE(reader->TEST_BlockInCache(table.tiles[1].pages[0]));
+  ASSERT_OK(reader->Prefetch(ReadOptions(), nullptr, nullptr));
+  for (const TileLayout& tile : table.tiles) {
+    for (const BlockHandle& page : tile.pages) {
+      ASSERT_TRUE(reader->TEST_BlockInCache(page));
+    }
+  }
+}
+
+TEST(KiWiAuditTest, SizeEstimatesAreMonotonicAndBounded) {
+  Random64 rnd(53);
+  BuildParams bp;
+  const std::vector<Entry> entries = MakeEntries(&rnd, 400, 0, 50);
+  BuiltTable table;
+  BuildKiWiTable(entries, bp, &table);
+  OpenedTable opened;
+  ASSERT_OK(OpenTable(table.contents, bp, &opened));
+  uint64_t prev = 0;
+  for (const Entry& e : entries) {
+    const uint64_t offset = opened.reader->ApproximateOffsetOf(
+        ReadOptions(), e.ikey, TableReaderCaller::kUncategorized);
+    ASSERT_GE(offset, prev);
+    ASSERT_LE(offset, table.contents.size());
+    prev = offset;
+  }
+  ASSERT_GT(prev, 0U);  // the last keys are far from the start of the file
+
+  std::vector<TableReader::Anchor> anchors;
+  ASSERT_OK(opened.reader->ApproximateKeyAnchors(ReadOptions(), anchors));
+  ASSERT_FALSE(anchors.empty());
+  ASSERT_LE(anchors.size(), 129U);
+  uint64_t total = 0;
+  for (const auto& anchor : anchors) {
+    total += anchor.range_size;
+  }
+  // Anchors partition the data region of the file.
+  ASSERT_GT(total, 0U);
+  ASSERT_LE(total, table.props->data_size);
 }
 
 #endif  // !NDEBUG

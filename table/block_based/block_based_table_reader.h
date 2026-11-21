@@ -731,6 +731,10 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   Status ReadKiWiDirectory(const ReadOptions& ro,
                            FilePrefetchBuffer* prefetch_buffer,
                            InternalIterator* meta_iter);
+  // The data blocks that an index entry covers: the block it points at, or all
+  // pages of the tile it points at in a KiWi file.
+  Status DataBlockHandlesOf(const IndexValue& index_value,
+                            std::vector<BlockHandle>* handles) const;
   // Get() for a KiWi file: the tile that may hold `key` is found through the
   // index, and only its pages whose filter matches are read and merged.
   Status KiWiGet(const ReadOptions& read_options, const Slice& key,
