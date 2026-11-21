@@ -159,7 +159,7 @@ class BuiltinFilterPolicy : public FilterPolicy {
 
  protected:
   static FilterBitsBuilder* GetXorFilterBuilderWithContext(
-      const FilterBuildingContext& context);
+      const FilterBuildingContext& context, uint8_t fingerprint_bytes);
 
  private:
   // For Bloom filter implementation(s)
@@ -169,7 +169,8 @@ class BuiltinFilterPolicy : public FilterPolicy {
   static BuiltinFilterBitsReader* GetRibbonBitsReader(const Slice& contents);
 
   // For XOR filter implementations
-  static BuiltinFilterBitsReader* GetXorFilterBitsReader(const Slice& contents);
+  static BuiltinFilterBitsReader* GetXorFilterBitsReader(const Slice& contents,
+                                                         bool bits_format);
 };
 
 // A "read only" filter policy used for backward compatibility with old
