@@ -128,7 +128,14 @@ enum NewFileCustomTag : uint32_t {
 
   // Forward incompatible (aka unignorable) fields
   kPathId,
+  // KiWi secondary delete floor. Unignorable: an older version that skipped it
+  // would show entries that were deleted.
+  kKiWiDeleteFloor,
 };
+
+static_assert((NewFileCustomTag::kKiWiDeleteFloor &
+               NewFileCustomTag::kCustomTagNonSafeIgnoreMask) != 0,
+              "kKiWiDeleteFloor must make older versions fail to open the DB");
 
 class VersionSet;
 
@@ -360,6 +367,13 @@ struct FileMetaData {
   // Size of the "tail" part of a SST file
   // "Tail" refers to all blocks after data blocks till the end of the SST file
   uint64_t tail_size = 0;
+
+  // KiWi secondary delete (see BlockBasedTableOptions::kiwi_tile_pages): every
+  // entry of this file whose delete key is below this value was deleted. Such
+  // entries are hidden from reads and dropped by compaction, without the file
+  // having been rewritten. 0 means nothing was deleted. Persisted in the
+  // MANIFEST only when non-zero.
+  uint64_t kiwi_delete_floor = 0;
 
   // Value of the `AdvancedColumnFamilyOptions.persist_user_defined_timestamps`
   // flag when the file is created. Default to true, only when this flag is
