@@ -95,16 +95,50 @@ void KiWiTableIterator::Next() {
   SkipEmptyTilesForward();
 }
 
-// TODO(kiwi): backward iteration is added by the next commit. Until then it
-// fails loudly instead of returning wrong results.
-void KiWiTableIterator::SeekToLast() {
-  tile_iter_.reset();
-  status_ = Status::NotSupported("KiWi: backward iteration not implemented");
+void KiWiTableIterator::SkipEmptyTilesBackward() {
+  while (status_.ok() && tile_iter_ != nullptr && !tile_iter_->Valid() &&
+         tile_iter_->status().ok()) {
+    index_iter_->Prev();
+    InitTile();
+    if (tile_iter_ != nullptr) {
+      tile_iter_->SeekToLast();
+    }
+  }
 }
 
-void KiWiTableIterator::SeekForPrev(const Slice& /*target*/) { SeekToLast(); }
+void KiWiTableIterator::SeekToLast() {
+  index_iter_->SeekToLast();
+  InitTile();
+  if (tile_iter_ != nullptr) {
+    tile_iter_->SeekToLast();
+    SkipEmptyTilesBackward();
+  }
+}
 
-void KiWiTableIterator::Prev() { SeekToLast(); }
+void KiWiTableIterator::SeekForPrev(const Slice& target) {
+  // The first tile whose last key is >= target may hold the last key <= target;
+  // if it holds none, that key is the last one of an earlier tile. When no tile
+  // ends at or after target, it is the last key of the file.
+  index_iter_->Seek(target);
+  if (!index_iter_->Valid()) {
+    if (!index_iter_->status().ok()) {
+      tile_iter_.reset();
+      return;  // reported by status()
+    }
+    index_iter_->SeekToLast();
+  }
+  InitTile();
+  if (tile_iter_ != nullptr) {
+    tile_iter_->SeekForPrev(target);
+    SkipEmptyTilesBackward();
+  }
+}
+
+void KiWiTableIterator::Prev() {
+  assert(Valid());
+  tile_iter_->Prev();
+  SkipEmptyTilesBackward();
+}
 
 Status KiWiTableIterator::status() const {
   if (!status_.ok()) {

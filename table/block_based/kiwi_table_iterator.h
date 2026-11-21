@@ -61,6 +61,8 @@ class KiWiTableIterator : public InternalIterator {
   // After the current tile ran out, moves on to the first entry of the next
   // non-empty tile.
   void SkipEmptyTilesForward();
+  // Likewise, moves on to the last entry of the previous non-empty tile.
+  void SkipEmptyTilesBackward();
 
   BlockBasedTable* const table_;
   // Must outlive the iterator, like for every TableReader::NewIterator().

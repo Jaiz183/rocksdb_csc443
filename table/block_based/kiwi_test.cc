@@ -1134,6 +1134,119 @@ TEST(KiWiIteratorTest, SeekMatchesPlainTable) {
   }
 }
 
+TEST(KiWiIteratorTest, BackwardScanMatchesPlainTable) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  for (int iter = 0; iter < 15; ++iter) {
+    BuildParams bp;
+    bp.tile_pages = 2 + static_cast<uint32_t>(rnd.Uniform(8));
+    bp.block_size = 64 + rnd.Uniform(400);
+    TablePair tables;
+    BuildTablePair(MakeEntries(&rnd, 1 + rnd.Uniform(400), 0, 60), bp, &tables);
+    std::unique_ptr<InternalIterator> expected(
+        NewIter(tables.plain.reader.get()));
+    std::unique_ptr<InternalIterator> actual(NewIter(tables.kiwi.reader.get()));
+    size_t count = 0;
+    for (expected->SeekToLast(), actual->SeekToLast(); expected->Valid();
+         expected->Prev(), actual->Prev()) {
+      ExpectSameIterator(expected.get(), actual.get());
+      ++count;
+    }
+    ExpectSameIterator(expected.get(), actual.get());
+    ASSERT_GT(count, 0U);
+  }
+}
+
+TEST(KiWiIteratorTest, SeekForPrevMatchesPlainTable) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  for (int iter = 0; iter < 10; ++iter) {
+    BuildParams bp;
+    bp.tile_pages = 2 + static_cast<uint32_t>(rnd.Uniform(8));
+    bp.block_size = 64 + rnd.Uniform(300);
+    const size_t num_keys = 20 + rnd.Uniform(300);
+    TablePair tables;
+    BuildTablePair(MakeEntries(&rnd, num_keys, 0, 60), bp, &tables);
+    std::unique_ptr<InternalIterator> expected(
+        NewIter(tables.plain.reader.get()));
+    std::unique_ptr<InternalIterator> actual(NewIter(tables.kiwi.reader.get()));
+    for (int probe = 0; probe < 300; ++probe) {
+      // Existing keys, keys between them, before the first and after the last.
+      char buf[16];
+      snprintf(buf, sizeof(buf), "key%08" PRIu64, rnd.Uniform(num_keys + 2));
+      std::string user_key(buf);
+      if (rnd.OneIn(3)) {
+        user_key.append("x");
+      }
+      const std::string target =
+          MakeInternalKeyFromUserKey(user_key, 1000 - rnd.Uniform(5));
+      expected->SeekForPrev(target);
+      actual->SeekForPrev(target);
+      ExpectSameIterator(expected.get(), actual.get());
+      for (int step = 0; step < 40 && expected->Valid(); ++step) {
+        expected->Prev();
+        actual->Prev();
+        ExpectSameIterator(expected.get(), actual.get());
+      }
+    }
+  }
+}
+
+// Mixes every operation, including direction changes in the middle of a tile
+// and across tile boundaries, and checks each step against the plain table.
+TEST(KiWiIteratorTest, RandomWalkMatchesPlainTable) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  for (int iter = 0; iter < 10; ++iter) {
+    BuildParams bp;
+    bp.tile_pages = 2 + static_cast<uint32_t>(rnd.Uniform(8));
+    bp.block_size = 64 + rnd.Uniform(300);
+    const size_t num_keys = 20 + rnd.Uniform(200);
+    TablePair tables;
+    BuildTablePair(MakeEntries(&rnd, num_keys, 0, 60), bp, &tables);
+    std::unique_ptr<InternalIterator> expected(
+        NewIter(tables.plain.reader.get()));
+    std::unique_ptr<InternalIterator> actual(NewIter(tables.kiwi.reader.get()));
+    for (int op = 0; op < 3000; ++op) {
+      const uint64_t choice = rnd.Uniform(20);
+      if (!expected->Valid() || choice == 0) {
+        // Reposition; also the only way out of an invalid state.
+        char buf[16];
+        snprintf(buf, sizeof(buf), "key%08" PRIu64, rnd.Uniform(num_keys + 2));
+        const std::string target =
+            MakeInternalKeyFromUserKey(buf, 1000 - rnd.Uniform(5));
+        switch (rnd.Uniform(4)) {
+          case 0:
+            expected->SeekToFirst();
+            actual->SeekToFirst();
+            break;
+          case 1:
+            expected->SeekToLast();
+            actual->SeekToLast();
+            break;
+          case 2:
+            expected->Seek(target);
+            actual->Seek(target);
+            break;
+          default:
+            expected->SeekForPrev(target);
+            actual->SeekForPrev(target);
+        }
+      } else if (choice < 11) {
+        expected->Next();
+        actual->Next();
+      } else {
+        expected->Prev();
+        actual->Prev();
+      }
+      ExpectSameIterator(expected.get(), actual.get());
+    }
+  }
+}
+
 TEST(KiWiIteratorTest, CorruptPageSurfacesAsError) {
   Random64 rnd(21);
   BuildParams bp;
