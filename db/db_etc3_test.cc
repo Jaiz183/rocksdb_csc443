@@ -8,7 +8,10 @@
 #include "rocksdb/experimental.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/sst_file_writer.h"
+#include "rocksdb/utilities/options_util.h"
+#include "table/block_based/kiwi_tile.h"
 #include "util/defer.h"
+#include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -1123,6 +1126,240 @@ TEST_F(DBOwnershipTest, Repair) {
   EXPECT_EQ(from_wal.db_ownership_start_time, from_wal.file_creation_time);
   expected.origin = DataFileProvenance::Origin::kFlush;
   EXPECT_EQ(Decode(from_wal), expected);
+}
+
+// KiWi (delete tiles): the whole database on top of tiled files.
+class DBKiWiTest : public DBEtc3Test {
+ public:
+  using Model = std::map<std::string, std::string>;
+  static constexpr uint64_t kNumKeys = 800;
+
+  // Small files and memtables so that flushes and leveled compactions, with
+  // several output files each, happen within a few thousand writes.
+  Options KiWiOptions(uint32_t tile_pages, uint32_t delete_key_offset = 0) {
+    Options options = CurrentOptions();
+    options.create_if_missing = true;
+    options.write_buffer_size = 32 << 10;
+    options.target_file_size_base = 16 << 10;
+    options.max_bytes_for_level_base = 64 << 10;
+    options.level0_file_num_compaction_trigger = 2;
+    options.compression = kNoCompression;
+    BlockBasedTableOptions table_options;
+    table_options.block_size = 512;
+    table_options.kiwi_tile_pages = tile_pages;
+    table_options.kiwi_delete_key_offset = delete_key_offset;
+    table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    return options;
+  }
+
+  static std::string KiWiKey(uint64_t i) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "k%06" PRIu64, i);
+    return buf;
+  }
+
+  // 8 big-endian delete key bytes followed by a payload.
+  static std::string KiWiValue(Random64* rnd) {
+    std::string value(8 + rnd->Uniform(48),
+                      'a' + static_cast<char>(rnd->Uniform(26)));
+    const uint64_t d = rnd->Next();
+    for (size_t i = 0; i < 8; ++i) {
+      value[i] = static_cast<char>((d >> (8 * (7 - i))) & 0xff);
+    }
+    return value;
+  }
+
+  // Point lookups, a forward and a backward scan all agree with `model`.
+  void VerifyModel(const Model& model, const Snapshot* snapshot = nullptr) {
+    ReadOptions read_options;
+    read_options.snapshot = snapshot;
+    for (uint64_t i = 0; i < kNumKeys + 2; ++i) {
+      const std::string key = KiWiKey(i);
+      std::string value;
+      Status s = db_->Get(read_options, key, &value);
+      auto it = model.find(key);
+      if (it == model.end()) {
+        ASSERT_TRUE(s.IsNotFound()) << key << ": " << s.ToString();
+      } else {
+        ASSERT_OK(s);
+        ASSERT_EQ(value, it->second) << key;
+      }
+    }
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+    auto expected = model.begin();
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++expected) {
+      ASSERT_TRUE(expected != model.end());
+      ASSERT_EQ(iter->key().ToString(), expected->first);
+      ASSERT_EQ(iter->value().ToString(), expected->second);
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(expected == model.end());
+    auto rexpected = model.rbegin();
+    for (iter->SeekToLast(); iter->Valid(); iter->Prev(), ++rexpected) {
+      ASSERT_TRUE(rexpected != model.rend());
+      ASSERT_EQ(iter->key().ToString(), rexpected->first);
+      ASSERT_EQ(iter->value().ToString(), rexpected->second);
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(rexpected == model.rend());
+  }
+
+  // Every live SST is a KiWi file; returns how many there are.
+  size_t CountKiWiFiles() {
+    TablePropertiesCollection props;
+    EXPECT_OK(db_->GetPropertiesOfAllTables(&props));
+    for (const auto& file : props) {
+      EXPECT_EQ(file.second->user_collected_properties.count(
+                    kiwi::kPropTilePages),
+                1U);
+    }
+    return props.size();
+  }
+};
+
+TEST_F(DBKiWiTest, RandomWorkloadMatchesModel) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  for (uint32_t tile_pages : {2U, 4U, 9U}) {
+    SCOPED_TRACE("tile_pages=" + std::to_string(tile_pages));
+    Options options = KiWiOptions(tile_pages);
+    DestroyAndReopen(options);
+    Model model;
+    Model snapshot_model;
+    const Snapshot* snapshot = nullptr;
+    for (int op = 0; op < 3000; ++op) {
+      const uint64_t k = rnd.Uniform(kNumKeys);
+      const std::string key = KiWiKey(k);
+      const uint64_t choice = rnd.Uniform(100);
+      if (choice < 70) {
+        const std::string value = KiWiValue(&rnd);
+        ASSERT_OK(Put(key, value));
+        model[key] = value;
+      } else if (choice < 88) {
+        ASSERT_OK(Delete(key));
+        model.erase(key);
+      } else if (choice < 92) {
+        // Range tombstones live outside the tiles.
+        const std::string end =
+            KiWiKey(std::min(kNumKeys, k + 1 + rnd.Uniform(20)));
+        ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                                   key, end));
+        model.erase(model.lower_bound(key), model.lower_bound(end));
+      } else if (choice < 95) {
+        ASSERT_OK(Flush());
+      } else if (choice == 95 && snapshot == nullptr && op > 1000) {
+        snapshot = db_->GetSnapshot();
+        snapshot_model = model;
+      } else if (choice == 96) {
+        ASSERT_OK(dbfull()->TEST_WaitForCompact());
+      } else if (choice == 97 && op % 5 == 0) {
+        if (snapshot != nullptr) {
+          db_->ReleaseSnapshot(snapshot);
+          snapshot = nullptr;
+        }
+        Reopen(options);
+      }
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    VerifyModel(model);
+    if (snapshot != nullptr) {
+      VerifyModel(snapshot_model, snapshot);
+      db_->ReleaseSnapshot(snapshot);
+    }
+    ASSERT_GT(CountKiWiFiles(), 0U);
+
+    // Rewrite everything through every level, then restart.
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    VerifyModel(model);
+    ASSERT_GT(CountKiWiFiles(), 0U);
+    Reopen(options);
+    VerifyModel(model);
+  }
+}
+
+TEST_F(DBKiWiTest, ManyFilesAcrossLevels) {
+  Random64 rnd(Env::Default()->NowMicros());
+  Options options = KiWiOptions(4);
+  // Tiny levels, so that 28KB of live data spills over several of them.
+  options.target_file_size_base = 4 << 10;
+  options.max_bytes_for_level_base = 8 << 10;
+  DestroyAndReopen(options);
+  Model model;
+  for (uint64_t round = 0; round < 6; ++round) {
+    for (uint64_t i = 0; i < kNumKeys; ++i) {
+      const std::string value = KiWiValue(&rnd);
+      ASSERT_OK(Put(KiWiKey(i), value));
+      model[KiWiKey(i)] = value;
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  // Leveled compaction cut the output into several tiled files per level.
+  ASSERT_GE(CountKiWiFiles(), 3U);
+  int levels_in_use = 0;
+  for (int level = 0; level < options.num_levels; ++level) {
+    levels_in_use += NumTableFilesAtLevel(level) > 0 ? 1 : 0;
+  }
+  ASSERT_GE(levels_in_use, 2);
+  VerifyModel(model);
+}
+
+TEST_F(DBKiWiTest, ValueTooShortForDeleteKeyFailsTheFlush) {
+  // The delete key is 8 bytes at offset 4, so a value must have 12 bytes.
+  DestroyAndReopen(KiWiOptions(4, /*delete_key_offset=*/4));
+  ASSERT_OK(Put("good", std::string(12, 'x')));
+  ASSERT_OK(Put("bad", "short"));
+  Status s = Flush();
+  ASSERT_NOK(s);
+  ASSERT_NE(s.ToString().find("KiWi"), std::string::npos) << s.ToString();
+}
+
+TEST_F(DBKiWiTest, IngestedKiWiFileIsReadable) {
+  Random64 rnd(Env::Default()->NowMicros());
+  Options options = KiWiOptions(4);
+  DestroyAndReopen(options);
+  Model model;
+  const std::string path = dbname_ + "/kiwi_ingest.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(path));
+  for (uint64_t i = 0; i < kNumKeys; i += 2) {
+    const std::string value = KiWiValue(&rnd);
+    ASSERT_OK(writer.Put(KiWiKey(i), value));
+    model[KiWiKey(i)] = value;
+  }
+  ASSERT_OK(writer.Finish());
+  ASSERT_OK(db_->IngestExternalFile({path}, IngestExternalFileOptions()));
+  ASSERT_GT(CountKiWiFiles(), 0U);
+  VerifyModel(model);
+
+  // Newer writes shadow the ingested ones.
+  for (uint64_t i = 0; i < kNumKeys; i += 3) {
+    const std::string value = KiWiValue(&rnd);
+    ASSERT_OK(Put(KiWiKey(i), value));
+    model[KiWiKey(i)] = value;
+  }
+  ASSERT_OK(Flush());
+  VerifyModel(model);
+}
+
+TEST_F(DBKiWiTest, OptionsFileRoundTrip) {
+  Options options = KiWiOptions(6, /*delete_key_offset=*/3);
+  DestroyAndReopen(options);
+  DBOptions loaded_db_options;
+  std::vector<ColumnFamilyDescriptor> loaded_cfs;
+  ConfigOptions config_options;
+  config_options.env = options.env;
+  ASSERT_OK(LoadLatestOptions(config_options, dbname_, &loaded_db_options,
+                              &loaded_cfs));
+  ASSERT_EQ(loaded_cfs.size(), 1U);
+  const auto* bbto =
+      loaded_cfs[0].options.table_factory->GetOptions<BlockBasedTableOptions>();
+  ASSERT_NE(bbto, nullptr);
+  ASSERT_EQ(bbto->kiwi_tile_pages, 6U);
+  ASSERT_EQ(bbto->kiwi_delete_key_offset, 3U);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

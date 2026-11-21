@@ -34,8 +34,16 @@ InternalIterator* KiWiTableIterator::NewPageIterator(
       /*async_read=*/false, s, /*use_block_cache_for_lookup=*/true);
 }
 
+void KiWiTableIterator::ReleaseTile() {
+  if (IsPinning()) {
+    pinned_iters_mgr_->PinIterator(tile_iter_.release());
+  } else {
+    tile_iter_.reset();
+  }
+}
+
 void KiWiTableIterator::InitTile() {
-  tile_iter_.reset();
+  ReleaseTile();
   if (!index_iter_->Valid()) {
     return;  // the end of the file, or an index error reported by status()
   }
@@ -56,6 +64,9 @@ void KiWiTableIterator::InitTile() {
   // Takes ownership of the page iterators.
   tile_iter_.reset(NewMergingIterator(
       &icomp_, page_scratch_.data(), static_cast<int>(page_scratch_.size())));
+  if (pinned_iters_mgr_ != nullptr) {
+    tile_iter_->SetPinnedItersMgr(pinned_iters_mgr_);
+  }
 }
 
 void KiWiTableIterator::SkipEmptyTilesForward() {
@@ -122,7 +133,7 @@ void KiWiTableIterator::SeekForPrev(const Slice& target) {
   index_iter_->Seek(target);
   if (!index_iter_->Valid()) {
     if (!index_iter_->status().ok()) {
-      tile_iter_.reset();
+      ReleaseTile();
       return;  // reported by status()
     }
     index_iter_->SeekToLast();

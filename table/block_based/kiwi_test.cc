@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "db/dbformat.h"
+#include "db/pinned_iterators_manager.h"
 #include "file/writable_file_writer.h"
 #include "options/cf_options.h"
 #include "port/stack_trace.h"
@@ -1251,6 +1252,43 @@ TEST(KiWiIteratorTest, RandomWalkMatchesPlainTable) {
       ExpectSameIterator(expected.get(), actual.get());
     }
   }
+}
+
+// DBIter walks backward over the versions of a key only if values stay valid
+// after the iterator moved on, even to another tile.
+TEST(KiWiIteratorTest, ValuesStayPinnedAfterLeavingATile) {
+  Random64 rnd(61);
+  BuildParams bp;
+  bp.tile_pages = 4;
+  bp.block_size = 128;
+  TablePair tables;
+  BuildTablePair(MakeEntries(&rnd, 200, 0, 40), bp, &tables);
+  ASSERT_GT(tables.kiwi_table.tiles.size(), 5U);
+
+  PinnedIteratorsManager pinned_iters_mgr;
+  pinned_iters_mgr.StartPinning();
+  std::unique_ptr<InternalIterator> it(NewIter(tables.kiwi.reader.get()));
+  it->SetPinnedItersMgr(&pinned_iters_mgr);
+  std::vector<Slice> values;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    ASSERT_TRUE(it->IsValuePinned());
+    values.push_back(it->value());
+  }
+  ASSERT_OK(it->status());
+
+  // Slices taken from tiles that were left are still readable and correct.
+  std::unique_ptr<InternalIterator> expected(
+      NewIter(tables.plain.reader.get()));
+  size_t i = 0;
+  for (expected->SeekToFirst(); expected->Valid(); expected->Next(), ++i) {
+    ASSERT_LT(i, values.size());
+    ASSERT_EQ(values[i].ToString(), expected->value().ToString());
+  }
+  ASSERT_EQ(i, values.size());
+  // Without pinning nothing is reported as pinned.
+  pinned_iters_mgr.ReleasePinnedData();
+  it->SeekToFirst();
+  ASSERT_FALSE(it->IsValuePinned());
 }
 
 TEST(KiWiIteratorTest, CorruptPageSurfacesAsError) {

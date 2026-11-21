@@ -1776,9 +1776,7 @@ TEST_F(OptionsTest, KiWiTableOptions) {
       config_options, "kiwi_tile_pages=8;kiwi_delete_key_offset=16;"));
   ASSERT_EQ(bbto->kiwi_tile_pages, 8U);
   ASSERT_EQ(bbto->kiwi_delete_key_offset, 16U);
-  // TODO(kiwi): becomes ASSERT_OK once the table reader supports KiWi files.
-  ASSERT_EQ(cf_opts.table_factory->ValidateOptions(db_opts, cf_opts).code(),
-            Status::kNotSupported);
+  ASSERT_OK(cf_opts.table_factory->ValidateOptions(db_opts, cf_opts));
   std::string printed = cf_opts.table_factory->GetPrintableOptions();
   ASSERT_NE(printed.find("kiwi_tile_pages: 8"), std::string::npos);
   ASSERT_NE(printed.find("kiwi_delete_key_offset: 16"), std::string::npos);

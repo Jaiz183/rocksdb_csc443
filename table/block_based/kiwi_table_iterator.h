@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "db/dbformat.h"
+#include "db/pinned_iterators_manager.h"
 #include "rocksdb/options.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/internal_iterator.h"
@@ -52,7 +53,30 @@ class KiWiTableIterator : public InternalIterator {
   }
   Status status() const override;
 
+  // Keys and values point into the pages of the current tile. With pinning
+  // enabled, a tile that is left is handed to the PinnedIteratorsManager
+  // instead of being freed, so what was returned stays valid.
+  void SetPinnedItersMgr(PinnedIteratorsManager* pinned_iters_mgr) override {
+    pinned_iters_mgr_ = pinned_iters_mgr;
+    if (tile_iter_ != nullptr) {
+      tile_iter_->SetPinnedItersMgr(pinned_iters_mgr);
+    }
+  }
+  bool IsKeyPinned() const override {
+    return IsPinning() && tile_iter_->IsKeyPinned();
+  }
+  bool IsValuePinned() const override {
+    return IsPinning() && tile_iter_->IsValuePinned();
+  }
+
  private:
+  bool IsPinning() const {
+    return tile_iter_ != nullptr && pinned_iters_mgr_ != nullptr &&
+           pinned_iters_mgr_->PinningEnabled();
+  }
+  // Drops tile_iter_, or pins it if keys and values it returned may still be
+  // in use.
+  void ReleaseTile();
   // Positions tile_iter_ on the tile the index iterator points at, or clears it
   // if the index iterator is not valid or the tile cannot be opened.
   void InitTile();
@@ -74,6 +98,7 @@ class KiWiTableIterator : public InternalIterator {
   // Merges the pages of the current tile; null when not positioned.
   std::unique_ptr<InternalIterator> tile_iter_;
   std::vector<InternalIterator*> page_scratch_;
+  PinnedIteratorsManager* pinned_iters_mgr_ = nullptr;
   Status status_;
 };
 

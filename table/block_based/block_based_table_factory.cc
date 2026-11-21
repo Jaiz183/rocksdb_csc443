@@ -985,10 +985,6 @@ Status BlockBasedTableFactory::ValidateOptions(
             "kiwi_tile_pages is incompatible with compression dictionaries");
       }
     }
-    // TODO(kiwi): remove once the table reader can read KiWi files. Until
-    // then a database must not write them.
-    return Status::NotSupported(
-        "kiwi_tile_pages: reading KiWi files is not implemented yet");
   }
   if (table_options_.data_block_index_type ==
           BlockBasedTableOptions::kDataBlockBinaryAndHash &&
