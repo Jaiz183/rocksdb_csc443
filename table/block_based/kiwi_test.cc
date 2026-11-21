@@ -1084,6 +1084,47 @@ void ExpectSameIterator(InternalIterator* expected, InternalIterator* actual) {
   ASSERT_OK(actual->status());
 }
 
+// Applies the same random mix of seeks, Next and Prev to both iterators
+// (direction changes inside a tile and across tile boundaries included) and
+// compares them after every step.
+void ExpectSameRandomWalk(InternalIterator* expected, InternalIterator* actual,
+                          Random64* rnd, size_t num_keys, int num_ops) {
+  for (int op = 0; op < num_ops; ++op) {
+    const uint64_t choice = rnd->Uniform(20);
+    if (!expected->Valid() || choice == 0) {
+      // Reposition; also the only way out of an invalid state.
+      char buf[16];
+      snprintf(buf, sizeof(buf), "key%08" PRIu64, rnd->Uniform(num_keys + 2));
+      const std::string target =
+          MakeInternalKeyFromUserKey(buf, 1000 - rnd->Uniform(5));
+      switch (rnd->Uniform(4)) {
+        case 0:
+          expected->SeekToFirst();
+          actual->SeekToFirst();
+          break;
+        case 1:
+          expected->SeekToLast();
+          actual->SeekToLast();
+          break;
+        case 2:
+          expected->Seek(target);
+          actual->Seek(target);
+          break;
+        default:
+          expected->SeekForPrev(target);
+          actual->SeekForPrev(target);
+      }
+    } else if (choice < 11) {
+      expected->Next();
+      actual->Next();
+    } else {
+      expected->Prev();
+      actual->Prev();
+    }
+    ExpectSameIterator(expected, actual);
+  }
+}
+
 }  // namespace
 
 TEST(KiWiIteratorTest, ForwardScanMatchesPlainTable) {
@@ -1245,40 +1286,7 @@ TEST(KiWiIteratorTest, RandomWalkMatchesPlainTable) {
     std::unique_ptr<InternalIterator> expected(
         NewIter(tables.plain.reader.get()));
     std::unique_ptr<InternalIterator> actual(NewIter(tables.kiwi.reader.get()));
-    for (int op = 0; op < 3000; ++op) {
-      const uint64_t choice = rnd.Uniform(20);
-      if (!expected->Valid() || choice == 0) {
-        // Reposition; also the only way out of an invalid state.
-        char buf[16];
-        snprintf(buf, sizeof(buf), "key%08" PRIu64, rnd.Uniform(num_keys + 2));
-        const std::string target =
-            MakeInternalKeyFromUserKey(buf, 1000 - rnd.Uniform(5));
-        switch (rnd.Uniform(4)) {
-          case 0:
-            expected->SeekToFirst();
-            actual->SeekToFirst();
-            break;
-          case 1:
-            expected->SeekToLast();
-            actual->SeekToLast();
-            break;
-          case 2:
-            expected->Seek(target);
-            actual->Seek(target);
-            break;
-          default:
-            expected->SeekForPrev(target);
-            actual->SeekForPrev(target);
-        }
-      } else if (choice < 11) {
-        expected->Next();
-        actual->Next();
-      } else {
-        expected->Prev();
-        actual->Prev();
-      }
-      ExpectSameIterator(expected.get(), actual.get());
-    }
+    ExpectSameRandomWalk(expected.get(), actual.get(), &rnd, num_keys, 3000);
   }
 }
 
@@ -1720,6 +1728,151 @@ TEST(KiWiAuditTest, SizeEstimatesAreMonotonicAndBounded) {
   // Anchors partition the data region of the file.
   ASSERT_GT(total, 0U);
   ASSERT_LE(total, table.props->data_size);
+}
+
+namespace {
+
+// Entries minus those a secondary delete removed (kTypeValue with a delete key
+// below `floor`), i.e. what a reader of the file must see.
+std::vector<Entry> SurvivingEntries(const std::vector<Entry>& entries,
+                                    uint32_t delete_key_offset,
+                                    uint64_t floor) {
+  std::vector<Entry> survivors;
+  for (const Entry& e : entries) {
+    uint64_t d = 0;
+    EXPECT_OK(ExtractDeleteKey(ExtractValueType(e.ikey), e.value,
+                               delete_key_offset, &d));
+    if (!(ExtractValueType(e.ikey) == kTypeValue && d < floor)) {
+      survivors.push_back(e);
+    }
+  }
+  return survivors;
+}
+
+// A KiWi file opened with a delete floor, next to a plain file holding exactly
+// the entries that survive the floor.
+struct FloorTables {
+  BuiltTable kiwi_table;
+  BuiltTable plain_table;
+  OpenedTable kiwi;
+  OpenedTable plain;
+  size_t num_survivors = 0;
+};
+
+void BuildFloorTables(const std::vector<Entry>& entries, const BuildParams& bp,
+                      uint64_t floor, FloorTables* out) {
+  BuildKiWiTable(entries, bp, &out->kiwi_table);
+  ASSERT_OK(OpenTable(out->kiwi_table.contents, bp, &out->kiwi, floor));
+  BuildParams plain_bp = bp;
+  plain_bp.tile_pages = 1;
+  const std::vector<Entry> survivors =
+      SurvivingEntries(entries, bp.delete_key_offset, floor);
+  out->num_survivors = survivors.size();
+  BuildKiWiTable(survivors, plain_bp, &out->plain_table);
+  ASSERT_OK(OpenTable(out->plain_table.contents, plain_bp, &out->plain));
+}
+
+}  // namespace
+
+TEST(KiWiDeleteFloorTest, ReadsMatchAPlainFileOfTheSurvivors) {
+  const uint64_t seed = Env::Default()->NowMicros();
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random64 rnd(seed);
+  for (int iter = 0; iter < 12; ++iter) {
+    BuildParams bp;
+    bp.tile_pages = 2 + static_cast<uint32_t>(rnd.Uniform(7));
+    bp.block_size = 64 + rnd.Uniform(300);
+    bp.filters = !rnd.OneIn(4);
+    const size_t num_keys = 30 + rnd.Uniform(150);
+    const std::vector<Entry> entries = MakeEntries(&rnd, num_keys, 0, 40);
+    // Delete keys span the whole 64-bit range or a handful of small values, so
+    // floors fall inside, between and outside of the pages' delete key ranges.
+    const uint64_t floors[] = {1, 4, rnd.Next(), rnd.Next() / 2, kNoDeleteKey};
+    const uint64_t floor = floors[rnd.Uniform(5)];
+    FloorTables tables;
+    BuildFloorTables(entries, bp, floor, &tables);
+
+    // Scans in both directions and a random walk of every operation.
+    std::unique_ptr<InternalIterator> expected(
+        NewIter(tables.plain.reader.get()));
+    std::unique_ptr<InternalIterator> actual(NewIter(tables.kiwi.reader.get()));
+    for (expected->SeekToFirst(), actual->SeekToFirst(); expected->Valid();
+         expected->Next(), actual->Next()) {
+      ExpectSameIterator(expected.get(), actual.get());
+    }
+    ExpectSameIterator(expected.get(), actual.get());
+    for (expected->SeekToLast(), actual->SeekToLast(); expected->Valid();
+         expected->Prev(), actual->Prev()) {
+      ExpectSameIterator(expected.get(), actual.get());
+    }
+    ExpectSameIterator(expected.get(), actual.get());
+    ExpectSameRandomWalk(expected.get(), actual.get(), &rnd, num_keys, 1500);
+
+    // Point lookups and snapshots see the same.
+    for (int probe = 0; probe < 200; ++probe) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), "key%08" PRIu64, rnd.Uniform(num_keys + 2));
+      const SequenceNumber snapshot =
+          rnd.OneIn(3) ? kMaxSequenceNumber : 1000 - rnd.Uniform(4);
+      GetResult want;
+      GetResult got;
+      ASSERT_OK(DoGet(tables.plain, buf, snapshot, &want));
+      ASSERT_OK(DoGet(tables.kiwi, buf, snapshot, &got));
+      ASSERT_EQ(want.state, got.state) << buf;
+      ASSERT_EQ(want.value, got.value) << buf;
+    }
+  }
+}
+
+TEST(KiWiDeleteFloorTest, FullyDeletedPagesAreNotRead) {
+  Random64 rnd(71);
+  BuildParams bp;
+  bp.tile_pages = 8;
+  // Only values, so that no page holds a tombstone (which has no delete key).
+  std::vector<Entry> entries;
+  for (uint64_t k = 0; k < 400; ++k) {
+    Entry e;
+    e.ikey = MakeInternalKey(k, 1000, kTypeValue);
+    e.value = MakeValue(1000 + rnd.Uniform(1000), 0, 40);
+    entries.push_back(std::move(e));
+  }
+  auto data_block_reads = [](const OpenedTable& t) {
+    Statistics* stats = t.options.statistics.get();
+    return stats->getTickerCount(BLOCK_CACHE_DATA_HIT) +
+           stats->getTickerCount(BLOCK_CACHE_DATA_MISS);
+  };
+  auto scan = [](OpenedTable* t) {
+    std::unique_ptr<InternalIterator> it(NewIter(t->reader.get()));
+    size_t n = 0;
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      ++n;
+    }
+    EXPECT_OK(it->status());
+    return n;
+  };
+
+  // A floor above every delete key deletes everything without reading a page.
+  FloorTables all_gone;
+  BuildFloorTables(entries, bp, /*floor=*/1000000, &all_gone);
+  ASSERT_EQ(scan(&all_gone.kiwi), 0U);
+  ASSERT_EQ(data_block_reads(all_gone.kiwi), 0U);
+  GetResult r;
+  ASSERT_OK(DoGet(all_gone.kiwi, "key00000005", kMaxSequenceNumber, &r));
+  ASSERT_EQ(r.state, GetContext::kNotFound);
+  ASSERT_EQ(data_block_reads(all_gone.kiwi), 0U);
+
+  // A floor in the middle reads only the pages that still hold entries: fewer
+  // than the whole file, and at most the surviving ones plus the edge pages.
+  FloorTables half;
+  BuildFloorTables(entries, bp, /*floor=*/1500, &half);
+  const size_t survivors = scan(&half.kiwi);
+  ASSERT_EQ(survivors, half.num_survivors);
+  ASSERT_GT(survivors, 0U);
+  ASSERT_LT(survivors, entries.size());
+  OpenedTable untouched;
+  ASSERT_OK(OpenTable(half.kiwi_table.contents, bp, &untouched));
+  ASSERT_EQ(scan(&untouched), entries.size());
+  ASSERT_LT(data_block_reads(half.kiwi), data_block_reads(untouched));
 }
 
 #endif  // !NDEBUG

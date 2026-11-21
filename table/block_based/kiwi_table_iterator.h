@@ -12,6 +12,7 @@
 #include "db/pinned_iterators_manager.h"
 #include "rocksdb/options.h"
 #include "table/block_based/block_based_table_reader.h"
+#include "table/block_based/kiwi_tile.h"
 #include "table/internal_iterator.h"
 #include "trace_replay/block_cache_tracer.h"
 
@@ -53,6 +54,15 @@ class KiWiTableIterator : public InternalIterator {
   }
   Status status() const override;
 
+  // Opens a page for reading under the file's KiWi delete floor. Returns
+  // nullptr if the floor deletes every entry of the page, which is then not
+  // even read; a page that is only partly deleted is wrapped so that its
+  // deleted entries are skipped.
+  static InternalIterator* NewPageIterator(
+      BlockBasedTable* table, const ReadOptions& read_options,
+      const kiwi::DirectoryPage& page, GetContext* get_context,
+      BlockCacheLookupContext* lookup_context, bool for_compaction);
+
   // Keys and values point into the pages of the current tile. With pinning
   // enabled, a tile that is left is handed to the PinnedIteratorsManager
   // instead of being freed, so what was returned stays valid.
@@ -80,8 +90,6 @@ class KiWiTableIterator : public InternalIterator {
   // Positions tile_iter_ on the tile the index iterator points at, or clears it
   // if the index iterator is not valid or the tile cannot be opened.
   void InitTile();
-  // Opens a page as a block iterator; errors surface through its status.
-  InternalIterator* NewPageIterator(const BlockHandle& handle);
   // After the current tile ran out, moves on to the first entry of the next
   // non-empty tile.
   void SkipEmptyTilesForward();

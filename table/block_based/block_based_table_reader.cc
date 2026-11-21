@@ -1809,13 +1809,12 @@ Status BlockBasedTable::KiWiGet(const ReadOptions& read_options,
         }
         RecordTick(stats, BLOOM_FILTER_FULL_POSITIVE);
       }
-      Status page_status;
-      pages.push_back(NewDataBlockIterator<DataBlockIter>(
-          read_options, tile.pages[i].handle, /*input_iter=*/nullptr,
-          BlockType::kData, get_context, &lookup_context,
-          /*prefetch_buffer=*/nullptr, /*for_compaction=*/false,
-          /*async_read=*/false, page_status,
-          /*use_block_cache_for_lookup=*/true));
+      InternalIterator* page = KiWiTableIterator::NewPageIterator(
+          this, read_options, tile.pages[i], get_context, &lookup_context,
+          /*for_compaction=*/false);
+      if (page != nullptr) {
+        pages.push_back(page);
+      }
     }
     if (!pages.empty()) {
       // Versions of one key can sit on different pages, so merge them and let

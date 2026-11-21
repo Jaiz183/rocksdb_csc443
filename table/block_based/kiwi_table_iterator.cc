@@ -24,14 +24,99 @@ KiWiTableIterator::KiWiTableIterator(
   assert(table_->get_rep()->kiwi_directory != nullptr);
 }
 
+namespace {
+// Hides the entries a KiWi secondary delete removed: kTypeValue entries whose
+// delete key is below the floor. Everything else is passed through.
+class DeleteFloorIterator : public InternalIterator {
+ public:
+  DeleteFloorIterator(std::unique_ptr<InternalIterator> iter,
+                      uint32_t delete_key_offset, uint64_t floor)
+      : iter_(std::move(iter)), offset_(delete_key_offset), floor_(floor) {}
+
+  bool Valid() const override { return status_.ok() && iter_->Valid(); }
+  void SeekToFirst() override {
+    iter_->SeekToFirst();
+    SkipDeletedForward();
+  }
+  void SeekToLast() override {
+    iter_->SeekToLast();
+    SkipDeletedBackward();
+  }
+  void Seek(const Slice& target) override {
+    iter_->Seek(target);
+    SkipDeletedForward();
+  }
+  void SeekForPrev(const Slice& target) override {
+    iter_->SeekForPrev(target);
+    SkipDeletedBackward();
+  }
+  void Next() override {
+    iter_->Next();
+    SkipDeletedForward();
+  }
+  void Prev() override {
+    iter_->Prev();
+    SkipDeletedBackward();
+  }
+  Slice key() const override { return iter_->key(); }
+  Slice value() const override { return iter_->value(); }
+  Status status() const override {
+    return status_.ok() ? iter_->status() : status_;
+  }
+  void SetPinnedItersMgr(PinnedIteratorsManager* mgr) override {
+    iter_->SetPinnedItersMgr(mgr);
+  }
+  bool IsKeyPinned() const override { return iter_->IsKeyPinned(); }
+  bool IsValuePinned() const override { return iter_->IsValuePinned(); }
+
+ private:
+  // A value too short for its delete key stops the iteration with an error.
+  bool IsDeleted() {
+    if (ExtractValueType(iter_->key()) != kTypeValue) {
+      return false;
+    }
+    uint64_t delete_key = 0;
+    status_ = kiwi::ExtractDeleteKey(kTypeValue, iter_->value(), offset_,
+                                     &delete_key);
+    return status_.ok() && delete_key < floor_;
+  }
+  void SkipDeletedForward() {
+    while (status_.ok() && iter_->Valid() && IsDeleted()) {
+      iter_->Next();
+    }
+  }
+  void SkipDeletedBackward() {
+    while (status_.ok() && iter_->Valid() && IsDeleted()) {
+      iter_->Prev();
+    }
+  }
+
+  std::unique_ptr<InternalIterator> iter_;
+  const uint32_t offset_;
+  const uint64_t floor_;
+  Status status_;
+};
+}  // namespace
+
 InternalIterator* KiWiTableIterator::NewPageIterator(
-    const BlockHandle& handle) {
+    BlockBasedTable* table, const ReadOptions& read_options,
+    const kiwi::DirectoryPage& page, GetContext* get_context,
+    BlockCacheLookupContext* lookup_context, bool for_compaction) {
+  const BlockBasedTable::Rep* rep = table->get_rep();
+  const uint64_t floor = rep->kiwi_delete_floor;
+  if (floor != 0 && page.max_delete_key < floor) {
+    return nullptr;  // fully deleted: not even read
+  }
   Status s;
-  return table_->NewDataBlockIterator<DataBlockIter>(
-      read_options_, handle, /*input_iter=*/nullptr, BlockType::kData,
-      /*get_context=*/nullptr, &lookup_context_, /*prefetch_buffer=*/nullptr,
-      /*for_compaction=*/caller_ == TableReaderCaller::kCompaction,
+  InternalIterator* iter = table->NewDataBlockIterator<DataBlockIter>(
+      read_options, page.handle, /*input_iter=*/nullptr, BlockType::kData,
+      get_context, lookup_context, /*prefetch_buffer=*/nullptr, for_compaction,
       /*async_read=*/false, s, /*use_block_cache_for_lookup=*/true);
+  if (floor != 0 && page.min_delete_key < floor) {
+    return new DeleteFloorIterator(std::unique_ptr<InternalIterator>(iter),
+                                   rep->kiwi_delete_key_offset, floor);
+  }
+  return iter;
 }
 
 void KiWiTableIterator::ReleaseTile() {
@@ -59,7 +144,13 @@ void KiWiTableIterator::InitTile() {
   const kiwi::Directory::TileView tile = dir.tile(tile_index);
   page_scratch_.clear();
   for (size_t i = 0; i < tile.num_pages; ++i) {
-    page_scratch_.push_back(NewPageIterator(tile.pages[i].handle));
+    InternalIterator* page = NewPageIterator(
+        table_, read_options_, tile.pages[i], /*get_context=*/nullptr,
+        &lookup_context_,
+        /*for_compaction=*/caller_ == TableReaderCaller::kCompaction);
+    if (page != nullptr) {
+      page_scratch_.push_back(page);
+    }
   }
   // Takes ownership of the page iterators.
   tile_iter_.reset(NewMergingIterator(
