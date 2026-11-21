@@ -1324,6 +1324,15 @@ struct BlockBasedTableBuilder::Rep {
         : packer(delete_key_offset, tile_pages, page_size) {}
     kiwi::TilePacker packer;
     std::vector<kiwi::TilePage> pages;  // scratch, reused across tiles
+    // Builds one Bloom filter per page; null if the file has no filters.
+    std::unique_ptr<FilterBitsBuilder> page_filter;
+    // What the reader needs to skip pages and filter lookups, per tile.
+    kiwi::DirectoryBuilder directory;
+    std::vector<kiwi::DirectoryPage> directory_pages;  // scratch
+    std::vector<std::string> blooms;                   // scratch
+    // Delete key range of the whole file, for the table properties.
+    uint64_t min_delete_key = kiwi::kNoDeleteKey;
+    uint64_t max_delete_key = 0;
   };
   std::unique_ptr<KiWiState> kiwi;
 
@@ -2013,10 +2022,16 @@ struct BlockBasedTableBuilder::Rep {
             "user-defined timestamps or compression dictionaries"));
       } else {
         // KiWi keeps a filter per page instead of one for the whole file.
+        // Whether to build filters at all follows the whole-file decision.
+        const bool want_filters = filter_builder != nullptr;
         filter_builder.reset();
         kiwi = std::make_unique<KiWiState>(table_opt.kiwi_delete_key_offset,
                                            table_opt.kiwi_tile_pages,
                                            table_opt.block_size);
+        if (want_filters) {
+          kiwi->page_filter.reset(
+              BloomFilterPolicy::GetBuilderFromContext(filter_context));
+        }
       }
     }
 
@@ -2527,12 +2542,34 @@ void BlockBasedTableBuilder::FlushTile(const Slice* first_key_in_next_tile) {
   BlockHandle first_page;
   BlockHandle last_page;
   bool skip_delta_encoding = false;
+  r->kiwi->directory_pages.clear();
+  r->kiwi->blooms.resize(pages.size());
   for (size_t p = 0; p < pages.size(); ++p) {
     Slice prev_key;
     for (size_t pos : pages[p].entries) {
       const Slice key = packer.key(pos);
       r->data_block.AddWithLastKey(key, packer.value(pos), prev_key);
+      if (r->kiwi->page_filter != nullptr) {
+        // Versions of a key are adjacent, so the filter deduplicates them.
+        r->kiwi->page_filter->AddKey(ExtractUserKey(key));
+      }
       prev_key = key;
+    }
+    std::string& bloom = r->kiwi->blooms[p];
+    bloom.clear();
+    if (r->kiwi->page_filter != nullptr) {
+      std::unique_ptr<const char[]> filter_buf;
+      Status filter_status;
+      const Slice filter =
+          r->kiwi->page_filter->Finish(&filter_buf, &filter_status);
+      r->SetStatus(filter_status);
+      if (LIKELY(ok())) {
+        r->SetStatus(r->kiwi->page_filter->MaybePostVerify(filter));
+      }
+      if (UNLIKELY(!ok())) {
+        return;
+      }
+      bloom.assign(filter.data(), filter.size());
     }
     const size_t page_bytes = r->data_block.Finish().size();
     NotifyCollectTableCollectorsOnBlockAdd(r->table_properties_collectors,
@@ -2552,7 +2589,19 @@ void BlockBasedTableBuilder::FlushTile(const Slice* first_key_in_next_tile) {
       skip_delta_encoding = page_skip_delta_encoding;
     }
     last_page = r->pending_handle;
+
+    kiwi::DirectoryPage entry;
+    entry.handle = r->pending_handle;
+    entry.min_delete_key = pages[p].min_delete_key;
+    entry.max_delete_key = pages[p].max_delete_key;
+    entry.bloom = bloom;
+    r->kiwi->directory_pages.push_back(entry);
+    r->kiwi->min_delete_key =
+        std::min(r->kiwi->min_delete_key, pages[p].min_delete_key);
+    r->kiwi->max_delete_key =
+        std::max(r->kiwi->max_delete_key, pages[p].max_delete_key);
   }
+  r->kiwi->directory.AddTile(r->kiwi->directory_pages);
 
   // One index entry per tile, covering all of its pages. Its handle is
   // contiguous with the next tile's, as plain index delta encoding assumes.
@@ -3832,6 +3881,18 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
           std::move(encoded_stats);
     }
 
+    if (rep_->kiwi) {
+      auto& user_props = rep_->props.user_collected_properties;
+      user_props[kiwi::kPropTilePages] =
+          std::to_string(rep_->table_options.kiwi_tile_pages);
+      user_props[kiwi::kPropDeleteKeyOffset] =
+          std::to_string(rep_->table_options.kiwi_delete_key_offset);
+      user_props[kiwi::kPropMinDeleteKey] =
+          std::to_string(rep_->kiwi->min_delete_key);
+      user_props[kiwi::kPropMaxDeleteKey] =
+          std::to_string(rep_->kiwi->max_delete_key);
+    }
+
     rep_->props.num_data_blocks_compression_rejected =
         rep_->num_data_blocks_compression_rejected.LoadRelaxed();
     rep_->props.num_data_blocks_compression_bypassed =
@@ -3895,6 +3956,23 @@ void BlockBasedTableBuilder::WriteCompressionDictBlock(
       meta_index_builder->Add(kCompressionDictBlockName,
                               compression_dict_block_handle);
     }
+  }
+}
+
+void BlockBasedTableBuilder::WriteKiWiDirectoryBlock(
+    MetaIndexBuilder* meta_index_builder) {
+  if (rep_->kiwi == nullptr || UNLIKELY(!ok())) {
+    return;
+  }
+  std::string contents;
+  rep_->kiwi->directory.Finish(&contents);
+  BlockHandle directory_handle;
+  // Not compressed, and not a filter or index block as far as caching and
+  // verification are concerned: the reader pins it as a whole.
+  WriteMaybeCompressedBlock(contents, kNoCompression, &directory_handle,
+                            BlockType::kProperties);
+  if (LIKELY(ok())) {
+    meta_index_builder->Add(kiwi::kDirectoryBlockName, directory_handle);
   }
 }
 
@@ -4208,6 +4286,7 @@ Status BlockBasedTableBuilder::Finish() {
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
+  WriteKiWiDirectoryBlock(&meta_index_builder);
   WritePropertiesBlock(&meta_index_builder);
   if (LIKELY(ok())) {
     // flush the meta index block

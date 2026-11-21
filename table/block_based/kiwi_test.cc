@@ -19,10 +19,12 @@
 #include "port/stack_trace.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/env.h"
+#include "rocksdb/filter_policy.h"
 #include "rocksdb/table.h"
 #include "table/block_based/block.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/block_based/block_based_table_reader.h"
+#include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/kiwi_tile.h"
 #include "table/meta_blocks.h"
 #include "table/table_builder.h"
@@ -474,6 +476,7 @@ struct BuiltTable {
   std::string contents;
   std::vector<TileLayout> tiles;
   std::unique_ptr<TableProperties> props;
+  std::string directory;  // contents of the KiWi directory meta block
 };
 
 struct BuildParams {
@@ -482,6 +485,7 @@ struct BuildParams {
   uint32_t delete_key_offset = 0;
   CompressionType compression = kNoCompression;
   uint32_t parallel_threads = 1;
+  bool filters = true;  // per-page Bloom filters
   const Comparator* comparator = BytewiseComparator();
 };
 
@@ -500,7 +504,11 @@ void BuildKiWiTable(const std::vector<Entry>& entries, const BuildParams& bp,
   bbto.kiwi_tile_pages = bp.tile_pages;
   bbto.block_size = bp.block_size;
   bbto.kiwi_delete_key_offset = bp.delete_key_offset;
-  bbto.filter_policy = nullptr;
+  if (bp.filters) {
+    bbto.filter_policy.reset(NewBloomFilterPolicy(10));
+  } else {
+    bbto.filter_policy = nullptr;
+  }
   BlockBasedTableFactory factory(bbto);
 
   std::unique_ptr<FSWritableFile> sink(new test::StringSink());
@@ -555,6 +563,15 @@ void BuildKiWiTable(const std::vector<Entry>& entries, const BuildParams& bp,
   ASSERT_OK(ReadTableProperties(file_reader.get(), out->contents.size(),
                                 kBlockBasedTableMagicNumber, ioptions,
                                 read_options, &out->props));
+
+  BlockHandle directory_handle;
+  ASSERT_OK(FindMetaBlockInFile(file_reader.get(), out->contents.size(),
+                                kBlockBasedTableMagicNumber, ioptions,
+                                read_options, kDirectoryBlockName,
+                                &directory_handle));
+  // Stored uncompressed; the checksum trailer follows the payload.
+  out->directory =
+      out->contents.substr(directory_handle.offset(), directory_handle.size());
 }
 
 // Entries in internal key order: ascending user keys, several versions each
@@ -611,6 +628,7 @@ TEST(KiWiBuilderTest, WritesTilesWithKiWiInvariants) {
     bp.tile_pages = 2 + static_cast<uint32_t>(rnd.Uniform(7));
     bp.block_size = 64 + rnd.Uniform(400);
     bp.delete_key_offset = static_cast<uint32_t>(rnd.Uniform(10));
+    bp.filters = !rnd.OneIn(4);
     const std::vector<Entry> entries =
         MakeEntries(&rnd, 50 + rnd.Uniform(300), bp.delete_key_offset, 60);
 
@@ -624,6 +642,11 @@ TEST(KiWiBuilderTest, WritesTilesWithKiWiInvariants) {
     }
     std::map<std::string, std::string> seen;
     size_t total_pages = 0;
+    Directory dir;
+    ASSERT_OK(dir.Decode(table.directory));
+    ASSERT_EQ(dir.num_tiles(), table.tiles.size());
+    uint64_t file_min_d = kNoDeleteKey;
+    uint64_t file_max_d = 0;
     std::string prev_tile_last_key;
     for (size_t t = 0; t < table.tiles.size(); ++t) {
       const TileLayout& tile = table.tiles[t];
@@ -648,11 +671,26 @@ TEST(KiWiBuilderTest, WritesTilesWithKiWiInvariants) {
                       BlockBasedTable::kBlockTrailerSize);
       }
 
+      // The directory describes exactly the pages that were written, and the
+      // index entry of the tile (its first page offset) finds the tile.
+      ASSERT_EQ(dir.FindTile(tile.handle.offset()), t);
+      const Directory::TileView dir_tile = dir.tile(t);
+      ASSERT_EQ(dir_tile.num_pages, tile.pages.size());
+
       std::string tile_first_key, tile_last_key;
       uint64_t prev_page_max_d = 0;
       for (size_t i = 0; i < tile.pages.size(); ++i) {
         std::vector<Entry> page;
         DecodePage(table.contents, tile.pages[i], ikc, &page);
+        ASSERT_EQ(dir_tile.pages[i].handle, tile.pages[i]);
+        std::unique_ptr<BuiltinFilterBitsReader> bloom;
+        if (bp.filters) {
+          ASSERT_FALSE(dir_tile.pages[i].bloom.empty());
+          bloom.reset(BuiltinFilterPolicy::GetBuiltinFilterBitsReader(
+              dir_tile.pages[i].bloom));
+        } else {
+          ASSERT_TRUE(dir_tile.pages[i].bloom.empty());
+        }
         ASSERT_FALSE(page.empty());
         uint64_t min_d = kNoDeleteKey;
         uint64_t max_d = 0;
@@ -668,6 +706,10 @@ TEST(KiWiBuilderTest, WritesTilesWithKiWiInvariants) {
           max_d = std::max(max_d, d);
           ASSERT_TRUE(seen.emplace(page[j].ikey, page[j].value).second)
               << "entry written twice";
+          if (bloom != nullptr) {
+            // No false negatives for any key of the page.
+            ASSERT_TRUE(bloom->MayMatch(ExtractUserKey(page[j].ikey)));
+          }
           if (tile_first_key.empty() ||
               ikc.Compare(page[j].ikey, tile_first_key) < 0) {
             tile_first_key = page[j].ikey;
@@ -677,6 +719,11 @@ TEST(KiWiBuilderTest, WritesTilesWithKiWiInvariants) {
             tile_last_key = page[j].ikey;
           }
         }
+        // The directory's delete key fences match the page contents.
+        ASSERT_EQ(dir_tile.pages[i].min_delete_key, min_d);
+        ASSERT_EQ(dir_tile.pages[i].max_delete_key, max_d);
+        file_min_d = std::min(file_min_d, min_d);
+        file_max_d = std::max(file_max_d, max_d);
         // Pages of a tile are ordered by delete key.
         if (i > 0) {
           ASSERT_LE(prev_page_max_d, min_d);
@@ -692,8 +739,14 @@ TEST(KiWiBuilderTest, WritesTilesWithKiWiInvariants) {
     ASSERT_EQ(seen, expected);
     ASSERT_EQ(table.props->num_entries, entries.size());
     ASSERT_EQ(table.props->num_data_blocks, total_pages);
-    // KiWi files have no whole-file filter.
+    // KiWi files have no whole-file filter; page filters live in the directory.
     ASSERT_EQ(table.props->filter_size, 0U);
+    const auto& up = table.props->user_collected_properties;
+    ASSERT_EQ(up.at(kPropTilePages), std::to_string(bp.tile_pages));
+    ASSERT_EQ(up.at(kPropDeleteKeyOffset),
+              std::to_string(bp.delete_key_offset));
+    ASSERT_EQ(up.at(kPropMinDeleteKey), std::to_string(file_min_d));
+    ASSERT_EQ(up.at(kPropMaxDeleteKey), std::to_string(file_max_d));
   }
 }
 
