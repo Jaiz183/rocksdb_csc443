@@ -1,0 +1,1 @@
+Added KiWi delete tiles (experimental): `BlockBasedTableOptions::kiwi_tile_pages` and `kiwi_delete_key_offset` write SST files whose data blocks are grouped into tiles ordered by a delete key stored in the value, with a Bloom filter per block, which makes secondary range deletes cheap (see `DB::SecondaryDeleteBelow()`). Files written this way cannot be read by older versions.
