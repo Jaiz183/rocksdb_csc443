@@ -141,6 +141,8 @@ DECLARE_int32(level0_stop_writes_trigger);
 DECLARE_int32(block_size);
 DECLARE_int32(format_version);
 DECLARE_bool(separate_key_value_in_data_block);
+DECLARE_uint32(kiwi_tile_pages);
+DECLARE_uint32(kiwi_delete_key_offset);
 DECLARE_int32(index_block_restart_interval);
 DECLARE_int32(max_background_compactions);
 DECLARE_int32(num_bottom_pri_threads);

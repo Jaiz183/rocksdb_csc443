@@ -453,6 +453,10 @@ default_params = {
     "format_version": lambda: random.choice([2, 3, 4, 5, 6, 7, 8, 8]),
     "optimize_key_common_prefix": lambda: random.choice([0, 1, 2]),
     "separate_key_value_in_data_block": lambda: random.choice([0, 1, 1]),
+    # KiWi delete tiles. Values have at least value_size_mult >= 8 bytes, which
+    # fits the 8-byte delete key at offset 0.
+    "kiwi_tile_pages": lambda: random.choice([0, 0, 0, 2, 4, 8]),
+    "kiwi_delete_key_offset": 0,
     "index_block_restart_interval": lambda: random.choice(range(1, 16)),
     "use_multiget": lambda: random.randint(0, 1),
     "use_async_db_api": lambda: random.choice([0] * 5 + [1]),
@@ -2287,6 +2291,18 @@ def finalize_and_sanitize(src_params):
         if dest_params.get("read_index", -1) > 0:
             dest_params["read_index"] = -1
 
+    # KiWi delete tiles are rejected with these features (or fail the builder):
+    # turn KiWi off for the run rather than the other feature.
+    if (
+        dest_params.get("partition_filters", 0) == 1
+        or dest_params.get("user_timestamp_size", 0) > 0
+        or dest_params.get("compression_max_dict_bytes", 0) > 0
+        or dest_params.get("use_multiscan", 0) == 1
+        or dest_params.get("use_trie_index", 0) == 1
+        or dest_params.get("structured_key_value", 0) == 1
+        or dest_params.get("ingest_external_file_with_embedded_blobs", 0) == 1
+    ):
+        dest_params["kiwi_tile_pages"] = 0
     # `db_stress` rejects either verification knob when `skip_verifydb` is set.
     # Must stay last: sanitization above can turn a verification knob back on
     # after `skip_verifydb` was decided.

@@ -336,6 +336,17 @@ DEFINE_bool(separate_key_value_in_data_block,
                 .separate_key_value_in_data_block,
             "If true, data blocks store keys and values separately.");
 
+DEFINE_uint32(kiwi_tile_pages,
+              ROCKSDB_NAMESPACE::BlockBasedTableOptions().kiwi_tile_pages,
+              "BlockBasedTableOptions::kiwi_tile_pages: data blocks per KiWi "
+              "delete tile; 0 or 1 disables KiWi.");
+
+DEFINE_uint32(
+    kiwi_delete_key_offset,
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions().kiwi_delete_key_offset,
+    "BlockBasedTableOptions::kiwi_delete_key_offset: byte offset of the "
+    "8-byte delete key in a value; values must be at least offset + 8 bytes.");
+
 DEFINE_int32(
     index_block_restart_interval,
     ROCKSDB_NAMESPACE::BlockBasedTableOptions().index_block_restart_interval,
