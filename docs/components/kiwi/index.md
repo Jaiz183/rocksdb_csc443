@@ -83,13 +83,20 @@ tell and must not read KiWi files.
 3. If that version is still current, one `VersionEdit` records `floor` as the
    **delete floor** of all of them (`FileMetaData::kiwi_delete_floor`, a new
    unignorable MANIFEST tag, so older versions refuse to open the DB instead of
-   resurrecting entries) and marks them for compaction.
+   resurrecting entries) and marks them for compaction (which only affects
+   files above the last level that holds data; see step 5).
 4. Readers of such a file skip every page whose largest D is below the floor
    **without reading it**, and filter the entries of the pages that straddle the
    floor (the paper's edge pages) in memory. Nothing is rewritten, so the cost is
    O(files) of metadata and no data I/O.
-5. Background compaction later reads the files through the same filter, so the
-   files it writes simply do not contain the deleted entries.
+5. Physical reclamation happens when compaction rewrites a file: it reads the
+   file through the same filter, so the files it writes simply do not contain
+   the deleted entries. Marked files above the last level that holds data are
+   picked by the normal "marked for compaction" mechanism. A file in the last
+   level with data, where the oldest entries usually are, is never picked
+   because of the mark; it is rewritten only by a compaction that overlaps it
+   or by `CompactRange()` with `BottommostLevelCompaction::kForce`. Until then
+   the entries are invisible but still take space.
 
 It is all-or-nothing: it returns `Busy` without changing anything if an affected
 file is being compacted or the column family changed during the scan, and
@@ -112,7 +119,7 @@ concern. Entries written after the call are not affected, whatever their D.
 
 | Paper | Here | Why |
 |-------|------|-----|
-| Full page drops delete pages in place and edge pages are rewritten in place | The floor is metadata; pages are skipped at read time and physically dropped by the next compaction | SST files are immutable and `FileSystem` has no hole-punching. Delete latency is O(files) with no data I/O, but space is reclaimed later |
+| Full page drops delete pages in place and edge pages are rewritten in place | The floor is metadata; pages are skipped at read time and physically dropped when compaction rewrites the file | SST files are immutable and `FileSystem` has no hole-punching. Delete latency is O(files) with no data I/O, but space is reclaimed only when compaction touches the file (a forced rewrite is the way to reclaim last-level space on demand) |
 | Range delete on D in [lo, hi) | D < floor | Avoids resurrecting older versions (see the contract) |
 | Fence pointers and filters in memory | Same, in one pinned directory per file | -- |
 | One hash per lookup | One hash per probed page | Each filter reader hashes the key itself; a pre-hashed probe could be added if measurements ask for it |

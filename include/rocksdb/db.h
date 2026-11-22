@@ -716,8 +716,12 @@ class DB {
   // whose delete key (see BlockBasedTableOptions::kiwi_tile_pages and
   // kiwi_delete_key_offset) is below `delete_key_floor`, without a full
   // compaction: the deletion is recorded in the MANIFEST per file and costs no
-  // data I/O. Reads stop seeing the entries when this returns; the space is
-  // reclaimed by background compaction. Calling it again with a floor that is
+  // data I/O. Reads stop seeing the entries when this returns. The space is
+  // reclaimed only when compaction rewrites the affected files: files above
+  // the last level that holds data are marked for compaction, but a file in
+  // that last level, where the oldest entries usually are, is rewritten only by
+  // a compaction that overlaps it or by CompactRange() with
+  // BottommostLevelCompaction::kForce. Calling it again with a floor that is
   // not higher has no effect.
   //
   // Contract: for any user key, the delete key of a newer version must not be

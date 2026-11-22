@@ -1459,8 +1459,8 @@ TEST_F(DBKiWiSecondaryDeleteTest, DeletesBelowTheFloorAndSurvivesRestarts) {
     Reopen(options);
     VerifyModel(model);
 
-    // Space is reclaimed by background compaction, which reads through the
-    // floor, and a later, higher floor still applies.
+    // Compaction reads through the floor, so the files it writes lack the
+    // deleted entries; a later, higher floor still applies.
     ASSERT_OK(dbfull()->TEST_WaitForCompact());
     VerifyModel(model);
     // Rewriting every file, bottommost ones included, drops what was deleted.
