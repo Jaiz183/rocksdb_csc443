@@ -1002,6 +1002,41 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   double read_triggered_compaction_threshold = 0.0;
 
+  // [Leveled compaction only] Tombstone deadline. When non-zero, RocksDB tries
+  // to push every SST file that contains deletions (point or range) from a
+  // non-last level down to the last level within roughly this many seconds of
+  // the file's oldest ancestor time, so that tombstones are persisted (and the
+  // data they shadow is dropped) within a bounded time. The budget is split
+  // evenly across the non-last levels in use (L0 plus base_level .. last
+  // level - 1), giving each level a cumulative deadline. A file whose
+  // cumulative deadline has passed is compacted to the next level with
+  // CompactionReason::kTombstoneDeadline. The file's oldest ancestor time is
+  // used as a conservative upper bound on the age of its oldest tombstone.
+  //
+  // Deadline compactions run ahead of size-based compactions, except that an
+  // L0 compaction is preferred while L0 is at or over
+  // level0_file_num_compaction_trigger.
+  //
+  // 0 disables the feature.
+  //
+  // Dynamically changeable through SetOptions() API
+  uint64_t tombstone_deadline_seconds = 0;
+
+  // [Leveled compaction only; requires tombstone_deadline_seconds > 0]
+  // Deadline coalescing window. When non-zero, a compaction that starts from a
+  // level L >= 1 (deadline-triggered or size-triggered) also takes adjacent
+  // files on level L whose tombstone deadline falls within the next
+  // `deadline_coalescing_window_seconds`, as long as the compaction stays
+  // under max_compaction_bytes and does not conflict with running
+  // compactions. This batches deadlines that are close in time into one
+  // compaction, so the overlapping files of the next level are rewritten once
+  // instead of once per expiring file.
+  //
+  // 0 disables coalescing: every expired file is compacted on its own.
+  //
+  // Dynamically changeable through SetOptions() API
+  uint64_t deadline_coalescing_window_seconds = 0;
+
   // If this option is set then 1 in N blocks are compressed
   // using a fast (lz4) and slow (zstd) compression algorithm.
   // The compressibility is reported as stats and the stored

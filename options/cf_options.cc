@@ -621,6 +621,14 @@ static std::unordered_map<std::string, OptionTypeInfo>
                    read_triggered_compaction_threshold),
           OptionType::kDouble, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"tombstone_deadline_seconds",
+         {offsetof(struct MutableCFOptions, tombstone_deadline_seconds),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"deadline_coalescing_window_seconds",
+         {offsetof(struct MutableCFOptions, deadline_coalescing_window_seconds),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"preclude_last_level_data_seconds",
          {offsetof(struct MutableCFOptions, preclude_last_level_data_seconds),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -1296,6 +1304,10 @@ void MutableCFOptions::Dump(Logger* log) const {
                  periodic_compaction_seconds);
   ROCKS_LOG_INFO(log, "    read_triggered_compaction_threshold: %f",
                  read_triggered_compaction_threshold);
+  ROCKS_LOG_INFO(log, "               tombstone_deadline_seconds: %" PRIu64,
+                 tombstone_deadline_seconds);
+  ROCKS_LOG_INFO(log, "       deadline_coalescing_window_seconds: %" PRIu64,
+                 deadline_coalescing_window_seconds);
   ROCKS_LOG_INFO(log,
                  "              preclude_last_level_data_seconds: %" PRIu64,
                  preclude_last_level_data_seconds);

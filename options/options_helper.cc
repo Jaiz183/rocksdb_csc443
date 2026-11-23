@@ -376,6 +376,9 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
   cf_opts->periodic_compaction_seconds = moptions.periodic_compaction_seconds;
   cf_opts->read_triggered_compaction_threshold =
       moptions.read_triggered_compaction_threshold;
+  cf_opts->tombstone_deadline_seconds = moptions.tombstone_deadline_seconds;
+  cf_opts->deadline_coalescing_window_seconds =
+      moptions.deadline_coalescing_window_seconds;
   cf_opts->preclude_last_level_data_seconds =
       moptions.preclude_last_level_data_seconds;
   cf_opts->preserve_internal_time_seconds =

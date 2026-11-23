@@ -15,6 +15,7 @@
 
 #include "db/version_edit.h"
 #include "logging/log_buffer.h"
+#include "logging/logging.h"
 #include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -22,6 +23,9 @@ namespace ROCKSDB_NAMESPACE {
 bool LevelCompactionPicker::NeedsCompaction(
     const VersionStorageInfo* vstorage) const {
   if (!vstorage->ExpiredTtlFiles().empty()) {
+    return true;
+  }
+  if (!vstorage->TombstoneDeadlineFiles().empty()) {
     return true;
   }
   if (!vstorage->FilesMarkedForPeriodicCompaction().empty()) {
@@ -106,6 +110,24 @@ class LevelCompactionBuilder {
 
   // Return true if a L0 trivial move is picked up.
   bool TryPickL0TrivialMove();
+
+  // Picks the most overdue file from TombstoneDeadlineFiles() that can be
+  // compacted to the next level, then coalesces near-deadline neighbours.
+  // Returns true and sets compaction_reason_ to kTombstoneDeadline if a
+  // compaction was picked.
+  bool PickTombstoneDeadlineCompaction();
+
+  // Deadline coalescing: extends start_level_inputs_ (start level >= 1) with
+  // adjacent files whose tombstone deadline falls within
+  // deadline_coalescing_window_seconds, while the compaction stays under
+  // max_compaction_bytes and conflicts with no running compaction. Returns
+  // the number of files added.
+  size_t CoalesceNearDeadlineFiles();
+
+  // Collects the output-level files overlapping `inputs` into `output`.
+  // Returns false if any of them is being compacted.
+  bool GetOutputLevelOverlap(const CompactionInputFiles& inputs,
+                             CompactionInputFiles* output);
 
   // For L0->L0, picks the longest span of files that aren't currently
   // undergoing compaction for which work-per-deleted-file decreases. The span
@@ -205,6 +227,16 @@ void LevelCompactionBuilder::PickFileToCompact(
 }
 
 void LevelCompactionBuilder::SetupInitialFiles() {
+  // Tombstone deadline compactions go ahead of size-based compactions so the
+  // deadline holds under load, except when L0 has reached its compaction
+  // trigger: then the L0 compaction goes first to avoid write stalls.
+  const bool l0_at_trigger =
+      vstorage_->NumLevelFiles(0) >=
+      mutable_cf_options_.level0_file_num_compaction_trigger;
+  if (!l0_at_trigger && PickTombstoneDeadlineCompaction()) {
+    return;
+  }
+
   // Find the compactions by size on all levels.
   bool skipped_l0_to_base = false;
   for (int i = 0; i < compaction_picker_->NumberLevels() - 1; i++) {
@@ -231,6 +263,9 @@ void LevelCompactionBuilder::SetupInitialFiles() {
         } else {
           // L1+ score = `Level files size` / `MaxBytesForLevel`
           compaction_reason_ = CompactionReason::kLevelMaxLevelSize;
+          // Let the size-triggered compaction absorb neighbours that are about
+          // to hit their tombstone deadline.
+          CoalesceNearDeadlineFiles();
         }
         break;
       } else {
@@ -259,6 +294,10 @@ void LevelCompactionBuilder::SetupInitialFiles() {
     }
   }
   if (!start_level_inputs_.empty()) {
+    return;
+  }
+
+  if (l0_at_trigger && PickTombstoneDeadlineCompaction()) {
     return;
   }
 
@@ -336,6 +375,147 @@ void LevelCompactionBuilder::SetupInitialFiles() {
     compaction_reason_ = CompactionReason::kReadTriggered;
     return;
   }
+}
+
+bool LevelCompactionBuilder::GetOutputLevelOverlap(
+    const CompactionInputFiles& inputs, CompactionInputFiles* output) {
+  InternalKey smallest;
+  InternalKey largest;
+  compaction_picker_->GetRange(inputs, &smallest, &largest);
+  output->clear();
+  output->level = output_level_;
+  vstorage_->GetOverlappingInputs(output_level_, &smallest, &largest,
+                                  &output->files);
+  return output->empty() || compaction_picker_->ExpandInputsToCleanCut(
+                                cf_name_, vstorage_, output);
+}
+
+bool LevelCompactionBuilder::PickTombstoneDeadlineCompaction() {
+  for (const auto& level_file : vstorage_->TombstoneDeadlineFiles()) {
+    const int level = level_file.first;
+    FileMetaData* f = level_file.second;
+    if (f->being_compacted) {
+      continue;
+    }
+    if (level == 0 &&
+        !compaction_picker_->level0_compactions_in_progress()->empty()) {
+      continue;
+    }
+    start_level_ = level;
+    output_level_ = (level == 0) ? vstorage_->base_level() : level + 1;
+    start_level_inputs_.clear();
+    start_level_inputs_.level = level;
+    start_level_inputs_.files = {f};
+    CompactionInputFiles output_level_inputs;
+    if (!compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
+                                                    &start_level_inputs_) ||
+        compaction_picker_->FilesRangeOverlapWithCompaction(
+            {start_level_inputs_}, output_level_,
+            Compaction::EvaluateProximalLevel(vstorage_, mutable_cf_options_,
+                                              ioptions_, start_level_,
+                                              output_level_)) ||
+        (level > 0 &&
+         !GetOutputLevelOverlap(start_level_inputs_, &output_level_inputs))) {
+      start_level_inputs_.clear();
+      continue;
+    }
+    size_t coalesced = CoalesceNearDeadlineFiles();
+    TEST_SYNC_POINT_CALLBACK(
+        "LevelCompactionBuilder::PickTombstoneDeadlineCompaction:Coalesced",
+        &coalesced);
+    ROCKS_LOG_BUFFER(
+        log_buffer_,
+        "[%s] Tombstone deadline compaction from L%d: %" ROCKSDB_PRIszt
+        " input files (%" ROCKSDB_PRIszt " coalesced)",
+        cf_name_.c_str(), start_level_, start_level_inputs_.size(), coalesced);
+    compaction_reason_ = CompactionReason::kTombstoneDeadline;
+    return true;
+  }
+  start_level_inputs_.clear();
+  return false;
+}
+
+size_t LevelCompactionBuilder::CoalesceNearDeadlineFiles() {
+  const uint64_t window =
+      mutable_cf_options_.deadline_coalescing_window_seconds;
+  if (window == 0 || mutable_cf_options_.tombstone_deadline_seconds == 0 ||
+      start_level_ <= 0 || output_level_ <= start_level_ ||
+      start_level_inputs_.empty() || ioptions_.compaction_pri == kRoundRobin) {
+    return 0;
+  }
+  // A start level input with no overlap in the output level becomes a cheap
+  // trivial move; widening it would turn it into a real rewrite.
+  CompactionInputFiles output_level_inputs;
+  if (!GetOutputLevelOverlap(start_level_inputs_, &output_level_inputs) ||
+      output_level_inputs.empty()) {
+    return 0;
+  }
+
+  const uint64_t horizon = vstorage_->TombstoneDeadlineEvalTime() + window;
+  const std::vector<FileMetaData*>& level_files =
+      vstorage_->LevelFiles(start_level_);
+  const int proximal_level = Compaction::EvaluateProximalLevel(
+      vstorage_, mutable_cf_options_, ioptions_, start_level_, output_level_);
+
+  auto near_deadline = [&](FileMetaData* f) {
+    if (f->being_compacted) {
+      return false;
+    }
+    const uint64_t due = vstorage_->TombstoneDeadlineDueTime(start_level_, f);
+    return due != 0 && due <= horizon;
+  };
+  auto index_of = [&](const FileMetaData* f) {
+    for (size_t i = 0; i < level_files.size(); i++) {
+      if (level_files[i] == f) {
+        return i;
+      }
+    }
+    assert(false);
+    return level_files.size();
+  };
+  // Tries to add level_files[idx] to the inputs. Returns true on success.
+  auto try_add = [&](size_t idx, bool at_back) {
+    CompactionInputFiles candidate = start_level_inputs_;
+    if (at_back) {
+      candidate.files.push_back(level_files[idx]);
+    } else {
+      candidate.files.insert(candidate.files.begin(), level_files[idx]);
+    }
+    CompactionInputFiles candidate_output;
+    if (!compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
+                                                    &candidate) ||
+        compaction_picker_->FilesRangeOverlapWithCompaction(
+            {candidate}, output_level_, proximal_level) ||
+        !GetOutputLevelOverlap(candidate, &candidate_output)) {
+      return false;
+    }
+    uint64_t total_bytes = 0;
+    for (const FileMetaData* file : candidate.files) {
+      total_bytes += file->fd.GetFileSize();
+    }
+    for (const FileMetaData* file : candidate_output.files) {
+      total_bytes += file->fd.GetFileSize();
+    }
+    if (total_bytes > mutable_cf_options_.max_compaction_bytes) {
+      return false;
+    }
+    start_level_inputs_ = std::move(candidate);
+    return true;
+  };
+
+  const size_t initial_size = start_level_inputs_.size();
+  // Grow right, then left, one contiguous near-deadline file at a time.
+  for (size_t next = index_of(start_level_inputs_.files.back()) + 1;
+       next < level_files.size() && near_deadline(level_files[next]) &&
+       try_add(next, /*at_back=*/true);
+       next = index_of(start_level_inputs_.files.back()) + 1) {
+  }
+  for (size_t first = index_of(start_level_inputs_.files.front());
+       first > 0 && near_deadline(level_files[first - 1]) &&
+       try_add(first - 1, /*at_back=*/false);
+       first = index_of(start_level_inputs_.files.front())) {
+  }
+  return start_level_inputs_.size() - initial_size;
 }
 
 bool LevelCompactionBuilder::SetupOtherL0FilesIfNeeded() {

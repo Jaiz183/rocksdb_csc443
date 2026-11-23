@@ -760,6 +760,8 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "ttl=60;"
       "periodic_compaction_seconds=3600;"
       "read_triggered_compaction_threshold=0.5;"
+      "tombstone_deadline_seconds=600;"
+      "deadline_coalescing_window_seconds=60;"
       "sample_for_compression=0;"
       "enable_blob_files=true;"
       "enable_blob_direct_write=true;"

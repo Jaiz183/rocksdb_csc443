@@ -1507,6 +1507,16 @@ static uint64_t GetMinTimeBasedCompactionInterval(
   if (cf_opts.ttl > 0) {
     min_interval = std::min(min_interval, cf_opts.ttl);
   }
+  if (cf_opts.tombstone_deadline_seconds > 0 &&
+      cf_opts.compaction_style == kCompactionStyleLevel) {
+    // The smallest per-level tombstone deadline is at least
+    // tombstone_deadline_seconds / num_levels.
+    const uint64_t num_levels =
+        static_cast<uint64_t>(std::max(cf_opts.num_levels, 1));
+    min_interval = std::min(
+        min_interval,
+        std::max<uint64_t>(1, cf_opts.tombstone_deadline_seconds / num_levels));
+  }
   const auto& fifo_thresholds =
       cf_opts.compaction_options_fifo.file_temperature_age_thresholds;
   if (!fifo_thresholds.empty() && fifo_thresholds[0].age > 0) {

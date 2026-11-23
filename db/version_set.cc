@@ -3971,6 +3971,7 @@ void VersionStorageInfo::ComputeCompactionScore(
           immutable_options.allow_ingest_behind,
       immutable_options.user_comparator, full_history_ts_low);
   ComputeExpiredTtlFiles(immutable_options, mutable_cf_options.ttl);
+  ComputeTombstoneDeadlineFiles(immutable_options, mutable_cf_options);
   ComputeFilesMarkedForPeriodicCompaction(
       immutable_options, mutable_cf_options.periodic_compaction_seconds,
       max_output_level);
@@ -3988,7 +3989,8 @@ void VersionStorageInfo::ComputeCompactionScore(
 void VersionStorageInfo::RemoveFilesBeingCompactedFromCompactionCandidates() {
   for (auto* candidates :
        {&files_marked_for_compaction_, &bottommost_files_marked_for_compaction_,
-        &expired_ttl_files_, &files_marked_for_periodic_compaction_,
+        &expired_ttl_files_, &tombstone_deadline_files_,
+        &files_marked_for_periodic_compaction_,
         &files_marked_for_forced_blob_gc_, &read_triggered_compaction_files_}) {
     const size_t remaining =
         std::remove_if(candidates->begin(), candidates->end(),
@@ -4061,6 +4063,80 @@ void VersionStorageInfo::ComputeExpiredTtlFiles(
         }
       }
     }
+  }
+}
+
+void VersionStorageInfo::ComputeTombstoneDeadlineFiles(
+    const ImmutableOptions& ioptions,
+    const MutableCFOptions& mutable_cf_options) {
+  tombstone_deadline_files_.clear();
+  tombstone_level_deadline_.clear();
+  const uint64_t deadline = mutable_cf_options.tombstone_deadline_seconds;
+  if (deadline == 0 ||
+      compaction_style_ != CompactionStyle::kCompactionStyleLevel) {
+    return;
+  }
+
+  int64_t temp_current_time;
+  if (!ioptions.clock->GetCurrentTime(&temp_current_time).ok()) {
+    return;
+  }
+  const uint64_t current_time = static_cast<uint64_t>(temp_current_time);
+  tombstone_deadline_eval_time_ = current_time;
+
+  // Tombstones are only dropped once they reach the last non-empty level, so
+  // that level has no deadline.
+  int last_level = 0;
+  for (int level = num_levels() - 1; level >= 1; level--) {
+    if (!files_[level].empty()) {
+      last_level = level;
+      break;
+    }
+  }
+  if (last_level == 0) {
+    return;
+  }
+
+  // Levels that can hold tombstones on their way down: L0 plus
+  // [base_level, last_level). Split the budget evenly across them; the
+  // deadline of a level is cumulative, since a file's oldest ancestor time
+  // also covers the time its data spent on the levels above.
+  const int first_non_l0 = std::min(std::max(base_level_, 1), last_level);
+  const uint64_t num_deadline_levels =
+      1 + static_cast<uint64_t>(last_level - first_non_l0);
+  tombstone_level_deadline_.assign(num_levels(), 0);
+  tombstone_level_deadline_[0] =
+      std::max<uint64_t>(1, deadline / num_deadline_levels);
+  for (int level = first_non_l0; level < last_level; level++) {
+    const uint64_t idx = 1 + static_cast<uint64_t>(level - first_non_l0);
+    tombstone_level_deadline_[level] =
+        std::max<uint64_t>(1, deadline * (idx + 1) / num_deadline_levels);
+  }
+
+  autovector<std::pair<uint64_t, std::pair<int, FileMetaData*>>> expired;
+  for (int level = 0; level < last_level; level++) {
+    if (tombstone_level_deadline_[level] == 0) {
+      continue;
+    }
+    for (FileMetaData* f : files_[level]) {
+      if (f->being_compacted) {
+        continue;
+      }
+      const uint64_t due = TombstoneDeadlineDueTime(level, f);
+      if (due != 0 && due <= current_time) {
+        expired.emplace_back(due, std::make_pair(level, f));
+      }
+    }
+  }
+  // Most overdue first; ties broken by level so upper levels drain first.
+  std::sort(expired.begin(), expired.end(), [](const auto& a, const auto& b) {
+    if (a.first != b.first) {
+      return a.first < b.first;
+    }
+    return a.second.first < b.second.first;
+  });
+  for (const auto& e : expired) {
+    tombstone_deadline_files_.push_back(e.second);
   }
 }
 

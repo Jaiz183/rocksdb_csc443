@@ -238,6 +238,13 @@ class VersionStorageInfo {
   void ComputeExpiredTtlFiles(const ImmutableOptions& ioptions,
                               const uint64_t ttl);
 
+  // This computes tombstone_deadline_files_ (files holding deletions that
+  // passed their per-level tombstone deadline) and the per-level cumulative
+  // deadlines. Called by ComputeCompactionScore().
+  void ComputeTombstoneDeadlineFiles(
+      const ImmutableOptions& ioptions,
+      const MutableCFOptions& mutable_cf_options);
+
   // This computes files_marked_for_periodic_compaction_ and is called by
   // ComputeCompactionScore()
   void ComputeFilesMarkedForPeriodicCompaction(
@@ -630,6 +637,39 @@ class VersionStorageInfo {
     return expired_ttl_files_;
   }
 
+  // Files holding deletions whose tombstone deadline has passed, most overdue
+  // first. See AdvancedColumnFamilyOptions::tombstone_deadline_seconds.
+  // REQUIRES: ComputeCompactionScore has been called
+  // REQUIRES: DB mutex held during access
+  // Used by Leveled Compaction only.
+  const autovector<std::pair<int, FileMetaData*>>& TombstoneDeadlineFiles()
+      const {
+    assert(finalized_);
+    return tombstone_deadline_files_;
+  }
+
+  // The time at which a file on `level` reaches its tombstone deadline, or 0
+  // if the file has no deadline (no deletions, last level, feature off, or
+  // unknown ancestor time). Uses the deadlines from the last
+  // ComputeCompactionScore().
+  uint64_t TombstoneDeadlineDueTime(int level, FileMetaData* f) const {
+    if (level < 0 ||
+        static_cast<size_t>(level) >= tombstone_level_deadline_.size() ||
+        tombstone_level_deadline_[level] == 0 || f->num_deletions == 0) {
+      return 0;
+    }
+    const uint64_t oldest_ancestor_time = f->TryGetOldestAncestorTime();
+    if (oldest_ancestor_time == kUnknownOldestAncestorTime) {
+      return 0;
+    }
+    return oldest_ancestor_time + tombstone_level_deadline_[level];
+  }
+
+  // Clock reading used by the last ComputeTombstoneDeadlineFiles().
+  uint64_t TombstoneDeadlineEvalTime() const {
+    return tombstone_deadline_eval_time_;
+  }
+
   // REQUIRES: ComputeCompactionScore has been called
   // REQUIRES: DB mutex held during access
   // Used by Leveled and Universal Compaction.
@@ -877,6 +917,13 @@ class VersionStorageInfo {
   autovector<std::pair<int, FileMetaData*>> files_marked_for_compaction_;
 
   autovector<std::pair<int, FileMetaData*>> expired_ttl_files_;
+
+  // Files past their tombstone deadline, most overdue first.
+  autovector<std::pair<int, FileMetaData*>> tombstone_deadline_files_;
+  // Cumulative tombstone deadline (seconds since oldest ancestor time) per
+  // level; 0 means no deadline on that level. Empty when the feature is off.
+  std::vector<uint64_t> tombstone_level_deadline_;
+  uint64_t tombstone_deadline_eval_time_ = 0;
 
   autovector<std::pair<int, FileMetaData*>>
       files_marked_for_periodic_compaction_;

@@ -1,0 +1,1 @@
+Added leveled-compaction options `tombstone_deadline_seconds` (push files holding deletions to the last level within a time budget, new `CompactionReason::kTombstoneDeadline`) and `deadline_coalescing_window_seconds` (batch files whose deadlines are close into one compaction).

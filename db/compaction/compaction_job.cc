@@ -170,6 +170,8 @@ const char* GetCompactionReasonString(CompactionReason compaction_reason) {
       return "RefitLevel";
     case CompactionReason::kReadTriggered:
       return "ReadTriggered";
+    case CompactionReason::kTombstoneDeadline:
+      return "TombstoneDeadline";
     case CompactionReason::kNumOfReasons:
       // fall through
     default:

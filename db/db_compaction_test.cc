@@ -6033,6 +6033,270 @@ TEST_F(DBCompactionTest, LevelTtlCascadingCompactions) {
   }
 }
 
+// Fixture for tombstone deadline / deadline coalescing tests. Uses a 3-level
+// tree (L0, L1, L2) so L1 has cumulative deadline tombstone_deadline_seconds.
+class DBTombstoneDeadlineTest : public DBCompactionTest {
+ public:
+  static constexpr int kFiles = 4;
+  static constexpr int kKeysPerFile = 100;
+  static constexpr uint64_t kGapSeconds = 100;
+  static constexpr uint64_t kDeadline = 1000;
+
+  Options DeadlineOptions() {
+    Options options = CurrentOptions();
+    options.env = env_;
+    options.compression = kNoCompression;
+    options.num_levels = 3;
+    options.level_compaction_dynamic_level_bytes = false;
+    options.disable_auto_compactions = true;
+    options.level0_file_num_compaction_trigger = 100;
+    options.level0_slowdown_writes_trigger = 200;
+    options.level0_stop_writes_trigger = 300;
+    options.max_bytes_for_level_base = 1 << 30;
+    // No other time-based compaction, so idle-DB tests depend only on the
+    // tombstone deadline waking up the periodic trigger.
+    options.ttl = 0;
+    options.periodic_compaction_seconds = 0;
+    return options;
+  }
+
+  // Each tombstone deadline compaction is counted, and its output level must
+  // be the next level.
+  void CountDeadlineCompactions() {
+    deadline_compactions_ = 0;
+    coalesced_files_ = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+          Compaction* c = static_cast<Compaction*>(arg);
+          if (c->compaction_reason() == CompactionReason::kTombstoneDeadline) {
+            deadline_compactions_++;
+            EXPECT_EQ(c->output_level(),
+                      c->start_level() == 0 ? 1 : c->start_level() + 1);
+          }
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "LevelCompactionBuilder::PickTombstoneDeadlineCompaction:Coalesced",
+        [&](void* arg) { coalesced_files_ += *static_cast<size_t*>(arg); });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+
+  std::string KeyOf(int file, int k) { return Key(file * kKeysPerFile + k); }
+
+  // L2: kFiles files over [100 i, 100 i + 99] holding values.
+  // L1: kFiles files over the same ranges; file i rewrites the lower half of
+  // its range and deletes the upper half, and is created kGapSeconds after
+  // L1 file i - 1. Sets *first_l1_time to the creation time of L1 file 0.
+  void BuildTree(uint64_t* first_l1_time) {
+    Random rnd(301);
+    for (int f = 0; f < kFiles; f++) {
+      for (int k = 0; k < kKeysPerFile; k++) {
+        ASSERT_OK(Put(KeyOf(f, k), rnd.RandomString(100)));
+      }
+      ASSERT_OK(Flush());
+      MoveFilesToLevel(2);
+    }
+    for (int f = 0; f < kFiles; f++) {
+      env_->MockSleepForSeconds(kGapSeconds);
+      for (int k = 0; k < kKeysPerFile / 2; k++) {
+        ASSERT_OK(Put(KeyOf(f, k), "new"));
+      }
+      for (int k = kKeysPerFile / 2; k < kKeysPerFile; k++) {
+        ASSERT_OK(Delete(KeyOf(f, k)));
+      }
+      ASSERT_OK(Flush());
+      MoveFilesToLevel(1);
+    }
+    ASSERT_EQ("0,4,4", FilesPerLevel());
+    std::vector<std::vector<FileMetaData>> files;
+    dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(), &files);
+    *first_l1_time = files[1][0].oldest_ancestor_time;
+    for (const FileMetaData& f : files[1]) {
+      ASSERT_GT(f.num_deletions, 0);
+      *first_l1_time = std::min(*first_l1_time, f.oldest_ancestor_time);
+    }
+  }
+
+  void VerifyData() {
+    for (int f = 0; f < kFiles; f++) {
+      for (int k = 0; k < kKeysPerFile / 2; k++) {
+        ASSERT_EQ("new", Get(KeyOf(f, k)));
+      }
+      for (int k = kKeysPerFile / 2; k < kKeysPerFile; k++) {
+        ASSERT_EQ("NOT_FOUND", Get(KeyOf(f, k)));
+      }
+    }
+  }
+
+  uint64_t DeletionsAtLevel(int level) {
+    std::vector<std::vector<FileMetaData>> files;
+    dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(), &files);
+    uint64_t total = 0;
+    for (const FileMetaData& f : files[level]) {
+      total += f.num_deletions;
+    }
+    return total;
+  }
+
+  int deadline_compactions_ = 0;
+  size_t coalesced_files_ = 0;
+};
+
+TEST_F(DBTombstoneDeadlineTest, ExpiredFilesAndCoalescingWindow) {
+  env_->SetMockSleep();
+  struct Case {
+    uint64_t deadline;
+    uint64_t window;
+    // If true, advance time until all four L1 files are past the deadline;
+    // otherwise only L1 file 0 is.
+    bool all_expired;
+    int expected_compactions;
+    size_t expected_coalesced;
+    const char* expected_files_per_level;
+  };
+  // L1 files reach their deadline 100 s apart. A window of 150 s pulls in the
+  // next file only; 1000 s pulls in all of them. With every file expired,
+  // coalescing turns four compactions into one. A coalesced compaction merges
+  // its L2 overlap into a single output file (target file size is large).
+  const Case kCases[] = {
+      {0, 0, false, 0, 0, "0,4,4"},
+      {kDeadline, 0, false, 1, 0, "0,3,4"},
+      {kDeadline, 150, false, 1, 1, "0,2,3"},
+      {kDeadline, 1000, false, 1, 3, "0,0,1"},
+      {kDeadline, 0, true, 4, 0, "0,0,4"},
+      {kDeadline, 1, true, 1, 3, "0,0,1"},
+  };
+  for (const Case& tc : kCases) {
+    SCOPED_TRACE("deadline=" + std::to_string(tc.deadline) +
+                 " window=" + std::to_string(tc.window) +
+                 " all_expired=" + std::to_string(tc.all_expired));
+    DestroyAndReopen(DeadlineOptions());
+    uint64_t first_l1_time = 0;
+    BuildTree(&first_l1_time);
+    if (HasFatalFailure()) {
+      return;
+    }
+    // L1 file i is due at first_l1_time + i * kGapSeconds + kDeadline.
+    const uint64_t target =
+        first_l1_time + kDeadline + 1 + (tc.all_expired ? 3 * kGapSeconds : 0);
+    const uint64_t now = env_->NowMicros() / 1000000;
+    ASSERT_LT(now, target);
+    env_->MockSleepForSeconds(static_cast<int>(target - now));
+
+    CountDeadlineCompactions();
+    ASSERT_OK(dbfull()->SetOptions(
+        {{"tombstone_deadline_seconds", std::to_string(tc.deadline)},
+         {"deadline_coalescing_window_seconds", std::to_string(tc.window)},
+         {"disable_auto_compactions", "false"}}));
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+    ASSERT_EQ(tc.expected_compactions, deadline_compactions_);
+    ASSERT_EQ(tc.expected_coalesced, coalesced_files_);
+    ASSERT_EQ(tc.expected_files_per_level, FilesPerLevel());
+    if (tc.deadline > 0) {
+      // Tombstones that reached the last level were dropped.
+      ASSERT_EQ(0, DeletionsAtLevel(2));
+    }
+    VerifyData();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+}
+
+TEST_F(DBTombstoneDeadlineTest, SizeCompactionAbsorbsNearDeadlineFiles) {
+  env_->SetMockSleep();
+  for (uint64_t window : {uint64_t{0}, uint64_t{1000}}) {
+    SCOPED_TRACE("window=" + std::to_string(window));
+    Options options = DeadlineOptions();
+    // L1 must be over its target so a size compaction picks one L1 file.
+    options.max_bytes_for_level_base = 1;
+    options.max_compaction_bytes = 1 << 30;
+    DestroyAndReopen(options);
+    uint64_t first_l1_time = 0;
+    BuildTree(&first_l1_time);
+    if (HasFatalFailure()) {
+      return;
+    }
+    // No file is past its deadline, but all are within 1000 s of it.
+    ASSERT_OK(dbfull()->SetOptions(
+        {{"tombstone_deadline_seconds", std::to_string(kDeadline)},
+         {"deadline_coalescing_window_seconds", std::to_string(window)}}));
+    int size_compactions = 0;
+    size_t max_l1_inputs = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+          Compaction* c = static_cast<Compaction*>(arg);
+          EXPECT_EQ(CompactionReason::kLevelMaxLevelSize,
+                    c->compaction_reason());
+          if (c->start_level() == 1) {
+            size_compactions++;
+            max_l1_inputs = std::max(max_l1_inputs, c->num_input_files(0));
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    ASSERT_OK(dbfull()->SetOptions({{"disable_auto_compactions", "false"}}));
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    // With max_bytes_for_level_base = 1, all of L1 is eventually compacted.
+    ASSERT_EQ(window == 0 ? "0,0,4" : "0,0,1", FilesPerLevel());
+    if (window == 0) {
+      ASSERT_EQ(4, size_compactions);
+      ASSERT_EQ(1, max_l1_inputs);
+    } else {
+      ASSERT_EQ(1, size_compactions);
+      ASSERT_EQ(4, max_l1_inputs);
+    }
+    VerifyData();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+}
+
+TEST_F(DBTombstoneDeadlineTest, CascadesFromL0OnIdleDB) {
+  env_->SetMockSleep();
+  Options options = DeadlineOptions();
+  options.tombstone_deadline_seconds = 100;
+  options.disable_auto_compactions = false;
+  DestroyAndReopen(options);
+  Random rnd(301);
+  for (int k = 0; k < kKeysPerFile; k++) {
+    ASSERT_OK(Put(KeyOf(0, k), rnd.RandomString(100)));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  for (int k = 0; k < kKeysPerFile / 2; k++) {
+    ASSERT_OK(Put(KeyOf(0, k), "new"));
+  }
+  for (int k = kKeysPerFile / 2; k < kKeysPerFile; k++) {
+    ASSERT_OK(Delete(KeyOf(0, k)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ("1,0,1", FilesPerLevel());
+
+  CountDeadlineCompactions();
+  // L0 deadline is 100 / 2 = 50 s; L1 cumulative deadline is 100 s. No writes
+  // happen, so only the periodic trigger can notice the deadlines.
+  env_->MockSleepForSeconds(51);
+  dbfull()->TriggerPeriodicCompaction();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(1, deadline_compactions_);
+  ASSERT_EQ("0,1,1", FilesPerLevel());
+
+  env_->MockSleepForSeconds(50);
+  dbfull()->TriggerPeriodicCompaction();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(2, deadline_compactions_);
+  ASSERT_EQ("0,0,1", FilesPerLevel());
+  ASSERT_EQ(0, DeletionsAtLevel(2));
+  for (int k = 0; k < kKeysPerFile / 2; k++) {
+    ASSERT_EQ("new", Get(KeyOf(0, k)));
+  }
+  for (int k = kKeysPerFile / 2; k < kKeysPerFile; k++) {
+    ASSERT_EQ("NOT_FOUND", Get(KeyOf(0, k)));
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
 TEST_F(DBCompactionTest, LevelPeriodicCompaction) {
   env_->SetMockSleep();
   const int kNumKeysPerFile = 32;
