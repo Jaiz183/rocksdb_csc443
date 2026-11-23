@@ -1,0 +1,14 @@
+skip-level-tombstone-draft unit tests, Debug build (cmake, WITH_TESTS=ON,
+compression libs OFF), macOS / Apple clang, 2026-11-23.
+
+compaction_picker_test --gtest_filter='SkipLevelPickerTest.*'  -> [  PASSED  ] 12 tests.
+compaction_picker_test (all)                                   -> [  PASSED  ] 173 tests.
+db_skip_level_compaction_test (all)                            -> [  PASSED  ] 7 tests.
+db_compaction_test --gtest_filter='*Ttl*:*Periodic*:*Bottommost*:*ManualCompaction*:*Trivial*:*CompactFiles*'
+                                                               -> [  PASSED  ] 82 tests.
+options_settable_test -> runs 0 tests here (its body is compiled only on Linux + GCC).
+
+Guard check: with conflicts_with_running() disabled in
+TrySetupSkipLevelCompaction(), SkipLevelPickerTest.RunningCompactionIntoIntermediateLevelBlocksSkip
+fails (picks output L3 instead of L2). The guard was restored afterwards.
+db_compaction_test (all)                                       -> [  PASSED  ] 384 tests (151 s).

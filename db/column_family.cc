@@ -1653,6 +1653,22 @@ Status ColumnFamilyData::ValidateOptions(
         "Use 0.0 to disable.");
   }
 
+  if (cf_options.skip_level_tombstone_compaction > 2) {
+    return Status::InvalidArgument(
+        "skip_level_tombstone_compaction must be 0 (off), 1 (always) or 2 "
+        "(cost-based).");
+  }
+  if (!(cf_options.skip_level_tombstone_density_threshold > 0.0 &&
+        cf_options.skip_level_tombstone_density_threshold <= 1.0)) {
+    return Status::InvalidArgument(
+        "skip_level_tombstone_density_threshold must be in (0, 1].");
+  }
+  if (!(cf_options.skip_level_max_overlap_ratio >= 1.0) ||
+      std::isinf(cf_options.skip_level_max_overlap_ratio)) {
+    return Status::InvalidArgument(
+        "skip_level_max_overlap_ratio must be finite and >= 1.");
+  }
+
   if (cf_options.compaction_style == kCompactionStyleFIFO &&
       db_options.max_open_files != -1 && cf_options.ttl > 0) {
     return Status::NotSupported(

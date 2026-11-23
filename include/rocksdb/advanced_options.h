@@ -1002,6 +1002,47 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   double read_triggered_compaction_threshold = 0.0;
 
+  // [CSC443 draft] Skip-level tombstone compaction (leveled compaction only).
+  //
+  // A "tombstone-dense" file is a file above the last non-empty level whose
+  // num_deletions / num_entries (num_deletions includes range deletions) is
+  // at least `skip_level_tombstone_density_threshold`. Instead of pushing such
+  // a file down one level at a time (L -> L+1 -> ... -> Lmax, rewriting the
+  // tombstones at every hop), a single multi-level compaction takes the file
+  // plus every overlapping file in the intermediate levels and writes the
+  // result straight into a deeper level. When that level is the bottommost
+  // one, the tombstones (and the data they shadow) are dropped right away.
+  //
+  // Modes:
+  //   0 = off (default): no change from stock RocksDB.
+  //   1 = always: target the deepest feasible level (the last non-empty level
+  //       when possible, limited by `max_compaction_bytes` and by files that
+  //       are already being compacted).
+  //   2 = cost-based: for every feasible target t, estimate
+  //       benefit(t) = (t - start_level) * start_bytes / total_input_bytes(t)
+  //       (levels descended per byte rewritten) and pick the best t, subject
+  //       to total_input_bytes(t) / start_bytes <=
+  //       `skip_level_max_overlap_ratio`. Ties go to the deeper level.
+  //
+  // When enabled, tombstone-dense files also become a compaction trigger
+  // (CompactionReason::kSkipLevelTombstone) that runs after size-based
+  // compaction, and size-triggered compactions whose start-level inputs are
+  // tombstone-dense are extended to skip levels the same way.
+  //
+  // Dynamically changeable through SetOptions() API
+  uint32_t skip_level_tombstone_compaction = 0;
+
+  // See `skip_level_tombstone_compaction`. Valid range: (0, 1].
+  //
+  // Dynamically changeable through SetOptions() API
+  double skip_level_tombstone_density_threshold = 0.5;
+
+  // See `skip_level_tombstone_compaction` (cost-based mode only). Must be
+  // >= 1.
+  //
+  // Dynamically changeable through SetOptions() API
+  double skip_level_max_overlap_ratio = 10.0;
+
   // If this option is set then 1 in N blocks are compressed
   // using a fast (lz4) and slow (zstd) compression algorithm.
   // The compressibility is reported as stats and the stored

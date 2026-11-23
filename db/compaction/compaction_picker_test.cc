@@ -6403,6 +6403,220 @@ TEST_F(FIFORatioBasedCompactionPickingTest, GraduatedFilesNotRecompacted) {
   AssertGraduatedNotPicked(s.files, 4, kCap);
 }
 
+// ---- Skip-level tombstone compaction (CSC443 draft) ----
+
+class SkipLevelPickerTest : public CompactionPickerTest {
+ public:
+  void SetDense(uint32_t file_number) {
+    FileMetaData* f = file_map_.at(file_number).first;
+    f->num_entries = 100;
+    f->num_deletions = 80;
+  }
+  void SetMode(uint32_t mode, double max_ratio = 10.0) {
+    mutable_cf_options_.skip_level_tombstone_compaction = mode;
+    mutable_cf_options_.skip_level_max_overlap_ratio = max_ratio;
+    mutable_cf_options_.max_compaction_bytes = 1ULL << 40;
+  }
+  std::unique_ptr<Compaction> Pick() {
+    return std::unique_ptr<Compaction>(level_compaction_picker.PickCompaction(
+        cf_name_, mutable_cf_options_, mutable_db_options_,
+        /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr,
+        vstorage_.get(), &log_buffer_, /*full_history_ts_low=*/""));
+  }
+};
+
+TEST_F(SkipLevelPickerTest, AlwaysSkipsToLastLevel) {
+  SetMode(1);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 1000U);
+  Add(2, 2U, "100", "200", 1000U);
+  Add(3, 3U, "050", "400", 1000U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+  ASSERT_EQ(1U, vstorage_->TombstoneDenseFiles().size());
+  ASSERT_TRUE(level_compaction_picker.NeedsCompaction(vstorage_.get()));
+
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
+  ASSERT_EQ(1, c->start_level());
+  ASSERT_EQ(3, c->output_level());
+  ASSERT_EQ(3U, c->num_input_levels());
+  ASSERT_EQ(1U, c->input(0, 0)->fd.GetNumber());
+  ASSERT_EQ(2U, c->input(1, 0)->fd.GetNumber());
+  ASSERT_EQ(3U, c->input(2, 0)->fd.GetNumber());
+  ASSERT_TRUE(c->bottommost_level());
+  ASSERT_FALSE(c->IsTrivialMove());
+}
+
+TEST_F(SkipLevelPickerTest, OffDoesNothing) {
+  SetMode(0);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 1000U);
+  Add(3, 3U, "050", "400", 1000U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+  ASSERT_TRUE(vstorage_->TombstoneDenseFiles().empty());
+  ASSERT_FALSE(level_compaction_picker.NeedsCompaction(vstorage_.get()));
+  ASSERT_EQ(Pick(), nullptr);
+}
+
+TEST_F(SkipLevelPickerTest, LastLevelFileIsNotACandidate) {
+  SetMode(1);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(3, 3U, "050", "400", 1000U);
+  SetDense(3U);
+  UpdateVersionStorageInfo();
+  ASSERT_TRUE(vstorage_->TombstoneDenseFiles().empty());
+}
+
+TEST_F(SkipLevelPickerTest, CostBasedPicksDeepWhenOverlapIsSmall) {
+  SetMode(2, /*max_ratio=*/100.0);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 100U);
+  Add(2, 2U, "100", "149", 100U);
+  Add(3, 3U, "100", "149", 100U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+  // score(L2) = 1 / 2, score(L3) = 2 / 3 -> L3
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
+  ASSERT_EQ(3, c->output_level());
+}
+
+TEST_F(SkipLevelPickerTest, CostBasedStopsWhenDeepOverlapIsLarge) {
+  SetMode(2, /*max_ratio=*/100.0);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 100U);
+  Add(2, 2U, "100", "149", 100U);
+  Add(3, 3U, "100", "149", 1000U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+  // score(L2) = 1 / 2, score(L3) = 2 / 12 -> normal one-level compaction.
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
+  ASSERT_EQ(1, c->start_level());
+  ASSERT_EQ(2, c->output_level());
+  ASSERT_EQ(2U, c->num_input_levels());
+}
+
+TEST_F(SkipLevelPickerTest, CostBasedRespectsMaxOverlapRatio) {
+  SetMode(2, /*max_ratio=*/2.5);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 100U);
+  Add(2, 2U, "100", "149", 100U);
+  Add(3, 3U, "100", "149", 100U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+  // L3 would be better (2/3 > 1/2) but its ratio 3 exceeds 2.5.
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(2, c->output_level());
+}
+
+TEST_F(SkipLevelPickerTest, StartsFromL0ThroughBaseLevel) {
+  SetMode(1);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(0, 1U, "100", "149", 100U);
+  Add(1, 2U, "120", "200", 100U);
+  Add(3, 3U, "050", "400", 100U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
+  ASSERT_EQ(0, c->start_level());
+  ASSERT_EQ(3, c->output_level());
+  ASSERT_EQ(3U, c->num_input_levels());
+}
+
+TEST_F(SkipLevelPickerTest, MaxCompactionBytesLimitsDepth) {
+  SetMode(1);
+  mutable_cf_options_.skip_level_tombstone_compaction = 1;
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 100U);
+  Add(2, 2U, "100", "149", 100U);
+  Add(3, 3U, "100", "149", 10000U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+  mutable_cf_options_.max_compaction_bytes = 1000;
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(2, c->output_level());
+}
+
+// A running compaction writing into an intermediate level inside the
+// (expanded) key range must stop the skip at that level: otherwise newer data
+// moved past it would end up below the older data it writes.
+TEST_F(SkipLevelPickerTest, RunningCompactionIntoIntermediateLevelBlocksSkip) {
+  SetMode(0);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 1000U);        // tombstone-dense
+  Add(1, 4U, "300", "349", 1000000000U);  // big, picked first by size
+  Add(2, 5U, "300", "349", 1000U);
+  Add(3, 3U, "050", "400", 1000U);  // expands our range over [300, 349]
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+
+  auto running = Pick();
+  ASSERT_NE(running, nullptr);
+  ASSERT_EQ(1, running->start_level());
+  ASSERT_EQ(2, running->output_level());
+  ASSERT_EQ(4U, running->input(0, 0)->fd.GetNumber());
+
+  SetMode(1);
+  vstorage_->ComputeCompactionScore(ioptions_, mutable_cf_options_, "");
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
+  ASSERT_EQ(1U, c->input(0, 0)->fd.GetNumber());
+  // Could not skip past L2 because `running` outputs into L2 within [050,400].
+  ASSERT_EQ(2, c->output_level());
+}
+
+TEST_F(SkipLevelPickerTest, NoRunningCompactionAllowsSkip) {
+  // Control for the test above.
+  SetMode(1);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 1000U);
+  Add(2, 5U, "300", "349", 1000U);
+  Add(3, 3U, "050", "400", 1000U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(3, c->output_level());
+}
+
+TEST_F(SkipLevelPickerTest, DenseSizeTriggeredPickIsExtended) {
+  SetMode(1);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 1000000000U);  // over the L1 size limit
+  Add(2, 2U, "100", "149", 1000U);
+  Add(3, 3U, "100", "149", 1000U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
+  ASSERT_EQ(3, c->output_level());
+}
+
+TEST_F(SkipLevelPickerTest, SparseSizeTriggeredPickIsUnchanged) {
+  SetMode(1);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 1000000000U);
+  Add(2, 2U, "100", "149", 1000U);
+  Add(3, 3U, "100", "149", 1000U);
+  UpdateVersionStorageInfo();
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(CompactionReason::kLevelMaxLevelSize, c->compaction_reason());
+  ASSERT_EQ(2, c->output_level());
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

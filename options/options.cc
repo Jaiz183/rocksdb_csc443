@@ -93,6 +93,10 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       disallow_memtable_writes(options.disallow_memtable_writes),
       ttl(options.ttl),
       periodic_compaction_seconds(options.periodic_compaction_seconds),
+      skip_level_tombstone_compaction(options.skip_level_tombstone_compaction),
+      skip_level_tombstone_density_threshold(
+          options.skip_level_tombstone_density_threshold),
+      skip_level_max_overlap_ratio(options.skip_level_max_overlap_ratio),
       sample_for_compression(options.sample_for_compression),
       last_level_temperature(options.last_level_temperature),
       default_write_temperature(options.default_write_temperature),
@@ -426,6 +430,14 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log,
                    "         Options.periodic_compaction_seconds: %" PRIu64,
                    periodic_compaction_seconds);
+  ROCKS_LOG_HEADER(log,
+                   "     Options.skip_level_tombstone_compaction: %" PRIu32,
+                   skip_level_tombstone_compaction);
+  ROCKS_LOG_HEADER(log,
+                   "     Options.skip_level_tombstone_density_threshold: %f",
+                   skip_level_tombstone_density_threshold);
+  ROCKS_LOG_HEADER(log, "     Options.skip_level_max_overlap_ratio: %f",
+                   skip_level_max_overlap_ratio);
   const auto& it_temp = temperature_to_string.find(default_temperature);
   std::string str_default_temperature;
   if (it_temp == temperature_to_string.end()) {

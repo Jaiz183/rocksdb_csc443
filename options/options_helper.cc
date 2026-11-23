@@ -376,6 +376,11 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
   cf_opts->periodic_compaction_seconds = moptions.periodic_compaction_seconds;
   cf_opts->read_triggered_compaction_threshold =
       moptions.read_triggered_compaction_threshold;
+  cf_opts->skip_level_tombstone_compaction =
+      moptions.skip_level_tombstone_compaction;
+  cf_opts->skip_level_tombstone_density_threshold =
+      moptions.skip_level_tombstone_density_threshold;
+  cf_opts->skip_level_max_overlap_ratio = moptions.skip_level_max_overlap_ratio;
   cf_opts->preclude_last_level_data_seconds =
       moptions.preclude_last_level_data_seconds;
   cf_opts->preserve_internal_time_seconds =

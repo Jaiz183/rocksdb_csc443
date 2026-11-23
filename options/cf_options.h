@@ -155,6 +155,11 @@ struct MutableCFOptions {
         periodic_compaction_seconds(options.periodic_compaction_seconds),
         read_triggered_compaction_threshold(
             options.read_triggered_compaction_threshold),
+        skip_level_tombstone_compaction(
+            options.skip_level_tombstone_compaction),
+        skip_level_tombstone_density_threshold(
+            options.skip_level_tombstone_density_threshold),
+        skip_level_max_overlap_ratio(options.skip_level_max_overlap_ratio),
         max_bytes_for_level_multiplier_additional(
             options.max_bytes_for_level_multiplier_additional),
         compaction_options_fifo(options.compaction_options_fifo),
@@ -237,6 +242,9 @@ struct MutableCFOptions {
         ttl(0),
         periodic_compaction_seconds(0),
         read_triggered_compaction_threshold(0.0),
+        skip_level_tombstone_compaction(0),
+        skip_level_tombstone_density_threshold(0.5),
+        skip_level_max_overlap_ratio(10.0),
         compaction_options_fifo(),
         preclude_last_level_data_seconds(0),
         preserve_internal_time_seconds(0),
@@ -341,6 +349,9 @@ struct MutableCFOptions {
   uint64_t ttl;
   uint64_t periodic_compaction_seconds;
   double read_triggered_compaction_threshold;
+  uint32_t skip_level_tombstone_compaction;
+  double skip_level_tombstone_density_threshold;
+  double skip_level_max_overlap_ratio;
   std::vector<int> max_bytes_for_level_multiplier_additional;
   CompactionOptionsFIFO compaction_options_fifo;
   CompactionOptionsUniversal compaction_options_universal;

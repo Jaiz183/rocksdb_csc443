@@ -3971,6 +3971,7 @@ void VersionStorageInfo::ComputeCompactionScore(
           immutable_options.allow_ingest_behind,
       immutable_options.user_comparator, full_history_ts_low);
   ComputeExpiredTtlFiles(immutable_options, mutable_cf_options.ttl);
+  ComputeTombstoneDenseFiles(mutable_cf_options);
   ComputeFilesMarkedForPeriodicCompaction(
       immutable_options, mutable_cf_options.periodic_compaction_seconds,
       max_output_level);
@@ -3988,7 +3989,8 @@ void VersionStorageInfo::ComputeCompactionScore(
 void VersionStorageInfo::RemoveFilesBeingCompactedFromCompactionCandidates() {
   for (auto* candidates :
        {&files_marked_for_compaction_, &bottommost_files_marked_for_compaction_,
-        &expired_ttl_files_, &files_marked_for_periodic_compaction_,
+        &expired_ttl_files_, &tombstone_dense_files_,
+        &files_marked_for_periodic_compaction_,
         &files_marked_for_forced_blob_gc_, &read_triggered_compaction_files_}) {
     const size_t remaining =
         std::remove_if(candidates->begin(), candidates->end(),
@@ -4035,6 +4037,44 @@ void VersionStorageInfo::ComputeFilesMarkedForCompaction(int last_level) {
       }
     }
   }
+}
+
+void VersionStorageInfo::ComputeTombstoneDenseFiles(
+    const MutableCFOptions& mutable_cf_options) {
+  tombstone_dense_files_.clear();
+  if (mutable_cf_options.skip_level_tombstone_compaction == 0 ||
+      compaction_style_ != CompactionStyle::kCompactionStyleLevel) {
+    return;
+  }
+  // Only files strictly above the last non-empty level can be pushed down.
+  int last_non_empty = -1;
+  for (int level = num_levels() - 1; level >= 0; level--) {
+    if (!files_[level].empty()) {
+      last_non_empty = level;
+      break;
+    }
+  }
+  const double threshold =
+      mutable_cf_options.skip_level_tombstone_density_threshold;
+  for (int level = 0; level < last_non_empty; level++) {
+    for (FileMetaData* f : files_[level]) {
+      if (!f->being_compacted && f->num_deletions > 0 &&
+          TombstoneDensity(f) >= threshold) {
+        tombstone_dense_files_.emplace_back(level, f);
+      }
+    }
+  }
+  // Densest first; break ties by smaller level (shallower files shadow more).
+  std::sort(tombstone_dense_files_.begin(), tombstone_dense_files_.end(),
+            [](const std::pair<int, FileMetaData*>& a,
+               const std::pair<int, FileMetaData*>& b) {
+              const double da = TombstoneDensity(a.second);
+              const double db = TombstoneDensity(b.second);
+              if (da != db) {
+                return da > db;
+              }
+              return a.first < b.first;
+            });
 }
 
 void VersionStorageInfo::ComputeExpiredTtlFiles(

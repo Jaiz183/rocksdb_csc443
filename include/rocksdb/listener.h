@@ -160,6 +160,9 @@ enum class CompactionReason : int {
   kRefitLevel,
   // Compaction triggered by high read frequency on SST files
   kReadTriggered,
+  // [Level] Multi-level compaction that pushes a tombstone-dense file past one
+  // or more levels in one step (see skip_level_tombstone_compaction).
+  kSkipLevelTombstone,
   // total number of compaction reasons, new reasons must be added above this.
   kNumOfReasons,
 };

@@ -233,6 +233,10 @@ class VersionStorageInfo {
   // ComputeCompactionScore()
   void ComputeFilesMarkedForCompaction(int last_level);
 
+  // This computes tombstone_dense_files_ (skip-level tombstone compaction
+  // candidates) and is called by ComputeCompactionScore()
+  void ComputeTombstoneDenseFiles(const MutableCFOptions& mutable_cf_options);
+
   // This computes ttl_expired_files_ and is called by
   // ComputeCompactionScore()
   void ComputeExpiredTtlFiles(const ImmutableOptions& ioptions,
@@ -625,6 +629,27 @@ class VersionStorageInfo {
   // REQUIRES: ComputeCompactionScore has been called
   // REQUIRES: DB mutex held during access
   // Used by Leveled Compaction only.
+  // Files above the last non-empty level whose tombstone density is at least
+  // skip_level_tombstone_density_threshold, densest first. Empty unless
+  // skip_level_tombstone_compaction != 0.
+  // REQUIRES: ComputeCompactionScore has been called
+  // REQUIRES: DB mutex held during access
+  // Used by Leveled Compaction only.
+  const autovector<std::pair<int, FileMetaData*>>& TombstoneDenseFiles() const {
+    assert(finalized_);
+    return tombstone_dense_files_;
+  }
+
+  // Tombstone density of a file: num_deletions / num_entries (num_deletions
+  // already counts range deletions). 0 if the file has no entries.
+  static double TombstoneDensity(const FileMetaData* f) {
+    if (f->num_entries == 0) {
+      return 0.0;
+    }
+    return static_cast<double>(f->num_deletions) /
+           static_cast<double>(f->num_entries);
+  }
+
   const autovector<std::pair<int, FileMetaData*>>& ExpiredTtlFiles() const {
     assert(finalized_);
     return expired_ttl_files_;
@@ -877,6 +902,8 @@ class VersionStorageInfo {
   autovector<std::pair<int, FileMetaData*>> files_marked_for_compaction_;
 
   autovector<std::pair<int, FileMetaData*>> expired_ttl_files_;
+
+  autovector<std::pair<int, FileMetaData*>> tombstone_dense_files_;
 
   autovector<std::pair<int, FileMetaData*>>
       files_marked_for_periodic_compaction_;
