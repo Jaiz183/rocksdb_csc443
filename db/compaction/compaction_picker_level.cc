@@ -616,8 +616,8 @@ bool LevelCompactionBuilder::PickFadeCompaction() {
   PickFileToCompact(fade_files, CompactToNextLevel::kSkipLastLevel);
   if (!start_level_inputs_.empty()) {
     compaction_reason_ = CompactionReason::kFadeTtl;
-    TEST_SYNC_POINT_CALLBACK("LevelCompactionBuilder::PickFadeCompaction:Picked",
-                             &start_level_);
+    TEST_SYNC_POINT_CALLBACK(
+        "LevelCompactionBuilder::PickFadeCompaction:Picked", &start_level_);
     return true;
   }
   return false;
@@ -637,8 +637,8 @@ bool LevelCompactionBuilder::PickFadeCompactionAtLevel(int level) {
   PickFileToCompact(level_files, CompactToNextLevel::kSkipLastLevel);
   if (!start_level_inputs_.empty()) {
     compaction_reason_ = CompactionReason::kFadeTtl;
-    TEST_SYNC_POINT_CALLBACK("LevelCompactionBuilder::PickFadeCompaction:Picked",
-                             &start_level_);
+    TEST_SYNC_POINT_CALLBACK(
+        "LevelCompactionBuilder::PickFadeCompaction:Picked", &start_level_);
     return true;
   }
   return false;

@@ -51,22 +51,22 @@ namespace {
 struct Config {
   std::string db = "/tmp/fade_bench_db";
   std::string label = "run";
-  std::string out_prefix = "";        // timeseries CSV path prefix ("" = none)
-  std::string summary_csv = "";       // append one summary row here
-  uint64_t keys = 1000000;            // key space size, fully preloaded
+  std::string out_prefix = "";   // timeseries CSV path prefix ("" = none)
+  std::string summary_csv = "";  // append one summary row here
+  uint64_t keys = 1000000;       // key space size, fully preloaded
   int value_size = 112;
-  double put_frac = 0.90;             // remaining ops are deletes ...
-  double range_del_frac = 0.0;        // ... of which this fraction (of ALL
-                                      // ops) are range deletes
-  int range_len = 100;                // keys per range delete
-  double hot_frac = 0.0;              // >0: 80% of ops go to this key prefix
+  double put_frac = 0.90;       // remaining ops are deletes ...
+  double range_del_frac = 0.0;  // ... of which this fraction (of ALL
+                                // ops) are range deletes
+  int range_len = 100;          // keys per range delete
+  double hot_frac = 0.0;        // >0: 80% of ops go to this key prefix
   double write_secs = 60;
   double read_secs = 10;
-  uint64_t rate = 20000;              // target write ops/s, 0 = unpaced
-  uint64_t dth = 0;                   // delete_persistence_threshold (s)
-  uint64_t b_threshold = 0;           // min b_f to trigger FADE compaction
-  bool filter_probe = false;          // probe output-level SST filters
-  bool tombstone_route = false;       // route point tombstones per key
+  uint64_t rate = 20000;         // target write ops/s, 0 = unpaced
+  uint64_t dth = 0;              // delete_persistence_threshold (s)
+  uint64_t b_threshold = 0;      // min b_f to trigger FADE compaction
+  bool filter_probe = false;     // probe output-level SST filters
+  bool tombstone_route = false;  // route point tombstones per key
   bool dynamic_level_bytes = true;
   uint64_t seed = 42;
   uint64_t write_buffer = 2 << 20;
@@ -86,20 +86,34 @@ bool ParseArgs(int argc, char** argv, Config* c) {
       return false;
     }
     std::string k = a.substr(0, eq), v = a.substr(eq + 1);
-    if (k == "db") c->db = v;
-    else if (k == "label") c->label = v;
-    else if (k == "out_prefix") c->out_prefix = v;
-    else if (k == "summary_csv") c->summary_csv = v;
-    else if (k == "keys") c->keys = std::stoull(v);
-    else if (k == "value_size") c->value_size = std::stoi(v);
-    else if (k == "put_frac") c->put_frac = std::stod(v);
-    else if (k == "range_del_frac") c->range_del_frac = std::stod(v);
-    else if (k == "range_len") c->range_len = std::stoi(v);
-    else if (k == "hot_frac") c->hot_frac = std::stod(v);
-    else if (k == "write_secs") c->write_secs = std::stod(v);
-    else if (k == "read_secs") c->read_secs = std::stod(v);
-    else if (k == "rate") c->rate = std::stoull(v);
-    else if (k == "dth") c->dth = std::stoull(v);
+    if (k == "db")
+      c->db = v;
+    else if (k == "label")
+      c->label = v;
+    else if (k == "out_prefix")
+      c->out_prefix = v;
+    else if (k == "summary_csv")
+      c->summary_csv = v;
+    else if (k == "keys")
+      c->keys = std::stoull(v);
+    else if (k == "value_size")
+      c->value_size = std::stoi(v);
+    else if (k == "put_frac")
+      c->put_frac = std::stod(v);
+    else if (k == "range_del_frac")
+      c->range_del_frac = std::stod(v);
+    else if (k == "range_len")
+      c->range_len = std::stoi(v);
+    else if (k == "hot_frac")
+      c->hot_frac = std::stod(v);
+    else if (k == "write_secs")
+      c->write_secs = std::stod(v);
+    else if (k == "read_secs")
+      c->read_secs = std::stod(v);
+    else if (k == "rate")
+      c->rate = std::stoull(v);
+    else if (k == "dth")
+      c->dth = std::stoull(v);
     else if (k == "b_threshold")
       c->b_threshold = std::stoull(v);
     else if (k == "filter_probe")
@@ -108,13 +122,20 @@ bool ParseArgs(int argc, char** argv, Config* c) {
       c->tombstone_route = v == "1" || v == "true";
     else if (k == "dynamic_level_bytes")
       c->dynamic_level_bytes = v == "1" || v == "true";
-    else if (k == "seed") c->seed = std::stoull(v);
-    else if (k == "write_buffer") c->write_buffer = std::stoull(v);
-    else if (k == "level_base") c->level_base = std::stoull(v);
-    else if (k == "target_file") c->target_file = std::stoull(v);
-    else if (k == "ratio") c->ratio = std::stod(v);
-    else if (k == "bg_jobs") c->bg_jobs = std::stoi(v);
-    else if (k == "verify_gets") c->verify_gets = std::stoi(v);
+    else if (k == "seed")
+      c->seed = std::stoull(v);
+    else if (k == "write_buffer")
+      c->write_buffer = std::stoull(v);
+    else if (k == "level_base")
+      c->level_base = std::stoull(v);
+    else if (k == "target_file")
+      c->target_file = std::stoull(v);
+    else if (k == "ratio")
+      c->ratio = std::stod(v);
+    else if (k == "bg_jobs")
+      c->bg_jobs = std::stoi(v);
+    else if (k == "verify_gets")
+      c->verify_gets = std::stoi(v);
     else {
       fprintf(stderr, "unknown arg %s\n", k.c_str());
       return false;
@@ -199,8 +220,7 @@ class SeqTimeMap {
   // whose seqno >= s). Under-estimates age by at most one record interval.
   double TimeOf(SequenceNumber s) {
     std::lock_guard<std::mutex> l(mu_);
-    auto it = std::lower_bound(
-        v_.begin(), v_.end(), std::make_pair(s, -1e300));
+    auto it = std::lower_bound(v_.begin(), v_.end(), std::make_pair(s, -1e300));
     if (it == v_.end()) return v_.empty() ? 0 : v_.back().second;
     return it->second;
   }
@@ -248,16 +268,24 @@ class CompactionCounter : public EventListener {
   }
   static std::string GetReasonName(CompactionReason r) {
     switch (r) {
-      case CompactionReason::kLevelL0FilesNum: return "L0FilesNum";
-      case CompactionReason::kLevelMaxLevelSize: return "LevelMaxSize";
-      case CompactionReason::kBottommostFiles: return "BottommostFiles";
-      case CompactionReason::kTtl: return "Ttl";
-      case CompactionReason::kFilesMarkedForCompaction: return "Marked";
-      case CompactionReason::kManualCompaction: return "Manual";
+      case CompactionReason::kLevelL0FilesNum:
+        return "L0FilesNum";
+      case CompactionReason::kLevelMaxLevelSize:
+        return "LevelMaxSize";
+      case CompactionReason::kBottommostFiles:
+        return "BottommostFiles";
+      case CompactionReason::kTtl:
+        return "Ttl";
+      case CompactionReason::kFilesMarkedForCompaction:
+        return "Marked";
+      case CompactionReason::kManualCompaction:
+        return "Manual";
 #ifndef FADE_BENCH_NO_FADE
-      case CompactionReason::kFadeTtl: return "FadeTtl";
+      case CompactionReason::kFadeTtl:
+        return "FadeTtl";
 #endif
-      default: return "Other" + std::to_string(static_cast<int>(r));
+      default:
+        return "Other" + std::to_string(static_cast<int>(r));
     }
   }
 
@@ -266,7 +294,8 @@ class CompactionCounter : public EventListener {
   std::map<std::string, Entry> by_reason_;
 };
 
-// ---- sampler ------------------------------------------------------------------
+// ---- sampler
+// ------------------------------------------------------------------
 
 struct Sample {
   double t;            // seconds since start of write phase
@@ -312,7 +341,8 @@ TombstoneScan ScanTombstones(DB* db, SeqTimeMap* stm, int num_levels) {
   return r;
 }
 
-// ---- model + verification -----------------------------------------------------
+// ---- model + verification
+// -----------------------------------------------------
 
 // ver[k] == 0 : key absent (deleted), else current version number.
 bool Verify(DB* db, const std::vector<uint32_t>& ver, const Config& c,
@@ -445,7 +475,10 @@ int BenchMain(int argc, char** argv) {
     std::shuffle(order.begin(), order.end(), rng);
     for (uint64_t k : order) {
       s = db->Put(wo, Key(k), Value(k, 1, c.value_size));
-      if (!s.ok()) { fprintf(stderr, "put %s\n", s.ToString().c_str()); return 4; }
+      if (!s.ok()) {
+        fprintf(stderr, "put %s\n", s.ToString().c_str());
+        return 4;
+      }
     }
     db->Flush(FlushOptions());
     db->WaitForCompact(WaitForCompactOptions());
@@ -481,7 +514,8 @@ int BenchMain(int argc, char** argv) {
   uint64_t n_put = 0, n_del = 0, n_rdel = 0, user_bytes = 0;
   std::uniform_real_distribution<double> u01(0, 1);
   std::uniform_int_distribution<uint64_t> ukey(0, c.keys - 1);
-  uint64_t hot_n = std::max<uint64_t>(1, static_cast<uint64_t>(c.keys * c.hot_frac));
+  uint64_t hot_n =
+      std::max<uint64_t>(1, static_cast<uint64_t>(c.keys * c.hot_frac));
   std::uniform_int_distribution<uint64_t> hkey(0, hot_n - 1);
   auto pick_key = [&]() -> uint64_t {
     if (c.hot_frac > 0 && u01(rng) < 0.8) return hkey(rng);
@@ -522,7 +556,10 @@ int BenchMain(int argc, char** argv) {
         s = db->Delete(wo, key);
         n_del++;
       }
-      if (!s.ok()) { fprintf(stderr, "write %s\n", s.ToString().c_str()); return 5; }
+      if (!s.ok()) {
+        fprintf(stderr, "write %s\n", s.ToString().c_str());
+        return 5;
+      }
     }
     stm.Record(db->GetLatestSequenceNumber(), NowSec());
   }
@@ -632,8 +669,11 @@ int BenchMain(int argc, char** argv) {
     }
   }
 
-  double wamp = user_bytes ? static_cast<double>(flush_w + comp_w) / user_bytes : 0;
-  double samp = logical_bytes ? static_cast<double>(final_ts.sst_bytes) / logical_bytes : 0;
+  double wamp =
+      user_bytes ? static_cast<double>(flush_w + comp_w) / user_bytes : 0;
+  double samp = logical_bytes
+                    ? static_cast<double>(final_ts.sst_bytes) / logical_bytes
+                    : 0;
 
   printf("== %s dth=%" PRIu64 " b_threshold=%" PRIu64
          " filter_probe=%d tombstone_route=%d dynamic_level_bytes=%d ==\n",
@@ -643,10 +683,11 @@ int BenchMain(int argc, char** argv) {
          " wall=%.1fs thr=%.0f ops/s cpu=%.1fs (%.2f us/op)\n",
          n_put, n_del, n_rdel, write_wall, ops / write_wall, write_cpu,
          write_cpu * 1e6 / ops);
-  printf("io flush_w=%.1fMB comp_w=%.1fMB comp_r=%.1fMB wal=%.1fMB user=%.1fMB "
-         "WA=%.2f\n",
-         flush_w / 1e6, comp_w / 1e6, comp_r / 1e6, wal_w / 1e6,
-         user_bytes / 1e6, wamp);
+  printf(
+      "io flush_w=%.1fMB comp_w=%.1fMB comp_r=%.1fMB wal=%.1fMB user=%.1fMB "
+      "WA=%.2f\n",
+      flush_w / 1e6, comp_w / 1e6, comp_r / 1e6, wal_w / 1e6, user_bytes / 1e6,
+      wamp);
   printf("compactions %s| fade=%" PRIu64 " fade_w=%.1fMB\n", reasons.c_str(),
          fade_count, fade_wbytes / 1e6);
   printf("fade_output_levels=%s\n", fade_output_levels.c_str());
@@ -656,19 +697,21 @@ int BenchMain(int argc, char** argv) {
                    fade_level_skips_compactions
              : 0.0,
          fade_level_skips_compactions);
-  printf("tombstones max_age(write)=%.1fs max_age(read/idle)=%.1fs "
-         "viol_samples=%" PRIu64 "/%" PRIu64 " avg_live=%.0f max_live=%" PRIu64
-         " final_live=%" PRIu64 "\n",
-         max_age_write, max_age_read, viol_samples, write_samples,
-         write_samples ? sum_live_dels / write_samples : 0.0, max_live_dels,
-         final_ts.live_dels);
+  printf(
+      "tombstones max_age(write)=%.1fs max_age(read/idle)=%.1fs "
+      "viol_samples=%" PRIu64 "/%" PRIu64 " avg_live=%.0f max_live=%" PRIu64
+      " final_live=%" PRIu64 "\n",
+      max_age_write, max_age_read, viol_samples, write_samples,
+      write_samples ? sum_live_dels / write_samples : 0.0, max_live_dels,
+      final_ts.live_dels);
   printf("space sst=%.1fMB logical=%.1fMB SA=%.3f\n", final_ts.sst_bytes / 1e6,
          logical_bytes / 1e6, samp);
-  printf("reads gets=%.0f/s scans=%.0f/s (%.1f keys/scan) cpu=%.1fs "
-         "tomb_skipped=%" PRIu64 " rdel_reseeks=%" PRIu64 "\n",
-         gets / (c.read_secs / 2), scans / (c.read_secs / 2),
-         scans ? static_cast<double>(scan_keys) / scans : 0.0, read_cpu,
-         scan_del_skipped, scan_rdel_skipped);
+  printf(
+      "reads gets=%.0f/s scans=%.0f/s (%.1f keys/scan) cpu=%.1fs "
+      "tomb_skipped=%" PRIu64 " rdel_reseeks=%" PRIu64 "\n",
+      gets / (c.read_secs / 2), scans / (c.read_secs / 2),
+      scans ? static_cast<double>(scan_keys) / scans : 0.0, read_cpu,
+      scan_del_skipped, scan_rdel_skipped);
   printf(
       "read_amp point_get_blocks_touched/get=%.4f "
       "block_reads/get=%.4f block_read_bytes/get=%.1f\n",
@@ -681,8 +724,8 @@ int BenchMain(int argc, char** argv) {
   (void)read_wall;
 
   if (!c.out_prefix.empty()) {
-    std::string path = c.out_prefix + c.label + "_dth" + std::to_string(c.dth) +
-                       "_ts.csv";
+    std::string path =
+        c.out_prefix + c.label + "_dth" + std::to_string(c.dth) + "_ts.csv";
     FILE* f = fopen(path.c_str(), "w");
     if (f) {
       fprintf(f, "t,phase,max_age,live_dels,sst_bytes");

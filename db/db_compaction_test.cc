@@ -14279,7 +14279,7 @@ Options FadeTestOptions(Options options, uint64_t dth, int num_levels) {
   options.delete_persistence_threshold = dth;
   options.num_levels = num_levels;
   options.max_bytes_for_level_multiplier = 10;
-  options.max_bytes_for_level_base = 64 << 20;  // keep size scores < 1
+  options.max_bytes_for_level_base = 64 << 20;           // keep size scores < 1
   options.level_compaction_dynamic_level_bytes = false;  // base_level == 1
   options.level0_file_num_compaction_trigger = 10;
   options.level0_slowdown_writes_trigger = 20;

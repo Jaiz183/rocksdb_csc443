@@ -654,7 +654,8 @@ class VersionStorageInfo {
   // which it must have left `level`). 0 if FADE does not govern this level
   // (disabled, empty intermediate level, or the last non-empty level).
   uint64_t FadeLevelDeadline(int level) const {
-    if (level < 0 || static_cast<size_t>(level) >= fade_level_deadline_.size()) {
+    if (level < 0 ||
+        static_cast<size_t>(level) >= fade_level_deadline_.size()) {
       return 0;
     }
     return fade_level_deadline_[level];

@@ -1104,8 +1104,9 @@ Status FlushJob::WriteLevel0Table() {
       } else {
         meta_.oldest_tombstone_time = kNoTombstoneTime;
       }
-      TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:oldest_tombstone_time",
-                               &meta_.oldest_tombstone_time);
+      TEST_SYNC_POINT_CALLBACK(
+          "FlushJob::WriteLevel0Table:oldest_tombstone_time",
+          &meta_.oldest_tombstone_time);
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
       io_s.PermitUncheckedError();

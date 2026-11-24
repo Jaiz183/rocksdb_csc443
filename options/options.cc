@@ -428,9 +428,9 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    disallow_memtable_writes);
   ROCKS_LOG_HEADER(log, "                              Options.ttl: %" PRIu64,
                    ttl);
-  ROCKS_LOG_HEADER(log,
-                   "             Options.delete_persistence_threshold: %" PRIu64,
-                   delete_persistence_threshold);
+  ROCKS_LOG_HEADER(
+      log, "             Options.delete_persistence_threshold: %" PRIu64,
+      delete_persistence_threshold);
   ROCKS_LOG_HEADER(log, "        Options.fade_b_compaction_threshold: %" PRIu64,
                    fade_b_compaction_threshold);
   ROCKS_LOG_HEADER(log, "             Options.fade_filter_probe_enabled: %d",

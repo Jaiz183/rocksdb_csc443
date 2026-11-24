@@ -1309,8 +1309,7 @@ void MutableCFOptions::Dump(Logger* log) const {
                  max_bytes_for_level_multiplier);
   ROCKS_LOG_INFO(log, "                                      ttl: %" PRIu64,
                  ttl);
-  ROCKS_LOG_INFO(log,
-                 "             delete_persistence_threshold: %" PRIu64,
+  ROCKS_LOG_INFO(log, "             delete_persistence_threshold: %" PRIu64,
                  delete_persistence_threshold);
   ROCKS_LOG_INFO(log, "        fade_b_compaction_threshold: %" PRIu64,
                  fade_b_compaction_threshold);

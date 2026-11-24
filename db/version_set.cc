@@ -4153,8 +4153,7 @@ void VersionStorageInfo::ComputeFadeExpiredFiles(
         continue;
       }
       const uint64_t tombstone_time = f->TryGetOldestTombstoneTime();
-      if (tombstone_time == kNoTombstoneTime ||
-          tombstone_time > current_time) {
+      if (tombstone_time == kNoTombstoneTime || tombstone_time > current_time) {
         continue;
       }
       // a_max = now - tombstone_time
@@ -4171,8 +4170,8 @@ void VersionStorageInfo::ComputeFadeExpiredFiles(
 
   // DD-mode ordering: smallest level first (avoid write stalls), then the
   // file with the oldest tombstone, then the file with the largest b_f.
-  std::vector<std::pair<int, FileMetaData*>> sorted(
-      fade_expired_files_.begin(), fade_expired_files_.end());
+  std::vector<std::pair<int, FileMetaData*>> sorted(fade_expired_files_.begin(),
+                                                    fade_expired_files_.end());
   std::sort(sorted.begin(), sorted.end(),
             [](const std::pair<int, FileMetaData*>& a,
                const std::pair<int, FileMetaData*>& b) {
