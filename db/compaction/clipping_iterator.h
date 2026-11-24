@@ -148,6 +148,8 @@ class ClippingIterator : public InternalIterator {
 
   Status status() const override { return iter_->status(); }
 
+  int GetCurrentLevel() const override { return iter_->GetCurrentLevel(); }
+
   bool PrepareValue() override {
     assert(valid_);
 

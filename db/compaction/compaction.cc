@@ -14,6 +14,7 @@
 
 #include "db/column_family.h"
 #include "db/dbformat.h"
+#include "db/table_cache.h"
 #include "logging/logging.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/sst_partitioner.h"
@@ -37,6 +38,140 @@ int sstableKeyCompare(const Comparator* uc, const Slice& a, const Slice& b) {
     return 1;
   }
   return 0;
+}
+
+void Compaction::EnableFadeTombstoneLevelRouting(
+    std::vector<FadeOutputLevelConfig> output_levels) {
+  assert(compaction_reason_ == CompactionReason::kFadeTtl);
+  fade_output_level_configs_ = std::move(output_levels);
+  fade_tombstone_level_routing_enabled_ = true;
+}
+
+int Compaction::FadeTombstoneOutputLevel(const Slice& user_key) const {
+  if (!fade_tombstone_level_routing_enabled_) {
+    return output_level_;
+  }
+
+  ReadOptions read_options(Env::IOActivity::kCompaction);
+  const Comparator* user_comparator = cfd_->user_comparator();
+  for (int level = output_level_; level < number_levels_; ++level) {
+    bool level_is_selected = level == output_level_;
+    for (const CompactionInputFiles& input_level : inputs_) {
+      if (input_level.level == level) {
+        level_is_selected = true;
+        break;
+      }
+    }
+    if (!level_is_selected) {
+      continue;
+    }
+
+    for (FileMetaData* file : input_vstorage_->LevelFiles(level)) {
+      if (user_comparator->CompareWithoutTimestamp(
+              user_key, file->smallest.user_key()) < 0 ||
+          user_comparator->CompareWithoutTimestamp(
+              user_key, file->largest.user_key()) > 0) {
+        continue;
+      }
+      bool may_match = true;
+      Status status = cfd_->table_cache()->KeyMayMatch(
+          read_options, cfd_->internal_comparator(), *file, user_key,
+          mutable_cf_options_, level, &may_match);
+      if (!status.ok()) {
+        ROCKS_LOG_WARN(
+            immutable_options_.info_log,
+            "[%s] FADE tombstone routed to level %d after filter probe failed "
+            "for file %" PRIu64 ": %s",
+            cfd_->GetName().c_str(), output_level_, file->fd.GetNumber(),
+            status.ToString().c_str());
+        return output_level_;
+      }
+      if (may_match) {
+        return level;
+      }
+    }
+  }
+  return output_level_;
+}
+
+const std::vector<FileMetaData*>& Compaction::grandparents(
+    int output_level) const {
+  if (output_level == output_level_) {
+    return grandparents_;
+  }
+  for (const FadeOutputLevelConfig& config : fade_output_level_configs_) {
+    if (config.level == output_level) {
+      return config.grandparents;
+    }
+  }
+  assert(false);
+  return grandparents_;
+}
+
+uint64_t Compaction::max_output_file_size(int output_level) const {
+  if (output_level == output_level_) {
+    return max_output_file_size_;
+  }
+  for (const FadeOutputLevelConfig& config : fade_output_level_configs_) {
+    if (config.level == output_level) {
+      return config.max_output_file_size;
+    }
+  }
+  assert(false);
+  return max_output_file_size_;
+}
+
+uint64_t Compaction::target_output_file_size(int output_level) const {
+  if (output_level == output_level_) {
+    return target_output_file_size_;
+  }
+  for (const FadeOutputLevelConfig& config : fade_output_level_configs_) {
+    if (config.level == output_level) {
+      return config.target_output_file_size;
+    }
+  }
+  assert(false);
+  return target_output_file_size_;
+}
+
+uint32_t Compaction::output_path_id(int output_level) const {
+  if (output_level == output_level_) {
+    return output_path_id_;
+  }
+  for (const FadeOutputLevelConfig& config : fade_output_level_configs_) {
+    if (config.level == output_level) {
+      return config.output_path_id;
+    }
+  }
+  assert(false);
+  return output_path_id_;
+}
+
+CompressionType Compaction::output_compression(int output_level) const {
+  if (output_level == output_level_) {
+    return output_compression_;
+  }
+  for (const FadeOutputLevelConfig& config : fade_output_level_configs_) {
+    if (config.level == output_level) {
+      return config.compression;
+    }
+  }
+  assert(false);
+  return output_compression_;
+}
+
+const CompressionOptions& Compaction::output_compression_opts(
+    int output_level) const {
+  if (output_level == output_level_) {
+    return output_compression_opts_;
+  }
+  for (const FadeOutputLevelConfig& config : fade_output_level_configs_) {
+    if (config.level == output_level) {
+      return config.compression_options;
+    }
+  }
+  assert(false);
+  return output_compression_opts_;
 }
 
 int sstableKeyCompare(const Comparator* user_cmp, const InternalKey* a,
@@ -217,6 +352,19 @@ bool Compaction::IsBottommostLevel(
   Slice smallest_key;
   Slice largest_key;
   GetBoundaryKeys(vstorage, inputs, &smallest_key, &largest_key);
+  const Comparator* user_comparator =
+      vstorage->InternalComparator()->user_comparator();
+  const int input_level = inputs.front().level;
+  for (int level = input_level + 1; level < output_level; ++level) {
+    for (const FileMetaData* file : vstorage->LevelFiles(level)) {
+      if (user_comparator->CompareWithoutTimestamp(file->smallest.user_key(),
+                                                   largest_key) <= 0 &&
+          user_comparator->CompareWithoutTimestamp(file->largest.user_key(),
+                                                   smallest_key) >= 0) {
+        return false;
+      }
+    }
+  }
   return !vstorage->RangeMightExistAfterSortedRun(smallest_key, largest_key,
                                                   output_level, output_l0_idx);
 }
@@ -658,6 +806,37 @@ bool Compaction::KeyNotExistsBeyondOutputLevel(
   assert(input_version_ != nullptr);
   assert(level_ptrs != nullptr);
   assert(level_ptrs->size() == static_cast<size_t>(number_levels_));
+  if (fade_tombstone_level_routing_enabled_) {
+    const int routed_output_level = FadeTombstoneOutputLevel(user_key);
+    ReadOptions read_options(Env::IOActivity::kCompaction);
+    const Comparator* user_comparator = cfd_->user_comparator();
+    for (int level = routed_output_level + 1; level < number_levels_; ++level) {
+      for (FileMetaData* file : input_vstorage_->LevelFiles(level)) {
+        if (user_comparator->CompareWithoutTimestamp(
+                user_key, file->smallest.user_key()) < 0 ||
+            user_comparator->CompareWithoutTimestamp(
+                user_key, file->largest.user_key()) > 0) {
+          continue;
+        }
+        bool may_match = true;
+        Status status = cfd_->table_cache()->KeyMayMatch(
+            read_options, cfd_->internal_comparator(), *file, user_key,
+            mutable_cf_options_, level, &may_match);
+        if (!status.ok() || may_match) {
+          if (!status.ok()) {
+            ROCKS_LOG_WARN(
+                immutable_options_.info_log,
+                "[%s] FADE tombstone elision retained key after filter probe "
+                "failed for file %" PRIu64 ": %s",
+                cfd_->GetName().c_str(), file->fd.GetNumber(),
+                status.ToString().c_str());
+          }
+          return false;
+        }
+      }
+    }
+    return true;
+  }
   if (bottommost_level_) {
     return true;
   } else if (output_level_ != 0 &&
@@ -666,7 +845,11 @@ bool Compaction::KeyNotExistsBeyondOutputLevel(
     // compaction/flush to L0.
     // Maybe use binary search to find right entry instead of linear search?
     const Comparator* user_cmp = cfd_->user_comparator();
-    for (int lvl = output_level_ + 1; lvl < number_levels_; lvl++) {
+    const int input_level = inputs_.front().level;
+    for (int lvl = input_level + 1; lvl < number_levels_; lvl++) {
+      if (lvl == output_level_) {
+        continue;
+      }
       const std::vector<FileMetaData*>& files =
           input_vstorage_->LevelFiles(lvl);
       for (; level_ptrs->at(lvl) < files.size(); level_ptrs->at(lvl)++) {
@@ -706,7 +889,11 @@ bool Compaction::KeyRangeNotExistsBeyondOutputLevel(
   } else if (output_level_ != 0 &&
              cfd_->ioptions().compaction_style == kCompactionStyleLevel) {
     const Comparator* user_cmp = cfd_->user_comparator();
-    for (int lvl = output_level_ + 1; lvl < number_levels_; lvl++) {
+    const int input_level = inputs_.front().level;
+    for (int lvl = input_level + 1; lvl < number_levels_; lvl++) {
+      if (lvl == output_level_) {
+        continue;
+      }
       const std::vector<FileMetaData*>& files =
           input_vstorage_->LevelFiles(lvl);
       for (; level_ptrs->at(lvl) < files.size(); level_ptrs->at(lvl)++) {
@@ -858,6 +1045,10 @@ void Compaction::Summary(char* output, int len) {
 }
 
 uint64_t Compaction::OutputFilePreallocationSize() const {
+  return OutputFilePreallocationSize(output_level_);
+}
+
+uint64_t Compaction::OutputFilePreallocationSize(int output_level) const {
   uint64_t preallocation_size = 0;
 
   for (const auto& level_files : inputs_) {
@@ -866,10 +1057,11 @@ uint64_t Compaction::OutputFilePreallocationSize() const {
     }
   }
 
-  if (max_output_file_size_ != std::numeric_limits<uint64_t>::max() &&
+  const uint64_t max_file_size = max_output_file_size(output_level);
+  if (max_file_size != std::numeric_limits<uint64_t>::max() &&
       (immutable_options_.compaction_style == kCompactionStyleLevel ||
-       output_level() > 0)) {
-    preallocation_size = std::min(max_output_file_size_, preallocation_size);
+       output_level > 0)) {
+    preallocation_size = std::min(max_file_size, preallocation_size);
   }
 
   // Over-estimate slightly so we don't end up just barely crossing
@@ -1198,11 +1390,16 @@ void Compaction::FilterInputsForCompactionIterator() {
 }
 
 Temperature Compaction::GetOutputTemperature(bool is_proximal_level) const {
+  const int level = is_proximal_level ? GetProximalLevel() : output_level_;
+  return GetOutputTemperatureForLevel(level);
+}
+
+Temperature Compaction::GetOutputTemperatureForLevel(int output_level) const {
   if (output_temperature_override_ != Temperature::kUnknown) {
     return output_temperature_override_;
   }
 
-  if (is_last_level() && !is_proximal_level &&
+  if (output_level == number_levels_ - 1 &&
       mutable_cf_options_.last_level_temperature != Temperature::kUnknown) {
     return mutable_cf_options_.last_level_temperature;
   }

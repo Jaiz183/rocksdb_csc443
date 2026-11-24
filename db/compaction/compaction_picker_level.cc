@@ -9,12 +9,16 @@
 
 #include "db/compaction/compaction_picker_level.h"
 
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "db/dbformat.h"
+#include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "logging/log_buffer.h"
+#include "logging/logging.h"
 #include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -95,6 +99,14 @@ class LevelCompactionBuilder {
   // level: within that level, prefer a file whose tombstones have expired.
   bool PickFadeCompactionAtLevel(int level);
 
+  // [FADE] Move the output level deeper when filters rule out input point keys
+  // from every intervening level.
+  void SetFadeOutputLevel();
+
+  // [FADE] Add overlapping destination-level files needed by point tombstones.
+  bool SetupFadeTombstoneInputs();
+  bool FadeTombstoneRoutingFallback(const char* reason) const;
+
   // If the initial files are from L0 level, pick other L0
   // files if needed.
   bool SetupOtherL0FilesIfNeeded();
@@ -168,6 +180,8 @@ class LevelCompactionBuilder {
   std::vector<CompactionInputFiles> compaction_inputs_;
   CompactionInputFiles output_level_inputs_;
   std::vector<FileMetaData*> grandparents_;
+  std::vector<Compaction::FadeOutputLevelConfig> fade_output_level_configs_;
+  bool fade_tombstone_routing_enabled_ = false;
   CompactionReason compaction_reason_ = CompactionReason::kUnknown;
 
   const MutableCFOptions& mutable_cf_options_;
@@ -217,14 +231,388 @@ void LevelCompactionBuilder::PickFileToCompact(
   start_level_inputs_.files.clear();
 }
 
+void LevelCompactionBuilder::SetFadeOutputLevel() {
+  if (!mutable_cf_options_.fade_filter_probe_enabled ||
+      mutable_cf_options_.fade_tombstone_level_routing_enabled ||
+      compaction_reason_ != CompactionReason::kFadeTtl ||
+      compaction_picker_->table_cache() == nullptr ||
+      start_level_inputs_.empty() || output_level_ <= start_level_ ||
+      ioptions_.user_comparator->timestamp_size() > 0) {
+    return;
+  }
+
+  TableCache* table_cache = compaction_picker_->table_cache();
+  ReadOptions read_options;
+  FileOptions file_options;
+  const int default_output_level = output_level_;
+  int candidate_output_level = vstorage_->num_levels();
+  const Comparator* user_comparator = ioptions_.user_comparator;
+  std::string previous_user_key;
+  bool have_previous_user_key = false;
+
+  for (FileMetaData* candidate : start_level_inputs_.files) {
+    if (candidate->num_range_deletions > 0 || candidate->num_deletions == 0) {
+      return;
+    }
+
+    TableReader* candidate_reader = nullptr;
+    InternalIterator* candidate_iter = table_cache->NewIterator(
+        read_options, file_options, *compaction_picker_->icmp(), *candidate,
+        nullptr, mutable_cf_options_, &candidate_reader, nullptr,
+        TableReaderCaller::kCompaction, nullptr, true /* skip_filters */,
+        start_level_, 0 /* max_file_size_for_l0_meta_pin */, nullptr, nullptr,
+        false /* allow_unprepared_value */, nullptr, nullptr);
+    if (candidate_iter == nullptr) {
+      ROCKS_LOG_WARN(ioptions_.logger,
+                     "[%s] FADE filter probe skipped for file %" PRIu64
+                     ": unable to open candidate table to enumerate keys",
+                     cf_name_.c_str(), candidate->fd.GetNumber());
+      return;
+    }
+
+    bool unsupported_entry = false;
+    Status parse_status;
+    for (candidate_iter->SeekToFirst();
+         candidate_iter->Valid() &&
+         candidate_output_level > default_output_level;
+         candidate_iter->Next()) {
+      ParsedInternalKey parsed;
+      parse_status = ParseInternalKey(candidate_iter->key(), &parsed, false);
+      if (!parse_status.ok()) {
+        unsupported_entry = true;
+        break;
+      }
+      if (parsed.type == kTypeRangeDeletion) {
+        unsupported_entry = true;
+        break;
+      }
+      const Slice user_key = parsed.user_key;
+      if (have_previous_user_key &&
+          user_comparator->Compare(user_key, previous_user_key) == 0) {
+        continue;
+      }
+      previous_user_key.assign(user_key.data(), user_key.size());
+      have_previous_user_key = true;
+
+      for (int level = default_output_level; level < candidate_output_level;
+           ++level) {
+        std::vector<FileMetaData*> files;
+        vstorage_->GetOverlappingInputs(level, &candidate->smallest,
+                                        &candidate->largest, &files);
+        bool may_match_at_level = false;
+        for (FileMetaData* file : files) {
+          if (user_comparator->CompareWithoutTimestamp(
+                  user_key, file->smallest.user_key()) < 0 ||
+              user_comparator->CompareWithoutTimestamp(
+                  user_key, file->largest.user_key()) > 0) {
+            continue;
+          }
+
+          bool may_match = true;
+          Status probe_status = table_cache->KeyMayMatch(
+              read_options, *compaction_picker_->icmp(), *file, user_key,
+              mutable_cf_options_, level, &may_match);
+          if (!probe_status.ok()) {
+            ROCKS_LOG_WARN(ioptions_.logger,
+                           "[%s] FADE filter probe skipped for file %" PRIu64
+                           ": unable to read filter for file %" PRIu64 ": %s",
+                           cf_name_.c_str(), candidate->fd.GetNumber(),
+                           file->fd.GetNumber(),
+                           probe_status.ToString().c_str());
+            may_match = true;
+          }
+          if (may_match) {
+            may_match_at_level = true;
+            break;
+          }
+        }
+        if (may_match_at_level) {
+          candidate_output_level = level;
+          break;
+        }
+      }
+    }
+    Status iter_status = candidate_iter->status();
+    delete candidate_iter;
+    if (unsupported_entry) {
+      ROCKS_LOG_WARN(ioptions_.logger,
+                     "[%s] FADE filter probe skipped for file %" PRIu64
+                     ": unsupported entry or malformed internal key%s%s",
+                     cf_name_.c_str(), candidate->fd.GetNumber(),
+                     parse_status.ok() ? "" : ": ",
+                     parse_status.ok() ? "" : parse_status.ToString().c_str());
+      if (!iter_status.ok()) {
+        ROCKS_LOG_WARN(ioptions_.logger,
+                       "[%s] FADE filter probe iterator for file %" PRIu64
+                       " also failed: %s",
+                       cf_name_.c_str(), candidate->fd.GetNumber(),
+                       iter_status.ToString().c_str());
+      }
+      return;
+    }
+    if (!iter_status.ok()) {
+      ROCKS_LOG_WARN(ioptions_.logger,
+                     "[%s] FADE filter probe skipped for file %" PRIu64
+                     ": unable to enumerate point deletes: %s",
+                     cf_name_.c_str(), candidate->fd.GetNumber(),
+                     iter_status.ToString().c_str());
+      return;
+    }
+  }
+
+  if (candidate_output_level < vstorage_->num_levels()) {
+    output_level_ = candidate_output_level;
+  }
+}
+
+bool LevelCompactionBuilder::SetupFadeTombstoneInputs() {
+  if (!mutable_cf_options_.fade_tombstone_level_routing_enabled ||
+      compaction_reason_ != CompactionReason::kFadeTtl) {
+    return false;
+  }
+
+  if (compaction_picker_->table_cache() == nullptr) {
+    return FadeTombstoneRoutingFallback("table cache is unavailable");
+  }
+  if (ioptions_.user_comparator->timestamp_size() != 0) {
+    return FadeTombstoneRoutingFallback(
+        "user-defined timestamps are unsupported");
+  }
+  if (ioptions_.merge_operator != nullptr) {
+    return FadeTombstoneRoutingFallback("merge operators are unsupported");
+  }
+  if (ioptions_.compaction_filter != nullptr ||
+      ioptions_.compaction_filter_factory != nullptr) {
+    return FadeTombstoneRoutingFallback("compaction filters are unsupported");
+  }
+  if (mutable_cf_options_.enable_blob_files) {
+    return FadeTombstoneRoutingFallback("blob files are unsupported");
+  }
+  if (mutable_cf_options_.preclude_last_level_data_seconds > 0) {
+    return FadeTombstoneRoutingFallback(
+        "precluding last-level data is enabled");
+  }
+  if (start_level_ >= output_level_ ||
+      output_level_ >= vstorage_->num_levels()) {
+    return FadeTombstoneRoutingFallback(
+        "the compaction does not have a deeper destination");
+  }
+  if (Compaction::EvaluateProximalLevel(
+          vstorage_, mutable_cf_options_, ioptions_, start_level_,
+          output_level_) != Compaction::kInvalidLevel) {
+    return FadeTombstoneRoutingFallback("proximal-level output is enabled");
+  }
+
+  for (const CompactionInputFiles& input_level : compaction_inputs_) {
+    for (FileMetaData* file : input_level.files) {
+      if (file->num_range_deletions > 0) {
+        return FadeTombstoneRoutingFallback("range tombstones are present");
+      }
+    }
+  }
+
+  InternalKey smallest;
+  InternalKey largest;
+  compaction_picker_->GetRange(start_level_inputs_, &smallest, &largest);
+
+  std::vector<std::vector<FileMetaData*>> overlapping_files(
+      static_cast<size_t>(vstorage_->num_levels()));
+  for (int level = output_level_; level < vstorage_->num_levels(); ++level) {
+    vstorage_->GetOverlappingInputs(level, &smallest, &largest,
+                                    &overlapping_files[level]);
+  }
+
+  std::set<int> output_levels;
+  ReadOptions read_options(Env::IOActivity::kCompaction);
+  FileOptions file_options;
+  TableCache* table_cache = compaction_picker_->table_cache();
+  const Comparator* user_comparator = ioptions_.user_comparator;
+  std::string previous_tombstone_key;
+
+  for (FileMetaData* candidate : start_level_inputs_.files) {
+    if (candidate->num_range_deletions > 0 || candidate->num_deletions == 0) {
+      if (candidate->num_range_deletions > 0) {
+        return FadeTombstoneRoutingFallback("range tombstones are present");
+      }
+      continue;
+    }
+
+    TableReader* candidate_reader = nullptr;
+    InternalIterator* candidate_iter = table_cache->NewIterator(
+        read_options, file_options, *compaction_picker_->icmp(), *candidate,
+        nullptr, mutable_cf_options_, &candidate_reader, nullptr,
+        TableReaderCaller::kCompaction, nullptr, true /* skip_filters */,
+        start_level_, 0 /* max_file_size_for_l0_meta_pin */, nullptr, nullptr,
+        false /* allow_unprepared_value */, nullptr, nullptr);
+    if (candidate_iter == nullptr) {
+      return FadeTombstoneRoutingFallback(
+          "a candidate table could not be opened");
+    }
+
+    Status probe_status;
+    bool unsupported_entry = false;
+    previous_tombstone_key.clear();
+    for (candidate_iter->SeekToFirst();
+         candidate_iter->Valid() && !unsupported_entry;
+         candidate_iter->Next()) {
+      ParsedInternalKey parsed;
+      probe_status = ParseInternalKey(candidate_iter->key(), &parsed, false);
+      if (!probe_status.ok() || parsed.type == kTypeRangeDeletion) {
+        unsupported_entry = true;
+        break;
+      }
+      if (parsed.type != kTypeDeletion &&
+          parsed.type != kTypeDeletionWithTimestamp) {
+        continue;
+      }
+      if (!previous_tombstone_key.empty() &&
+          user_comparator->Compare(parsed.user_key, previous_tombstone_key) ==
+              0) {
+        continue;
+      }
+      previous_tombstone_key.assign(parsed.user_key.data(),
+                                    parsed.user_key.size());
+
+      for (int level = output_level_; level < vstorage_->num_levels();
+           ++level) {
+        bool level_may_match = false;
+        for (FileMetaData* file : overlapping_files[level]) {
+          if (user_comparator->CompareWithoutTimestamp(
+                  parsed.user_key, file->smallest.user_key()) < 0 ||
+              user_comparator->CompareWithoutTimestamp(
+                  parsed.user_key, file->largest.user_key()) > 0) {
+            continue;
+          }
+          bool may_match = true;
+          probe_status = table_cache->KeyMayMatch(
+              read_options, *compaction_picker_->icmp(), *file, parsed.user_key,
+              mutable_cf_options_, level, &may_match);
+          if (!probe_status.ok()) {
+            break;
+          }
+          if (may_match) {
+            level_may_match = true;
+            break;
+          }
+        }
+        if (!probe_status.ok()) {
+          break;
+        }
+        if (level_may_match) {
+          if (level > output_level_) {
+            output_levels.insert(level);
+          }
+          break;
+        }
+      }
+      if (!probe_status.ok()) {
+        break;
+      }
+    }
+    Status iter_status = candidate_iter->status();
+    delete candidate_iter;
+    if (unsupported_entry || !probe_status.ok() || !iter_status.ok()) {
+      return FadeTombstoneRoutingFallback(
+          "candidate tombstones could not be enumerated or probed");
+    }
+  }
+
+  uint64_t total_input_size = 0;
+  for (const CompactionInputFiles& input_level : compaction_inputs_) {
+    for (FileMetaData* file : input_level.files) {
+      total_input_size += file->fd.GetFileSize();
+    }
+  }
+
+  std::vector<CompactionInputFiles> extra_inputs;
+  for (int level : output_levels) {
+    CompactionInputFiles additional_inputs;
+    additional_inputs.level = level;
+    additional_inputs.files = overlapping_files[level];
+    if (additional_inputs.empty()) {
+      continue;
+    }
+    for (FileMetaData* file : additional_inputs.files) {
+      if (file->being_compacted || file->num_range_deletions > 0) {
+        return FadeTombstoneRoutingFallback(
+            "a destination input is busy or has range tombstones");
+      }
+      total_input_size += file->fd.GetFileSize();
+    }
+    extra_inputs.push_back(std::move(additional_inputs));
+  }
+  if (mutable_cf_options_.max_compaction_bytes > 0 &&
+      total_input_size > mutable_cf_options_.max_compaction_bytes) {
+    return FadeTombstoneRoutingFallback(
+        "the selected inputs exceed max_compaction_bytes");
+  }
+
+  std::vector<CompactionInputFiles> all_inputs = compaction_inputs_;
+  all_inputs.insert(all_inputs.end(), extra_inputs.begin(), extra_inputs.end());
+  if (compaction_picker_->FilesRangeOverlapWithCompaction(
+          all_inputs, output_level_, Compaction::kInvalidLevel)) {
+    return FadeTombstoneRoutingFallback(
+        "the expanded input range overlaps a running compaction");
+  }
+  for (int level : output_levels) {
+    if (compaction_picker_->FilesRangeOverlapWithCompaction(
+            all_inputs, level, Compaction::kInvalidLevel)) {
+      return FadeTombstoneRoutingFallback(
+          "a destination overlaps another running compaction");
+    }
+  }
+
+  compaction_inputs_ = std::move(all_inputs);
+  std::sort(compaction_inputs_.begin(), compaction_inputs_.end(),
+            [](const CompactionInputFiles& a, const CompactionInputFiles& b) {
+              return a.level < b.level;
+            });
+  compaction_picker_->GetRange(compaction_inputs_, &smallest, &largest,
+                               Compaction::kInvalidLevel);
+
+  for (int level : output_levels) {
+    std::vector<FileMetaData*> grandparents;
+    if (level + 1 < vstorage_->num_levels()) {
+      vstorage_->GetOverlappingInputs(level + 1, &smallest, &largest,
+                                      &grandparents);
+    }
+    const uint64_t target_size =
+        MaxFileSizeForLevel(mutable_cf_options_, level,
+                            ioptions_.compaction_style, vstorage_->base_level(),
+                            ioptions_.level_compaction_dynamic_level_bytes);
+    const uint64_t max_size =
+        grandparents.empty() || level == vstorage_->num_levels() - 1
+            ? target_size
+            : target_size * 2;
+    fade_output_level_configs_.push_back(
+        {level, target_size, max_size,
+         GetPathId(ioptions_, mutable_cf_options_, level),
+         GetCompressionType(vstorage_, mutable_cf_options_, level,
+                            vstorage_->base_level()),
+         GetCompressionOptions(mutable_cf_options_, vstorage_, level),
+         std::move(grandparents)});
+  }
+  fade_tombstone_routing_enabled_ = true;
+  return true;
+}
+
+bool LevelCompactionBuilder::FadeTombstoneRoutingFallback(
+    const char* reason) const {
+  ROCKS_LOG_WARN(ioptions_.logger,
+                 "[%s] FADE tombstone routing uses the default output level: "
+                 "%s",
+                 cf_name_.c_str(), reason);
+  return false;
+}
+
 bool LevelCompactionBuilder::PickFadeCompaction() {
   const auto& fade_files = vstorage_->FadeExpiredFiles();
   if (fade_files.empty()) {
     return false;
   }
   // FadeExpiredFiles() is already ordered by (level, oldest tombstone,
-  // #tombstones). kSkipLastLevel: a file is moved one level down
-  // (L0 -> base_level, Ln -> Ln+1) and never self-compacted in the last level.
+  // #tombstones). kSkipLastLevel compacts into the next level, or rewrites a
+  // file in the last level.
   PickFileToCompact(fade_files, CompactToNextLevel::kSkipLastLevel);
   if (!start_level_inputs_.empty()) {
     compaction_reason_ = CompactionReason::kFadeTtl;
@@ -628,11 +1016,15 @@ Compaction* LevelCompactionBuilder::PickCompaction() {
     return nullptr;
   }
 
+  SetFadeOutputLevel();
+
   // Pick files in the output level and expand more files in the start level
   // if needed.
   if (!SetupOtherInputsIfNeeded()) {
     return nullptr;
   }
+
+  SetupFadeTombstoneInputs();
 
   // Form a compaction object containing the files we picked.
   Compaction* c = GetCompaction();
@@ -669,6 +1061,9 @@ Compaction* LevelCompactionBuilder::GetCompaction() {
       /* earliest_snapshot */ std::nullopt, /* snapshot_checker */ nullptr,
       compaction_reason_,
       /* trim_ts */ "", start_level_score_, l0_files_might_overlap);
+  if (fade_tombstone_routing_enabled_) {
+    c->EnableFadeTombstoneLevelRouting(std::move(fade_output_level_configs_));
+  }
 
   // If it's level 0 compaction, make sure we don't execute any other level 0
   // compactions in parallel

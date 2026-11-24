@@ -136,7 +136,8 @@ bool CompactionOutputs::UpdateFilesToCutForTTLStates(
 size_t CompactionOutputs::UpdateGrandparentBoundaryInfo(
     const Slice& internal_key) {
   size_t curr_key_boundary_switched_num = 0;
-  const std::vector<FileMetaData*>& grandparents = compaction_->grandparents();
+  const std::vector<FileMetaData*>& grandparents =
+      compaction_->grandparents(output_level_);
 
   if (grandparents.empty()) {
     return curr_key_boundary_switched_num;
@@ -201,7 +202,8 @@ uint64_t CompactionOutputs::GetCurrentKeyGrandparentOverlappedBytes(
   }
   uint64_t overlapped_bytes = 0;
 
-  const std::vector<FileMetaData*>& grandparents = compaction_->grandparents();
+  const std::vector<FileMetaData*>& grandparents =
+      compaction_->grandparents(output_level_);
   const Comparator* ucmp = compaction_->column_family_data()->user_comparator();
   InternalKey ikey;
   ikey.DecodeFrom(internal_key);
@@ -280,9 +282,8 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
   bool should_stop_for_ttl = false;
   // Always update grandparent information like overlapped file number, size
   // etc., and TTL states.
-  // If compaction_->output_level() == 0, there is no need to update grandparent
-  // info, and that `grandparent` should be empty.
-  if (compaction_->output_level() > 0) {
+  // If output_level_ == 0, there is no need to update grandparent info.
+  if (output_level_ > 0) {
     num_grandparent_boundaries_crossed =
         UpdateGrandparentBoundaryInfo(internal_key);
     should_stop_for_ttl = UpdateFilesToCutForTTLStates(internal_key);
@@ -301,7 +302,7 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
   }
 
   // files output to Level 0 won't be split
-  if (compaction_->output_level() == 0) {
+  if (output_level_ == 0) {
     return false;
   }
 
@@ -310,7 +311,7 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
   if (compaction_->mutable_cf_options().target_file_size_is_upper_bound) {
     estimated_file_size += builder_->EstimatedTailSize();
   }
-  if (estimated_file_size >= compaction_->max_output_file_size()) {
+  if (estimated_file_size >= compaction_->max_output_file_size(output_level_)) {
     return true;
   }
 
@@ -359,7 +360,7 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
         num_grandparent_boundaries_crossed >=
             num_skippable_boundaries_crossed &&
         grandparent_overlapped_bytes_ - previous_overlapped_bytes >
-            compaction_->target_output_file_size() / 8) {
+            compaction_->target_output_file_size(output_level_) / 8) {
       return true;
     }
 
@@ -378,7 +379,7 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
     if (compaction_->immutable_options().compaction_style ==
             kCompactionStyleLevel &&
         current_output_file_size_ >=
-            ((compaction_->target_output_file_size() + 99) / 100) *
+            ((compaction_->target_output_file_size(output_level_) + 99) / 100) *
                 (50 + std::min(grandparent_boundary_switched_num_ * 5,
                                size_t{40}))) {
       return true;
@@ -910,8 +911,8 @@ Status CompactionOutputs::AddRangeDels(
               compaction_->input_version()->version_set()->ApproximateSize(
                   approx_opts, read_options, compaction_->input_version(),
                   tombstone_start.Encode(), tombstone_end.Encode(),
-                  compaction_->output_level() + 1 /* start_level */,
-                  -1 /* end_level */, kCompaction);
+                  output_level_ + 1 /* start_level */, -1 /* end_level */,
+                  kCompaction);
           meta.compensated_range_deletion_size += approximate_covered_size;
         }
       }
@@ -921,6 +922,9 @@ Status CompactionOutputs::AddRangeDels(
 }
 
 void CompactionOutputs::FillFilesToCutForTtl() {
+  if (compaction_->fade_tombstone_level_routing_enabled()) {
+    return;
+  }
   if (compaction_->immutable_options().compaction_style !=
           kCompactionStyleLevel ||
       compaction_->immutable_options().compaction_pri != kMinOverlappingRatio ||
@@ -961,13 +965,14 @@ void CompactionOutputs::FillFilesToCutForTtl() {
 }
 
 CompactionOutputs::CompactionOutputs(const Compaction* compaction,
-                                     const bool is_proximal_level)
-    : compaction_(compaction), is_proximal_level_(is_proximal_level) {
-  partitioner_ = compaction->output_level() == 0
-                     ? nullptr
-                     : compaction->CreateSstPartitioner();
+                                     int output_level, bool is_proximal_level)
+    : compaction_(compaction),
+      output_level_(output_level),
+      is_proximal_level_(is_proximal_level) {
+  partitioner_ =
+      output_level_ == 0 ? nullptr : compaction->CreateSstPartitioner();
 
-  if (compaction->output_level() != 0) {
+  if (output_level_ != 0) {
     FillFilesToCutForTtl();
   }
 

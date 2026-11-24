@@ -82,6 +82,16 @@ class CompactionFilter;
 // A Compaction encapsulates metadata about a compaction.
 class Compaction {
  public:
+  struct FadeOutputLevelConfig {
+    int level;
+    uint64_t target_output_file_size;
+    uint64_t max_output_file_size;
+    uint32_t output_path_id;
+    CompressionType compression;
+    CompressionOptions compression_options;
+    std::vector<FileMetaData*> grandparents;
+  };
+
   Compaction(VersionStorageInfo* input_version,
              const ImmutableOptions& immutable_options,
              const MutableCFOptions& mutable_cf_options,
@@ -129,6 +139,23 @@ class Compaction {
 
   // Outputs will go to this level
   int output_level() const { return output_level_; }
+
+  void EnableFadeTombstoneLevelRouting(
+      std::vector<FadeOutputLevelConfig> output_levels);
+  bool fade_tombstone_level_routing_enabled() const {
+    return fade_tombstone_level_routing_enabled_;
+  }
+  int FadeTombstoneOutputLevel(const Slice& user_key) const;
+  const std::vector<FadeOutputLevelConfig>& fade_output_level_configs() const {
+    return fade_output_level_configs_;
+  }
+  const std::vector<FileMetaData*>& grandparents(int output_level) const;
+  uint64_t max_output_file_size(int output_level) const;
+  uint64_t target_output_file_size(int output_level) const;
+  uint32_t output_path_id(int output_level) const;
+  CompressionType output_compression(int output_level) const;
+  const CompressionOptions& output_compression_opts(int output_level) const;
+  uint64_t OutputFilePreallocationSize(int output_level) const;
 
   // Returns the number of input levels in this compaction.
   size_t num_input_levels() const { return inputs_.size(); }
@@ -241,13 +268,14 @@ class Compaction {
   // Add all inputs to this compaction as delete operations to *edit.
   void AddInputDeletions(VersionEdit* edit);
 
-  // Returns true if the available information we have guarantees that
-  // the input "user_key" does not exist in any level beyond `output_level()`.
+  // Returns true if the available information we have guarantees that the
+  // input "user_key" does not exist in levels skipped by the compaction or
+  // below `output_level()`.
   bool KeyNotExistsBeyondOutputLevel(const Slice& user_key,
                                      std::vector<size_t>* level_ptrs) const;
 
-  // Returns true if the user key range [begin_key, end_key) does not exist
-  // in any level beyond `output_level()`.
+  // Returns true if the user key range [begin_key, end_key) does not exist in
+  // levels skipped by the compaction or below `output_level()`.
   // Used for checking range tombstones, so we assume begin_key < end_key.
   // begin_key and end_key should include timestamp if enabled.
   bool KeyRangeNotExistsBeyondOutputLevel(
@@ -447,6 +475,7 @@ class Compaction {
   // 2. Temperature of the last level files if applicable
   // 3. Default write temperature
   Temperature GetOutputTemperature(bool is_proximal_level = false) const;
+  Temperature GetOutputTemperatureForLevel(int output_level) const;
 
   uint32_t max_subcompactions() const { return max_subcompactions_; }
 
@@ -617,6 +646,8 @@ class Compaction {
   // State used to check for number of overlapping grandparent files
   // (grandparent == "output_level_ + 1")
   std::vector<FileMetaData*> grandparents_;
+  std::vector<FadeOutputLevelConfig> fade_output_level_configs_;
+  bool fade_tombstone_level_routing_enabled_ = false;
 
   // The earliest snapshot and snapshot checker at compaction picking time.
   // These fields are only set for deletion triggered compactions picked in

@@ -797,6 +797,30 @@ size_t TableCache::GetMemoryUsageByTableReader(
   return ret;
 }
 
+Status TableCache::KeyMayMatch(const ReadOptions& options,
+                               const InternalKeyComparator& internal_comparator,
+                               const FileMetaData& file_meta,
+                               const Slice& user_key,
+                               const MutableCFOptions& mutable_cf_options,
+                               int level, bool* may_match) {
+  assert(may_match != nullptr);
+  *may_match = true;
+  TypedHandle* handle = nullptr;
+  TableReader* table_reader = nullptr;
+  Status s = FindTable(options, file_options_, internal_comparator, file_meta,
+                       &handle, mutable_cf_options, &table_reader,
+                       options.read_tier == kBlockCacheTier /* no_io */,
+                       nullptr, false /* skip_filters */, level);
+  if (s.ok()) {
+    *may_match = table_reader->KeyMayMatch(
+        options, user_key, mutable_cf_options.prefix_extractor.get());
+  }
+  if (handle != nullptr) {
+    cache_.Release(handle);
+  }
+  return s;
+}
+
 void TableCache::Evict(Cache* cache, uint64_t file_number) {
   cache->Erase(GetSliceForFileNumber(&file_number));
 }

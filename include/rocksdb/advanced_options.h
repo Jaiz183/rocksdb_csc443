@@ -920,6 +920,26 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   uint64_t delete_persistence_threshold = 0;
 
+  // [FADE] Minimum estimated invalidated-entry count b_f that makes an SST
+  // eligible for delete-driven compaction even if its oldest tombstone has not
+  // violated its level TTL. 0 disables this augmentation. Like
+  // delete_persistence_threshold, this is evaluated when a new Version is
+  // installed and is dynamically changeable through SetOptions().
+  uint64_t fade_b_compaction_threshold = 0;
+
+  // [FADE] Probe filters for input point keys when choosing a compaction
+  // output level. Levels whose overlapping SST filters rule out every input
+  // point key are skipped. Range deletions and unsupported filter paths use
+  // the regular next-level output. 0 disables probing.
+  bool fade_filter_probe_enabled = false;
+
+  // [FADE] Probe point tombstones independently and place each tombstone at
+  // the first deeper level whose overlapping SST filters may contain its key.
+  // Live keys remain at the normal next-level destination. This option is
+  // experimental, applies only to leveled FADE compactions, and is disabled by
+  // default.
+  bool fade_tombstone_level_routing_enabled = false;
+
   // This option has different meanings for different compaction styles:
   //
   // Leveled: files older than `periodic_compaction_seconds` will be picked up

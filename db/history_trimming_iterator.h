@@ -78,6 +78,8 @@ class HistoryTrimmingIterator : public InternalIterator {
 
   Status status() const override { return input_->status(); }
 
+  int GetCurrentLevel() const override { return input_->GetCurrentLevel(); }
+
   bool IsKeyPinned() const override { return input_->IsKeyPinned(); }
 
   bool IsValuePinned() const override { return input_->IsValuePinned(); }

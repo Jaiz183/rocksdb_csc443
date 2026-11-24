@@ -19,6 +19,11 @@ void SubcompactionState::AggregateCompactionOutputStats(
   // range deletes have already been written also.
   assert(compaction_outputs_.HasBuilder() == false);
   assert(proximal_level_outputs_.HasBuilder() == false);
+#ifndef NDEBUG
+  for (const std::unique_ptr<CompactionOutputs>& outputs : fade_outputs_) {
+    assert(!outputs || !outputs->HasBuilder());
+  }
+#endif
 
   // FIXME: These stats currently include abandonned output files
   // assert(compaction_outputs_.stats_.num_output_files ==
@@ -27,6 +32,11 @@ void SubcompactionState::AggregateCompactionOutputStats(
   //        proximal_level_outputs_.outputs_.size());
 
   internal_stats.output_level_stats.Add(compaction_outputs_.stats_);
+  for (const std::unique_ptr<CompactionOutputs>& outputs : fade_outputs_) {
+    if (outputs) {
+      internal_stats.output_level_stats.Add(outputs->stats_);
+    }
+  }
   if (proximal_level_outputs_.HasOutput()) {
     internal_stats.has_proximal_level_output = true;
     internal_stats.proximal_level_stats.Add(proximal_level_outputs_.stats_);
@@ -34,13 +44,26 @@ void SubcompactionState::AggregateCompactionOutputStats(
 }
 
 OutputIterator SubcompactionState::GetOutputs() const {
-  return OutputIterator(proximal_level_outputs_.outputs_,
-                        compaction_outputs_.outputs_);
+  std::vector<const std::vector<CompactionOutputs::Output>*> outputs;
+  outputs.push_back(&proximal_level_outputs_.outputs_);
+  outputs.push_back(&compaction_outputs_.outputs_);
+  for (const std::unique_ptr<CompactionOutputs>& level_outputs :
+       fade_outputs_) {
+    if (level_outputs) {
+      outputs.push_back(&level_outputs->outputs_);
+    }
+  }
+  return OutputIterator(std::move(outputs));
 }
 
 void SubcompactionState::Cleanup(Cache* cache, const Status& overall_status) {
   proximal_level_outputs_.Cleanup();
   compaction_outputs_.Cleanup();
+  for (const std::unique_ptr<CompactionOutputs>& outputs : fade_outputs_) {
+    if (outputs) {
+      outputs->Cleanup();
+    }
+  }
 
   if (!status.ok() || !overall_status.ok()) {
     for (const auto& out : GetOutputs()) {
@@ -62,57 +85,44 @@ void SubcompactionState::Cleanup(Cache* cache, const Status& overall_status) {
 }
 
 Slice SubcompactionState::SmallestUserKey() const {
-  if (proximal_level_outputs_.HasOutput()) {
-    Slice a = compaction_outputs_.SmallestUserKey();
-    Slice b = proximal_level_outputs_.SmallestUserKey();
-    if (a.empty()) {
-      return b;
+  Slice smallest;
+  const Comparator* user_cmp =
+      compaction->column_family_data()->user_comparator();
+  for (const auto& output : GetOutputs()) {
+    if (!output.finished || output.meta.smallest.size() == 0) {
+      continue;
     }
-    if (b.empty()) {
-      return a;
+    Slice key = output.meta.smallest.user_key();
+    if (smallest.empty() || user_cmp->Compare(key, smallest) < 0) {
+      smallest = key;
     }
-    const Comparator* user_cmp =
-        compaction->column_family_data()->user_comparator();
-    if (user_cmp->Compare(a, b) > 0) {
-      return b;
-    } else {
-      return a;
-    }
-  } else {
-    return compaction_outputs_.SmallestUserKey();
   }
+  return smallest;
 }
 
 Slice SubcompactionState::LargestUserKey() const {
-  if (proximal_level_outputs_.HasOutput()) {
-    Slice a = compaction_outputs_.LargestUserKey();
-    Slice b = proximal_level_outputs_.LargestUserKey();
-    if (a.empty()) {
-      return b;
+  Slice largest;
+  const Comparator* user_cmp =
+      compaction->column_family_data()->user_comparator();
+  for (const auto& output : GetOutputs()) {
+    if (!output.finished || output.meta.largest.size() == 0) {
+      continue;
     }
-    if (b.empty()) {
-      return a;
+    Slice key = output.meta.largest.user_key();
+    if (largest.empty() || user_cmp->Compare(key, largest) > 0) {
+      largest = key;
     }
-    const Comparator* user_cmp =
-        compaction->column_family_data()->user_comparator();
-    if (user_cmp->Compare(a, b) < 0) {
-      return b;
-    } else {
-      return a;
-    }
-  } else {
-    return compaction_outputs_.LargestUserKey();
   }
+  return largest;
 }
 
 Status SubcompactionState::AddToOutput(
-    CompactionIterator& iter, bool use_proximal_output,
+    CompactionIterator& iter, int output_level,
     const CompactionFileOpenFunc& open_file_func,
     const CompactionFileCloseFunc& close_file_func,
     const ParsedInternalKey& prev_iter_output_internal_key) {
   // update target output
-  current_outputs_ =
-      use_proximal_output ? &proximal_level_outputs_ : &compaction_outputs_;
+  current_outputs_ = OutputsForLevel(output_level);
   return current_outputs_->AddToOutput(iter, open_file_func, close_file_func,
                                        prev_iter_output_internal_key);
 }

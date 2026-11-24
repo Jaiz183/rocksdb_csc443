@@ -14289,6 +14289,16 @@ Options FadeTestOptions(Options options, uint64_t dth, int num_levels) {
   options.compression = kNoCompression;
   return options;
 }
+
+Options FadeFilterProbeTestOptions(Options options) {
+  options = FadeTestOptions(options, /*dth=*/1000, /*num_levels=*/5);
+  options.fade_b_compaction_threshold = 1;
+  options.fade_filter_probe_enabled = true;
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(100));
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  return options;
+}
 }  // namespace
 
 // d_i follow the paper: exponentially growing, cumulative, summing to D_th.
@@ -14509,6 +14519,231 @@ TEST_F(DBCompactionTest, FadeThresholdIsDynamic) {
   DestroyAndReopen(options);
   ASSERT_OK(dbfull()->SetOptions({{"delete_persistence_threshold", "3600"}}));
   ASSERT_EQ(3600u, dbfull()->GetOptions().delete_persistence_threshold);
+  ASSERT_OK(dbfull()->SetOptions({{"fade_b_compaction_threshold", "100"}}));
+  ASSERT_EQ(100u, dbfull()->GetOptions().fade_b_compaction_threshold);
+  ASSERT_OK(dbfull()->SetOptions({{"fade_filter_probe_enabled", "true"}}));
+  ASSERT_TRUE(dbfull()->GetOptions().fade_filter_probe_enabled);
+}
+
+TEST_F(DBCompactionTest, FadeBThresholdAddsDeleteHeavyFileCandidate) {
+  env_->SetMockSleep();
+  Options options = FadeTestOptions(CurrentOptions(), /*dth=*/1000,
+                                    /*num_levels=*/3);
+  options.fade_b_compaction_threshold = 50;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put(Key(i), "value"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+
+  std::atomic<int> fade_compactions{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        if (static_cast<Compaction*>(arg)->compaction_reason() ==
+            CompactionReason::kFadeTtl) {
+          fade_compactions++;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Delete(Key(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_GE(fade_compactions.load(), 1);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBCompactionTest, FadeFilterProbeSkipsNegativeIntermediateLevel) {
+  env_->SetMockSleep();
+  Options options = FadeFilterProbeTestOptions(CurrentOptions());
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put(Key(49), "neighbor"));
+  ASSERT_OK(Put(Key(51), "neighbor"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_OK(Put(Key(50), "deleted"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(3);
+
+  std::atomic<int> fade_output_level{-1};
+  SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        Compaction* compaction = static_cast<Compaction*>(arg);
+        if (compaction->compaction_reason() == CompactionReason::kFadeTtl) {
+          fade_output_level = compaction->output_level();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Delete(Key(50)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(3, fade_output_level.load());
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), Key(50), &value).IsNotFound());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBCompactionTest, FadeFilterProbeKeepsLevelForMatchingLiveKey) {
+  env_->SetMockSleep();
+  Options options = FadeFilterProbeTestOptions(CurrentOptions());
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put(Key(49), "old"));
+  ASSERT_OK(Put(Key(51), "neighbor"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+
+  std::atomic<int> fade_output_level{-1};
+  SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        Compaction* compaction = static_cast<Compaction*>(arg);
+        if (compaction->compaction_reason() == CompactionReason::kFadeTtl) {
+          fade_output_level = compaction->output_level();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put(Key(49), "new"));
+  ASSERT_OK(Delete(Key(50)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(2, fade_output_level.load());
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), Key(49), &value));
+  ASSERT_EQ("new", value);
+  ASSERT_TRUE(db_->Get(ReadOptions(), Key(50), &value).IsNotFound());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBCompactionTest, FadeRoutesPointTombstonesToDifferentLevels) {
+  env_->SetMockSleep();
+  Options options = FadeFilterProbeTestOptions(CurrentOptions());
+  options.fade_filter_probe_enabled = false;
+  options.fade_tombstone_level_routing_enabled = true;
+  options.fade_b_compaction_threshold = 0;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put(Key(20), "old20"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  ASSERT_OK(Put(Key(80), "old80"));
+  ASSERT_OK(Flush());
+  const std::string range_begin = Key(80);
+  const std::string range_end = Key(81);
+  const Slice range_begin_slice(range_begin);
+  const Slice range_end_slice(range_end);
+  for (int level = 0; level < 3; ++level) {
+    ASSERT_OK(dbfull()->TEST_CompactRange(level, &range_begin_slice,
+                                          &range_end_slice));
+  }
+
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_NE(nullptr, snapshot);
+
+  std::atomic<int> routed_tombstone_destination{-1};
+  std::atomic<int> default_output_level{-1};
+  SyncPoint::GetInstance()->SetCallBack(
+      "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+        Compaction* compaction = static_cast<Compaction*>(arg);
+        if (compaction->compaction_reason() == CompactionReason::kFadeTtl &&
+            compaction->start_level() == 0 &&
+            compaction->fade_tombstone_level_routing_enabled() &&
+            !compaction->fade_output_level_configs().empty()) {
+          default_output_level = compaction->output_level();
+          routed_tombstone_destination =
+              compaction->fade_output_level_configs().front().level;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Delete(Key(20)));
+  ASSERT_OK(Put(Key(40), "live40"));
+  ASSERT_OK(Delete(Key(80)));
+  ASSERT_OK(Flush());
+  env_->MockSleepForSeconds(10);
+  ASSERT_OK(Put("zz_fade_trigger", "trigger"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_EQ(3, routed_tombstone_destination.load());
+  ASSERT_EQ(1, default_output_level.load());
+  ReadOptions snapshot_options;
+  snapshot_options.snapshot = snapshot;
+  std::string value;
+  ASSERT_OK(db_->Get(snapshot_options, Key(20), &value));
+  ASSERT_EQ("old20", value);
+  ASSERT_OK(db_->Get(snapshot_options, Key(80), &value));
+  ASSERT_EQ("old80", value);
+  ASSERT_TRUE(db_->Get(ReadOptions(), Key(20), &value).IsNotFound());
+  ASSERT_TRUE(db_->Get(ReadOptions(), Key(80), &value).IsNotFound());
+  ASSERT_OK(db_->Get(ReadOptions(), Key(40), &value));
+  ASSERT_EQ("live40", value);
+
+  bool level1_has_tombstone = false;
+  bool level3_has_tombstone = false;
+  dbfull()->TEST_LockMutex();
+  VersionStorageInfo* vstorage = FadeStorageInfo(db_.get());
+  for (FileMetaData* file : vstorage->LevelFiles(1)) {
+    level1_has_tombstone |= file->num_deletions > 0;
+  }
+  for (FileMetaData* file : vstorage->LevelFiles(3)) {
+    level3_has_tombstone |= file->num_deletions > 0;
+  }
+  dbfull()->TEST_UnlockMutex();
+  ASSERT_TRUE(level1_has_tombstone);
+  ASSERT_TRUE(level3_has_tombstone);
+
+  db_->ReleaseSnapshot(snapshot);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  Reopen(options);
+  ASSERT_TRUE(db_->Get(ReadOptions(), Key(20), &value).IsNotFound());
+  ASSERT_TRUE(db_->Get(ReadOptions(), Key(80), &value).IsNotFound());
+  ASSERT_OK(db_->Get(ReadOptions(), Key(40), &value));
+  ASSERT_EQ("live40", value);
+}
+
+TEST_F(DBCompactionTest, FadeDropsAllNegativePointTombstoneWhenSafe) {
+  Options options = FadeFilterProbeTestOptions(CurrentOptions());
+  options.fade_tombstone_level_routing_enabled = true;
+  options.fade_b_compaction_threshold = 1;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put(Key(10), "unrelated"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_OK(Delete(Key(50)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), Key(50), &value).IsNotFound());
+  ASSERT_OK(db_->Get(ReadOptions(), Key(10), &value));
+  ASSERT_EQ("unrelated", value);
+
+  uint64_t remaining_deletions = 0;
+  dbfull()->TEST_LockMutex();
+  VersionStorageInfo* vstorage = FadeStorageInfo(db_.get());
+  for (int level = 0; level < vstorage->num_levels(); ++level) {
+    for (FileMetaData* file : vstorage->LevelFiles(level)) {
+      remaining_deletions += file->num_deletions;
+    }
+  }
+  dbfull()->TEST_UnlockMutex();
+  ASSERT_EQ(0U, remaining_deletions);
 }
 
 // FADE goes ahead of size-triggered compactions only while no level's

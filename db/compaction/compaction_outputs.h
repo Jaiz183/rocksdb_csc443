@@ -32,31 +32,35 @@ class CompactionOutputs {
   struct Output {
     Output(FileMetaData&& _meta, const InternalKeyComparator& _icmp,
            bool _enable_hash, bool _finished, uint64_t precalculated_hash,
-           bool _is_proximal_level)
+           int _output_level, bool _is_proximal_level)
         : meta(std::move(_meta)),
           validator(_icmp, _enable_hash, precalculated_hash),
           finished(_finished),
+          output_level(_output_level),
           is_proximal_level(_is_proximal_level) {}
     FileMetaData meta;
     OutputValidator validator;
     bool finished;
+    int output_level;
     bool is_proximal_level;
     std::shared_ptr<const TableProperties> table_properties;
   };
 
   CompactionOutputs() = delete;
 
-  explicit CompactionOutputs(const Compaction* compaction,
-                             const bool is_proximal_level);
+  CompactionOutputs(const Compaction* compaction, int output_level,
+                    bool is_proximal_level);
 
   bool IsProximalLevel() const { return is_proximal_level_; }
+  int output_level() const { return output_level_; }
 
   // Add generated output to the list
   void AddOutput(FileMetaData&& meta, const InternalKeyComparator& icmp,
                  bool enable_hash, bool finished = false,
                  uint64_t precalculated_hash = 0) {
     outputs_.emplace_back(std::move(meta), icmp, enable_hash, finished,
-                          precalculated_hash, is_proximal_level_);
+                          precalculated_hash, output_level_,
+                          is_proximal_level_);
   }
 
   const std::vector<Output>& GetOutputs() const { return outputs_; }
@@ -344,6 +348,7 @@ class CompactionOutputs {
   }
 
   const Compaction* compaction_;
+  const int output_level_;
 
   // current output builder and writer
   std::unique_ptr<TableBuilder> builder_;
@@ -441,42 +446,59 @@ class CompactionOutputs {
 // which could be replaced by std::ranges::join_view() in c++20
 struct OutputIterator {
  public:
-  explicit OutputIterator(const std::vector<CompactionOutputs::Output>& a,
-                          const std::vector<CompactionOutputs::Output>& b)
-      : a_(a), b_(b) {
-    within_a = !a_.empty();
-    idx_ = 0;
+  explicit OutputIterator(
+      std::vector<const std::vector<CompactionOutputs::Output>*> outputs)
+      : outputs_(std::move(outputs)) {
+    SkipEmptyOutputs();
   }
 
-  OutputIterator begin() { return *this; }
+  OutputIterator begin() const { return *this; }
 
-  OutputIterator end() { return *this; }
+  OutputIterator end() const {
+    OutputIterator result = *this;
+    result.output_idx_ = result.outputs_.size();
+    result.file_idx_ = 0;
+    return result;
+  }
 
-  size_t size() { return a_.size() + b_.size(); }
+  size_t size() const {
+    size_t result = 0;
+    for (const std::vector<CompactionOutputs::Output>* output : outputs_) {
+      result += output->size();
+    }
+    return result;
+  }
 
   const CompactionOutputs::Output& operator*() const {
-    return within_a ? a_[idx_] : b_[idx_];
+    assert(output_idx_ < outputs_.size());
+    return (*outputs_[output_idx_])[file_idx_];
   }
 
   OutputIterator& operator++() {
-    idx_++;
-    if (within_a && idx_ >= a_.size()) {
-      within_a = false;
-      idx_ = 0;
+    assert(output_idx_ < outputs_.size());
+    ++file_idx_;
+    if (file_idx_ >= outputs_[output_idx_]->size()) {
+      ++output_idx_;
+      file_idx_ = 0;
+      SkipEmptyOutputs();
     }
-    assert(within_a || idx_ <= b_.size());
     return *this;
   }
 
-  bool operator!=(const OutputIterator& /*rhs*/) const {
-    return within_a || idx_ < b_.size();
+  bool operator!=(const OutputIterator& rhs) const {
+    return output_idx_ != rhs.output_idx_ || file_idx_ != rhs.file_idx_;
   }
 
  private:
-  const std::vector<CompactionOutputs::Output>& a_;
-  const std::vector<CompactionOutputs::Output>& b_;
-  bool within_a;
-  size_t idx_;
+  void SkipEmptyOutputs() {
+    while (output_idx_ < outputs_.size() && outputs_[output_idx_]->empty()) {
+      ++output_idx_;
+    }
+  }
+
+  std::vector<const std::vector<CompactionOutputs::Output>*> outputs_;
+  size_t output_idx_ = 0;
+  size_t file_idx_ = 0;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

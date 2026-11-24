@@ -183,8 +183,9 @@ CompressionOptions GetCompressionOptions(const MutableCFOptions& cf_options,
 }
 
 CompactionPicker::CompactionPicker(const ImmutableOptions& ioptions,
-                                   const InternalKeyComparator* icmp)
-    : ioptions_(ioptions), icmp_(icmp) {}
+                                   const InternalKeyComparator* icmp,
+                                   TableCache* table_cache)
+    : ioptions_(ioptions), table_cache_(table_cache), icmp_(icmp) {}
 
 CompactionPicker::~CompactionPicker() = default;
 
@@ -329,7 +330,17 @@ bool CompactionPicker::RangeOverlapWithCompaction(
   for (Compaction* c : compactions_in_progress_) {
     const int largest_cmp = ucmp->CompareWithoutTimestamp(
         largest_user_key, c->GetSmallestUserKey());
-    if (c->output_level() == level &&
+    bool writes_to_level = c->output_level() == level;
+    if (c->fade_tombstone_level_routing_enabled()) {
+      for (const Compaction::FadeOutputLevelConfig& config :
+           c->fade_output_level_configs()) {
+        if (config.level == level) {
+          writes_to_level = true;
+          break;
+        }
+      }
+    }
+    if (writes_to_level &&
         ucmp->CompareWithoutTimestamp(smallest_user_key,
                                       c->GetLargestUserKey()) <= 0 &&
         (range_limit_exclusive ? largest_cmp > 0 : largest_cmp >= 0)) {
@@ -521,9 +532,8 @@ bool CompactionPicker::IsRangeInCompaction(VersionStorageInfo* vstorage,
   return AreFilesInCompaction(inputs);
 }
 
-// Populates the set of inputs of all other levels that overlap with the
-// start level.
-// Now we assume all levels except start level and output level are empty.
+// Populates the set of inputs at the output level that overlap with the start
+// level. Intermediate levels may be non-empty when the output level is deeper.
 // Will also attempt to expand "start level" if that doesn't expand
 // "output level" or cause "level" to include a file for compaction that has an
 // overlapping user-key with another file.
@@ -544,12 +554,6 @@ bool CompactionPicker::SetupOtherInputs(
   if (input_level == output_level) {
     // no possibility of conflict
     return true;
-  }
-
-  // For now, we only support merging two levels, start level and output level.
-  // We need to assert other levels are empty.
-  for (int l = input_level + 1; l < output_level; l++) {
-    assert(vstorage->NumLevelFiles(l) == 0);
   }
 
   InternalKey smallest;
@@ -1237,6 +1241,13 @@ void CompactionPicker::RegisterCompaction(Compaction* c) {
          c->output_level() == 0 ||
          !FilesRangeOverlapWithCompaction(*c->inputs(), c->output_level(),
                                           c->GetProximalLevel()));
+#ifndef NDEBUG
+  for (const Compaction::FadeOutputLevelConfig& config :
+       c->fade_output_level_configs()) {
+    assert(!FilesRangeOverlapWithCompaction(*c->inputs(), config.level,
+                                            Compaction::kInvalidLevel));
+  }
+#endif
   // CompactionReason::kExternalSstIngestion's start level is just a placeholder
   // number without actual meaning as file ingestion technically does not have
   // an input level like other compactions

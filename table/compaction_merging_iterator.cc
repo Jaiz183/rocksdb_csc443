@@ -12,7 +12,7 @@ class CompactionMergingIterator : public InternalIterator {
  public:
   CompactionMergingIterator(
       const InternalKeyComparator* comparator, InternalIterator** children,
-      int n, bool is_arena_mode,
+      int n, const std::vector<int>& input_levels, bool is_arena_mode,
       std::vector<std::pair<std::unique_ptr<TruncatedRangeDelIterator>,
                             std::unique_ptr<TruncatedRangeDelIterator>**>>&
           range_tombstones,
@@ -24,6 +24,8 @@ class CompactionMergingIterator : public InternalIterator {
         pinned_iters_mgr_(nullptr),
         internal_stats_(internal_stats),
         num_sorted_runs_recorded_(0) {
+    assert(input_levels.size() == static_cast<size_t>(n));
+    input_levels_ = input_levels;
     children_.resize(n);
     for (int i = 0; i < n; i++) {
       children_[i].level = i;
@@ -89,6 +91,11 @@ class CompactionMergingIterator : public InternalIterator {
   bool Valid() const override { return current_ != nullptr && status_.ok(); }
 
   Status status() const override { return status_; }
+
+  int GetCurrentLevel() const override {
+    assert(Valid());
+    return input_levels_[current_->level];
+  }
 
   void SeekToFirst() override;
 
@@ -217,6 +224,7 @@ class CompactionMergingIterator : public InternalIterator {
   const InternalKeyComparator* comparator_;
   // HeapItem for all child point iterators.
   std::vector<HeapItem> children_;
+  std::vector<int> input_levels_;
   // HeapItem for range tombstones. pinned_heap_item_[i] corresponds to the
   // current range tombstone from range_tombstone_iters_[i].
   std::vector<HeapItem> pinned_heap_item_;
@@ -380,23 +388,25 @@ void CompactionMergingIterator::AddToMinHeapOrCheckStatus(HeapItem* child) {
 
 InternalIterator* NewCompactionMergingIterator(
     const InternalKeyComparator* comparator, InternalIterator** children, int n,
+    const std::vector<int>& input_levels,
     std::vector<std::pair<std::unique_ptr<TruncatedRangeDelIterator>,
                           std::unique_ptr<TruncatedRangeDelIterator>**>>&
         range_tombstone_iters,
     Arena* arena, InternalStats* stats) {
   assert(n >= 0);
+  assert(input_levels.size() == static_cast<size_t>(n));
   if (n == 0) {
     return NewEmptyInternalIterator<Slice>(arena);
   } else {
     if (arena == nullptr) {
-      return new CompactionMergingIterator(comparator, children, n,
-                                           false /* is_arena_mode */,
-                                           range_tombstone_iters, stats);
+      return new CompactionMergingIterator(
+          comparator, children, n, input_levels, false /* is_arena_mode */,
+          range_tombstone_iters, stats);
     } else {
       auto mem = arena->AllocateAligned(sizeof(CompactionMergingIterator));
-      return new (mem) CompactionMergingIterator(comparator, children, n,
-                                                 true /* is_arena_mode */,
-                                                 range_tombstone_iters, stats);
+      return new (mem) CompactionMergingIterator(
+          comparator, children, n, input_levels, true /* is_arena_mode */,
+          range_tombstone_iters, stats);
     }
   }
 }

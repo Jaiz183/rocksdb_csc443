@@ -18,8 +18,9 @@ namespace ROCKSDB_NAMESPACE {
 class LevelCompactionPicker : public CompactionPicker {
  public:
   LevelCompactionPicker(const ImmutableOptions& ioptions,
-                        const InternalKeyComparator* icmp)
-      : CompactionPicker(ioptions, icmp) {}
+                        const InternalKeyComparator* icmp,
+                        TableCache* table_cache = nullptr)
+      : CompactionPicker(ioptions, icmp, table_cache) {}
   Compaction* PickCompaction(
       const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
       const MutableDBOptions& mutable_db_options,

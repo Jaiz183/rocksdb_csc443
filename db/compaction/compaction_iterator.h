@@ -102,6 +102,9 @@ class SequenceIterWrapper : public InternalIterator {
         need_count_entries_(need_count_entries) {}
   bool Valid() const override { return inner_iter_->Valid(); }
   Status status() const override { return inner_iter_->status(); }
+  int GetCurrentLevel() const override {
+    return inner_iter_->GetCurrentLevel();
+  }
   void Next() override {
     if (!inner_iter_->IsDeleteRangeSentinelKey()) {
       num_itered_++;
@@ -352,6 +355,7 @@ class CompactionIterator {
   const Slice& value() const { return value_; }
   const Status& status() const { return status_; }
   const ParsedInternalKey& ikey() const { return ikey_; }
+  int GetCurrentInputLevel() const { return input_.GetCurrentLevel(); }
   inline bool Valid() const { return validity_info_.IsValid(); }
   const Slice& user_key() const {
     if (UNLIKELY(is_range_del_)) {

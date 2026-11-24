@@ -39,7 +39,7 @@
 #include "rocksdb/table.h"
 #include "rocksdb/table_properties.h"
 
-using namespace ROCKSDB_NAMESPACE;
+namespace ROCKSDB_NAMESPACE {
 
 namespace {
 
@@ -59,6 +59,10 @@ struct Config {
   double read_secs = 10;
   uint64_t rate = 20000;              // target write ops/s, 0 = unpaced
   uint64_t dth = 0;                   // delete_persistence_threshold (s)
+  uint64_t b_threshold = 0;           // min b_f to trigger FADE compaction
+  bool filter_probe = false;          // probe output-level SST filters
+  bool tombstone_route = false;       // route point tombstones per key
+  bool dynamic_level_bytes = true;
   uint64_t seed = 42;
   uint64_t write_buffer = 2 << 20;
   uint64_t level_base = 4 << 20;
@@ -91,6 +95,14 @@ bool ParseArgs(int argc, char** argv, Config* c) {
     else if (k == "read_secs") c->read_secs = std::stod(v);
     else if (k == "rate") c->rate = std::stoull(v);
     else if (k == "dth") c->dth = std::stoull(v);
+    else if (k == "b_threshold")
+      c->b_threshold = std::stoull(v);
+    else if (k == "filter_probe")
+      c->filter_probe = v == "1" || v == "true";
+    else if (k == "tombstone_route")
+      c->tombstone_route = v == "1" || v == "true";
+    else if (k == "dynamic_level_bytes")
+      c->dynamic_level_bytes = v == "1" || v == "true";
     else if (k == "seed") c->seed = std::stoull(v);
     else if (k == "write_buffer") c->write_buffer = std::stoull(v);
     else if (k == "level_base") c->level_base = std::stoull(v);
@@ -203,10 +215,27 @@ class CompactionCounter : public EventListener {
     e.count++;
     e.write_bytes += ci.stats.total_output_bytes;
     e.read_bytes += ci.stats.total_input_bytes;
+    if (ci.compaction_reason == CompactionReason::kFadeTtl) {
+      int deepest_output_level = ci.output_level;
+      for (const CompactionFileInfo& output : ci.output_file_infos) {
+        e.output_level_counts[output.level]++;
+        deepest_output_level = std::max(deepest_output_level, output.level);
+      }
+      if (ci.output_file_infos.empty()) {
+        e.output_level_counts[ci.output_level]++;
+      }
+      if (ci.status.ok()) {
+        e.level_skips_sum += static_cast<uint64_t>(
+            std::max(0, deepest_output_level - ci.output_level - 1));
+        e.level_skips_compactions++;
+      }
+    }
     if (ci.stats.num_input_files_trivially_moved > 0) e.trivial_moves++;
   }
   struct Entry {
     uint64_t count = 0, trivial_moves = 0, write_bytes = 0, read_bytes = 0;
+    uint64_t level_skips_sum = 0, level_skips_compactions = 0;
+    std::map<int, uint64_t> output_level_counts;
   };
   std::map<std::string, Entry> Snapshot() {
     std::lock_guard<std::mutex> l(mu_);
@@ -354,6 +383,7 @@ Options MakeOptions(const Config& c, std::shared_ptr<CompactionCounter> cc) {
   o.max_bytes_for_level_base = c.level_base;
   o.target_file_size_base = c.target_file;
   o.max_bytes_for_level_multiplier = c.ratio;
+  o.level_compaction_dynamic_level_bytes = c.dynamic_level_bytes;
   o.level0_file_num_compaction_trigger = 4;
   o.max_background_jobs = c.bg_jobs;
   o.compression = kNoCompression;
@@ -363,9 +393,14 @@ Options MakeOptions(const Config& c, std::shared_ptr<CompactionCounter> cc) {
       std::make_shared<TombstoneCollectorFactory>());
 #ifndef FADE_BENCH_NO_FADE
   o.delete_persistence_threshold = c.dth;
+  o.fade_b_compaction_threshold = c.b_threshold;
+  o.fade_filter_probe_enabled = c.filter_probe;
+  o.fade_tombstone_level_routing_enabled = c.tombstone_route;
 #else
-  if (c.dth != 0) {
-    fprintf(stderr, "this build has no FADE; dth must be 0\n");
+  if (c.dth != 0 || c.tombstone_route) {
+    fprintf(
+        stderr,
+        "this build has no FADE; dth and tombstone_route must be disabled\n");
     exit(2);
   }
 #endif
@@ -378,7 +413,7 @@ Options MakeOptions(const Config& c, std::shared_ptr<CompactionCounter> cc) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int BenchMain(int argc, char** argv) {
   Config c;
   if (!ParseArgs(argc, argv, &c)) return 2;
   std::mt19937_64 rng(c.seed);
@@ -501,9 +536,12 @@ int main(int argc, char** argv) {
   double rcpu0 = CpuSec();
   double rt0 = NowSec();
   uint64_t gets = 0, scans = 0, scan_keys = 0;
+  uint64_t get_block_reads = 0, get_block_cache_hits = 0;
+  uint64_t get_block_read_bytes = 0;
   {
     ReadOptions ro;
     std::string v;
+    get_perf_context()->Reset();
     double half = rt0 + c.read_secs / 2;
     while (NowSec() < half) {
       for (int i = 0; i < 100; i++, gets++) {
@@ -512,6 +550,9 @@ int main(int argc, char** argv) {
       }
     }
     double get_end = NowSec();
+    get_block_reads = get_perf_context()->block_read_count;
+    get_block_cache_hits = get_perf_context()->block_cache_hit_count;
+    get_block_read_bytes = get_perf_context()->block_read_byte;
     uint64_t get_tomb_skip = get_perf_context()->internal_delete_skipped_count;
     (void)get_tomb_skip;
     get_perf_context()->Reset();
@@ -568,19 +609,31 @@ int main(int argc, char** argv) {
   auto creasons = cc->Snapshot();
   std::string reasons;
   uint64_t fade_count = 0, fade_wbytes = 0;
+  uint64_t fade_level_skips_sum = 0, fade_level_skips_compactions = 0;
+  std::string fade_output_levels;
   for (auto& kv : creasons) {
     reasons += kv.first + ":" + std::to_string(kv.second.count) + "/" +
                std::to_string(kv.second.trivial_moves) + "tm ";
     if (kv.first == "FadeTtl") {
       fade_count = kv.second.count;
       fade_wbytes = kv.second.write_bytes;
+      fade_level_skips_sum = kv.second.level_skips_sum;
+      fade_level_skips_compactions = kv.second.level_skips_compactions;
+      for (const auto& level_count : kv.second.output_level_counts) {
+        if (!fade_output_levels.empty()) fade_output_levels += ";";
+        fade_output_levels += "L" + std::to_string(level_count.first) + ":" +
+                              std::to_string(level_count.second);
+      }
     }
   }
 
   double wamp = user_bytes ? static_cast<double>(flush_w + comp_w) / user_bytes : 0;
   double samp = logical_bytes ? static_cast<double>(final_ts.sst_bytes) / logical_bytes : 0;
 
-  printf("== %s dth=%" PRIu64 " ==\n", c.label.c_str(), c.dth);
+  printf("== %s dth=%" PRIu64 " b_threshold=%" PRIu64
+         " filter_probe=%d tombstone_route=%d dynamic_level_bytes=%d ==\n",
+         c.label.c_str(), c.dth, c.b_threshold, c.filter_probe ? 1 : 0,
+         c.tombstone_route ? 1 : 0, c.dynamic_level_bytes ? 1 : 0);
   printf("ops put=%" PRIu64 " del=%" PRIu64 " rdel=%" PRIu64
          " wall=%.1fs thr=%.0f ops/s cpu=%.1fs (%.2f us/op)\n",
          n_put, n_del, n_rdel, write_wall, ops / write_wall, write_cpu,
@@ -591,6 +644,13 @@ int main(int argc, char** argv) {
          user_bytes / 1e6, wamp);
   printf("compactions %s| fade=%" PRIu64 " fade_w=%.1fMB\n", reasons.c_str(),
          fade_count, fade_wbytes / 1e6);
+  printf("fade_output_levels=%s\n", fade_output_levels.c_str());
+  printf("fade_avg_level_skips=%.3f (%" PRIu64 " successful compactions)\n",
+         fade_level_skips_compactions
+             ? static_cast<double>(fade_level_skips_sum) /
+                   fade_level_skips_compactions
+             : 0.0,
+         fade_level_skips_compactions);
   printf("tombstones max_age(write)=%.1fs max_age(read/idle)=%.1fs "
          "viol_samples=%" PRIu64 "/%" PRIu64 " avg_live=%.0f max_live=%" PRIu64
          " final_live=%" PRIu64 "\n",
@@ -604,6 +664,13 @@ int main(int argc, char** argv) {
          gets / (c.read_secs / 2), scans / (c.read_secs / 2),
          scans ? static_cast<double>(scan_keys) / scans : 0.0, read_cpu,
          scan_del_skipped, scan_rdel_skipped);
+  printf(
+      "read_amp point_get_blocks_touched/get=%.4f "
+      "block_reads/get=%.4f block_read_bytes/get=%.1f\n",
+      gets ? static_cast<double>(get_block_reads + get_block_cache_hits) / gets
+           : 0.0,
+      gets ? static_cast<double>(get_block_reads) / gets : 0.0,
+      gets ? static_cast<double>(get_block_read_bytes) / gets : 0.0);
   printf("verify before_reopen=%s after_reopen=%s %s %s\n", ok1 ? "OK" : "FAIL",
          ok2 ? "OK" : "FAIL", err.c_str(), err2.c_str());
   (void)read_wall;
@@ -632,34 +699,62 @@ int main(int argc, char** argv) {
       fseek(f, 0, SEEK_END);
       if (ftell(f) == 0) {
         fprintf(f,
-                "label,dth,rate,put_frac,range_del_frac,hot_frac,ops,write_wall,"
+                "label,dth,b_threshold,filter_probe,tombstone_route,"
+                "dynamic_level_bytes,rate,put_"
+                "frac,range_del_"
+                "frac,hot_frac,"
+                "ops,write_wall,"
                 "throughput,cpu_s,cpu_us_per_op,flush_w_mb,comp_w_mb,comp_r_mb,"
                 "user_mb,wa,compactions,fade_compactions,fade_w_mb,"
                 "max_tomb_age_write,max_tomb_age_idle,viol_samples,"
                 "write_samples,avg_live_dels,final_live_dels,sst_mb,logical_mb,"
-                "sa,gets_per_s,scans_per_s,scan_tomb_skipped,verify\n");
+                "sa,gets_per_s,scans_per_s,get_blocks_touched_per_get,"
+                "get_block_reads_per_get,get_block_read_bytes_per_get,"
+                "scan_tomb_skipped,verify,fade_output_levels,"
+                "fade_avg_level_skips,fade_skip_compactions\n");
       }
       uint64_t total_comp = 0;
       for (auto& kv : creasons) total_comp += kv.second.count;
-      fprintf(f,
-              "%s,%" PRIu64 ",%" PRIu64 ",%.2f,%.3f,%.2f,%" PRIu64
-              ",%.1f,%.0f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.3f,%" PRIu64
-              ",%" PRIu64 ",%.1f,%.1f,%.1f,%" PRIu64 ",%" PRIu64
-              ",%.0f,%" PRIu64 ",%.1f,%.1f,%.3f,%.0f,%.0f,%" PRIu64 ",%s\n",
-              c.label.c_str(), c.dth, c.rate, c.put_frac, c.range_del_frac,
-              c.hot_frac, ops, write_wall, ops / write_wall, write_cpu,
-              write_cpu * 1e6 / ops, flush_w / 1e6, comp_w / 1e6, comp_r / 1e6,
-              user_bytes / 1e6, wamp, total_comp, fade_count, fade_wbytes / 1e6,
-              max_age_write, max_age_read, viol_samples, write_samples,
-              write_samples ? sum_live_dels / write_samples : 0.0,
-              final_ts.live_dels, final_ts.sst_bytes / 1e6,
-              logical_bytes / 1e6, samp, gets / (c.read_secs / 2),
-              scans / (c.read_secs / 2), scan_del_skipped,
-              (ok1 && ok2) ? "OK" : "FAIL");
+      fprintf(
+          f,
+          "%s,%" PRIu64 ",%" PRIu64 ",%d,%d,%d,%" PRIu64
+          ",%.2f,%.3f,%.2f,%" PRIu64
+          ",%.1f,%.0f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.3f,%" PRIu64 ",%" PRIu64
+          ",%.1f,%.1f,%.1f,%" PRIu64 ",%" PRIu64 ",%.0f,%" PRIu64
+          ",%.1f,%.1f,%.3f,%.0f,%.0f,%.4f,%.4f,%.1f,%" PRIu64
+          ",%s,%s,%.3f,%" PRIu64 "\n",
+          c.label.c_str(), c.dth, c.b_threshold, c.filter_probe ? 1 : 0,
+          c.tombstone_route ? 1 : 0, c.dynamic_level_bytes ? 1 : 0, c.rate,
+          c.put_frac, c.range_del_frac, c.hot_frac, ops, write_wall,
+          ops / write_wall, write_cpu, write_cpu * 1e6 / ops, flush_w / 1e6,
+          comp_w / 1e6, comp_r / 1e6, user_bytes / 1e6, wamp, total_comp,
+          fade_count, fade_wbytes / 1e6, max_age_write, max_age_read,
+          viol_samples, write_samples,
+          write_samples ? sum_live_dels / write_samples : 0.0,
+          final_ts.live_dels, final_ts.sst_bytes / 1e6, logical_bytes / 1e6,
+          samp, gets / (c.read_secs / 2), scans / (c.read_secs / 2),
+          gets ? static_cast<double>(get_block_reads + get_block_cache_hits) /
+                     gets
+               : 0.0,
+          gets ? static_cast<double>(get_block_reads) / gets : 0.0,
+          gets ? static_cast<double>(get_block_read_bytes) / gets : 0.0,
+          scan_del_skipped, (ok1 && ok2) ? "OK" : "FAIL",
+          fade_output_levels.c_str(),
+          fade_level_skips_compactions
+              ? static_cast<double>(fade_level_skips_sum) /
+                    fade_level_skips_compactions
+              : 0.0,
+          fade_level_skips_compactions);
       fclose(f);
     }
   }
   dbh.reset();
   DestroyDB(c.db, opts);
   return (ok1 && ok2) ? 0 : 1;
+}
+
+}  // namespace ROCKSDB_NAMESPACE
+
+int main(int argc, char** argv) {
+  return ROCKSDB_NAMESPACE::BenchMain(argc, argv);
 }

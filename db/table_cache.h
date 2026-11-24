@@ -162,6 +162,12 @@ class TableCache {
                          bool skip_filters = false, int level = -1,
                          size_t max_file_size_for_l0_meta_pin = 0);
 
+  Status KeyMayMatch(const ReadOptions& options,
+                     const InternalKeyComparator& internal_comparator,
+                     const FileMetaData& file_meta, const Slice& user_key,
+                     const MutableCFOptions& mutable_cf_options, int level,
+                     bool* may_match);
+
   // Return the range delete tombstone iterator of the file specified by
   // `file_meta`.
   Status GetRangeTombstoneIterator(

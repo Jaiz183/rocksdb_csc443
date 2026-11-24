@@ -32,6 +32,7 @@ namespace ROCKSDB_NAMESPACE {
 class LogBuffer;
 class Compaction;
 class VersionStorageInfo;
+class TableCache;
 struct CompactionInputFiles;
 
 // An abstract class to pick compactions from an existing LSM-tree.
@@ -48,7 +49,8 @@ struct CompactionInputFiles;
 class CompactionPicker {
  public:
   CompactionPicker(const ImmutableOptions& ioptions,
-                   const InternalKeyComparator* icmp);
+                   const InternalKeyComparator* icmp,
+                   TableCache* table_cache = nullptr);
   virtual ~CompactionPicker();
 
   // Pick level and inputs for a new compaction.
@@ -248,9 +250,11 @@ class CompactionPicker {
   }
 
   const InternalKeyComparator* icmp() const { return icmp_; }
+  TableCache* table_cache() const { return table_cache_; }
 
  protected:
   const ImmutableOptions& ioptions_;
+  TableCache* table_cache_;
 
   // A helper function to SanitizeAndConvertCompactionInputFiles() that
   // sanitizes "input_files" by adding necessary files.

@@ -78,6 +78,13 @@ class TableReader {
                        allow_unprepared_value);
   }
 
+  // Return false only when the table's filter can rule out user_key.
+  virtual bool KeyMayMatch(const ReadOptions& /*read_options*/,
+                           const Slice& /*user_key*/,
+                           const SliceTransform* /*prefix_extractor*/) {
+    return true;
+  }
+
   // read_options.snapshot needs to outlive this call.
   virtual FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
       const ReadOptions& /*read_options*/) {

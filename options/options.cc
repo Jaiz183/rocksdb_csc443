@@ -93,6 +93,10 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       disallow_memtable_writes(options.disallow_memtable_writes),
       ttl(options.ttl),
       delete_persistence_threshold(options.delete_persistence_threshold),
+      fade_b_compaction_threshold(options.fade_b_compaction_threshold),
+      fade_filter_probe_enabled(options.fade_filter_probe_enabled),
+      fade_tombstone_level_routing_enabled(
+          options.fade_tombstone_level_routing_enabled),
       periodic_compaction_seconds(options.periodic_compaction_seconds),
       sample_for_compression(options.sample_for_compression),
       last_level_temperature(options.last_level_temperature),
@@ -427,6 +431,12 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log,
                    "             Options.delete_persistence_threshold: %" PRIu64,
                    delete_persistence_threshold);
+  ROCKS_LOG_HEADER(log, "        Options.fade_b_compaction_threshold: %" PRIu64,
+                   fade_b_compaction_threshold);
+  ROCKS_LOG_HEADER(log, "             Options.fade_filter_probe_enabled: %d",
+                   fade_filter_probe_enabled);
+  ROCKS_LOG_HEADER(log, "   Options.fade_tombstone_level_routing_enabled: %d",
+                   fade_tombstone_level_routing_enabled);
   ROCKS_LOG_HEADER(log,
                    "         Options.periodic_compaction_seconds: %" PRIu64,
                    periodic_compaction_seconds);

@@ -212,6 +212,9 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
                                        bool allow_unprepared_value,
                                        const Slice& seek_target) override;
 
+  bool KeyMayMatch(const ReadOptions& read_options, const Slice& user_key,
+                   const SliceTransform* prefix_extractor) override;
+
   FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
       const ReadOptions& read_options) override;
 

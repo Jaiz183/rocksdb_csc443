@@ -130,6 +130,9 @@ class InternalIteratorBase : public Cleanable {
   // satisfied without doing some IO, then this returns Status::Incomplete().
   virtual Status status() const = 0;
 
+  // Return the input level for the current entry when known.
+  virtual int GetCurrentLevel() const { return -1; }
+
   // For some types of iterators, sometimes Seek()/Next()/SeekForPrev()/etc may
   // load key but not value (to avoid the IO cost of reading the value from disk
   // if it won't be not needed). This method loads the value in such situation.

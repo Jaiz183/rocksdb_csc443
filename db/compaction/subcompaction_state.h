@@ -23,10 +23,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// Maintains state and outputs for each sub-compaction
-// It contains 2 `CompactionOutputs`:
-//  1. one for the normal output files
-//  2. another for the proximal level outputs
+// Maintains state and output groups for each sub-compaction. It contains output
+// groups for the normal level, optional proximal level, and additional FADE
+// destination levels.
 // a `current` pointer maintains the current output group, when calling
 // `AddToOutput()`, it checks the output of the current compaction_iterator key
 // and point `current` to the target output group. By default, it just points to
@@ -77,8 +76,7 @@ class SubcompactionState {
 
   Slice LargestUserKey() const;
 
-  // Get all outputs from the subcompaction. For per_key_placement compaction,
-  // it returns both the last level outputs and proximal level outputs.
+  // Get all outputs from the subcompaction, including additional FADE levels.
   OutputIterator GetOutputs() const;
 
   // Get mutable access to outputs for post-processing (e.g., retrieving
@@ -88,6 +86,9 @@ class SubcompactionState {
   }
   std::vector<CompactionOutputs::Output>& GetMutableProximalOutputs() {
     return proximal_level_outputs_.GetMutableOutputs();
+  }
+  std::vector<std::unique_ptr<CompactionOutputs>>& GetMutableFadeOutputs() {
+    return fade_outputs_;
   }
 
   // Assign range dels aggregator. The various tombstones will potentially
@@ -102,6 +103,11 @@ class SubcompactionState {
   void RemoveLastEmptyOutput() {
     compaction_outputs_.RemoveLastEmptyOutput();
     proximal_level_outputs_.RemoveLastEmptyOutput();
+    for (const std::unique_ptr<CompactionOutputs>& outputs : fade_outputs_) {
+      if (outputs) {
+        outputs->RemoveLastEmptyOutput();
+      }
+    }
   }
 
   // Cleanup output builders for abandoning in-progress files.
@@ -109,6 +115,11 @@ class SubcompactionState {
     compaction_outputs_.Cleanup();
     if (compaction->SupportsPerKeyPlacement()) {
       proximal_level_outputs_.Cleanup();
+    }
+    for (const std::unique_ptr<CompactionOutputs>& outputs : fade_outputs_) {
+      if (outputs) {
+        outputs->Cleanup();
+      }
     }
   }
 
@@ -140,8 +151,13 @@ class SubcompactionState {
         start(_start),
         end(_end),
         sub_job_id(_sub_job_id),
-        compaction_outputs_(c, /*is_proximal_level=*/false),
-        proximal_level_outputs_(c, /*is_proximal_level=*/true) {
+        compaction_outputs_(c, c->output_level(),
+                            /*is_proximal_level=*/false),
+        proximal_level_outputs_(c, c->GetProximalLevel(),
+                                /*is_proximal_level=*/true),
+        fade_outputs_(c->fade_tombstone_level_routing_enabled()
+                          ? static_cast<size_t>(c->number_levels())
+                          : 0) {
     assert(compaction != nullptr);
     // Set output split key (used for RoundRobin feature) only for normal
     // compaction_outputs, output to proximal_level feature doesn't support
@@ -163,11 +179,21 @@ class SubcompactionState {
         sub_job_id(state.sub_job_id),
         compaction_outputs_(std::move(state.compaction_outputs_)),
         proximal_level_outputs_(std::move(state.proximal_level_outputs_)),
+        fade_outputs_(std::move(state.fade_outputs_)),
         range_del_agg_(std::move(state.range_del_agg_)),
         blob_garbage_checkpoint_(std::move(state.blob_garbage_checkpoint_)) {
-    current_outputs_ = state.current_outputs_ == &state.proximal_level_outputs_
-                           ? &proximal_level_outputs_
-                           : &compaction_outputs_;
+    current_outputs_ = &compaction_outputs_;
+    if (state.current_outputs_ == &state.proximal_level_outputs_) {
+      current_outputs_ = &proximal_level_outputs_;
+    } else {
+      for (size_t level = 0; level < fade_outputs_.size(); ++level) {
+        if (fade_outputs_[level] &&
+            state.current_outputs_ == fade_outputs_[level].get()) {
+          current_outputs_ = fade_outputs_[level].get();
+          break;
+        }
+      }
+    }
   }
   SubcompactionState& operator=(SubcompactionState&&) = delete;
 
@@ -175,11 +201,8 @@ class SubcompactionState {
 
   // Add all the new files from this compaction to version_edit
   void AddOutputsEdit(VersionEdit* out_edit) const {
-    for (const auto& file : proximal_level_outputs_.outputs_) {
-      out_edit->AddFile(compaction->GetProximalLevel(), file.meta);
-    }
-    for (const auto& file : compaction_outputs_.outputs_) {
-      out_edit->AddFile(compaction->output_level(), file.meta);
+    for (const auto& output : GetOutputs()) {
+      out_edit->AddFile(output.output_level, output.meta);
     }
   }
 
@@ -195,8 +218,16 @@ class SubcompactionState {
 
   // Returns true if either output level still has an open output file.
   bool HasUnfinishedOutputFile() const {
-    return compaction_outputs_.HasUnfinishedOutput() ||
-           proximal_level_outputs_.HasUnfinishedOutput();
+    if (compaction_outputs_.HasUnfinishedOutput() ||
+        proximal_level_outputs_.HasUnfinishedOutput()) {
+      return true;
+    }
+    for (const std::unique_ptr<CompactionOutputs>& outputs : fade_outputs_) {
+      if (outputs && outputs->HasUnfinishedOutput()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   CompactionOutputs* Outputs(bool is_proximal_level) {
@@ -206,6 +237,25 @@ class SubcompactionState {
       return &proximal_level_outputs_;
     }
     return &compaction_outputs_;
+  }
+
+  CompactionOutputs* OutputsForLevel(int output_level) {
+    assert(compaction);
+    if (output_level == compaction->output_level()) {
+      return &compaction_outputs_;
+    }
+    if (compaction->SupportsPerKeyPlacement() &&
+        output_level == compaction->GetProximalLevel()) {
+      return &proximal_level_outputs_;
+    }
+    assert(compaction->fade_tombstone_level_routing_enabled());
+    assert(output_level >= 0 &&
+           output_level < static_cast<int>(fade_outputs_.size()));
+    if (!fade_outputs_[output_level]) {
+      fade_outputs_[output_level] = std::make_unique<CompactionOutputs>(
+          compaction, output_level, /*is_proximal_level=*/false);
+    }
+    return fade_outputs_[output_level].get();
   }
 
   // Per-level stats for the output
@@ -222,6 +272,11 @@ class SubcompactionState {
     uint64_t rv = compaction_outputs_.GetWorkerCPUMicros();
     if (compaction->SupportsPerKeyPlacement()) {
       rv += proximal_level_outputs_.GetWorkerCPUMicros();
+    }
+    for (const std::unique_ptr<CompactionOutputs>& outputs : fade_outputs_) {
+      if (outputs) {
+        rv += outputs->GetWorkerCPUMicros();
+      }
     }
     return rv;
   }
@@ -245,7 +300,7 @@ class SubcompactionState {
   }
 
   // Add compaction_iterator key/value to the `Current` output group.
-  Status AddToOutput(CompactionIterator& iter, bool use_proximal_output,
+  Status AddToOutput(CompactionIterator& iter, int output_level,
                      const CompactionFileOpenFunc& open_file_func,
                      const CompactionFileCloseFunc& close_file_func,
                      const ParsedInternalKey& prev_iter_output_internal_key);
@@ -274,6 +329,14 @@ class SubcompactionState {
     }
     s = compaction_outputs_.CloseOutput(s, range_del_agg_.get(), open_file_func,
                                         close_file_func);
+    if (compaction->fade_tombstone_level_routing_enabled()) {
+      for (const std::unique_ptr<CompactionOutputs>& outputs : fade_outputs_) {
+        if (outputs) {
+          s = outputs->CloseOutput(s, range_del_agg_.get(), open_file_func,
+                                   close_file_func);
+        }
+      }
+    }
     return s;
   }
 
@@ -281,6 +344,7 @@ class SubcompactionState {
   // State kept for output being generated
   CompactionOutputs compaction_outputs_;
   CompactionOutputs proximal_level_outputs_;
+  std::vector<std::unique_ptr<CompactionOutputs>> fade_outputs_;
   CompactionOutputs* current_outputs_ = &compaction_outputs_;
   std::unique_ptr<CompactionRangeDelAggregator> range_del_agg_;
   std::unique_ptr<BlobGarbageMeter> blob_garbage_checkpoint_;

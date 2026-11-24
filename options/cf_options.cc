@@ -616,6 +616,19 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct MutableCFOptions, delete_persistence_threshold),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"fade_b_compaction_threshold",
+         {offsetof(struct MutableCFOptions, fade_b_compaction_threshold),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"fade_filter_probe_enabled",
+         {offsetof(struct MutableCFOptions, fade_filter_probe_enabled),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"fade_tombstone_level_routing_enabled",
+         {offsetof(struct MutableCFOptions,
+                   fade_tombstone_level_routing_enabled),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"periodic_compaction_seconds",
          {offsetof(struct MutableCFOptions, periodic_compaction_seconds),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -1299,6 +1312,12 @@ void MutableCFOptions::Dump(Logger* log) const {
   ROCKS_LOG_INFO(log,
                  "             delete_persistence_threshold: %" PRIu64,
                  delete_persistence_threshold);
+  ROCKS_LOG_INFO(log, "        fade_b_compaction_threshold: %" PRIu64,
+                 fade_b_compaction_threshold);
+  ROCKS_LOG_INFO(log, "             fade_filter_probe_enabled: %d",
+                 fade_filter_probe_enabled);
+  ROCKS_LOG_INFO(log, "   fade_tombstone_level_routing_enabled: %d",
+                 fade_tombstone_level_routing_enabled);
   ROCKS_LOG_INFO(log, "              periodic_compaction_seconds: %" PRIu64,
                  periodic_compaction_seconds);
   ROCKS_LOG_INFO(log, "    read_triggered_compaction_threshold: %f",

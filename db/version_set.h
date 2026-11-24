@@ -240,7 +240,8 @@ class VersionStorageInfo {
 
   // [FADE] Computes the per-level cumulative tombstone deadlines
   // (fade_level_deadline_) from delete_persistence_threshold and collects the
-  // files whose oldest tombstone has outlived its level's deadline into
+  // files whose oldest tombstone has outlived its level's deadline or whose
+  // estimated invalidated entries meet fade_b_compaction_threshold into
   // fade_expired_files_, ordered for FADE's delete-driven (DD) file selection.
   // Called by ComputeCompactionScore().
   void ComputeFadeExpiredFiles(const ImmutableOptions& ioptions,

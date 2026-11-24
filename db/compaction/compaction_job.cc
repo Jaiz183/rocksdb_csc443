@@ -1196,6 +1196,12 @@ Status CompactionJob::VerifyOutputFiles() {
           };
       apply_metadata(subcompaction_state.GetMutableCompactionOutputs());
       apply_metadata(subcompaction_state.GetMutableProximalOutputs());
+      for (const std::unique_ptr<CompactionOutputs>& outputs :
+           subcompaction_state.GetMutableFadeOutputs()) {
+        if (outputs) {
+          apply_metadata(outputs->GetMutableOutputs());
+        }
+      }
     }
   };
   for (size_t i = 1; i < compact_->sub_compact_states.size(); i++) {
@@ -1572,6 +1578,10 @@ void CompactionJob::NotifyOnSubcompactionCompleted(
 }
 
 bool CompactionJob::ShouldUseLocalCompaction(SubcompactionState* sub_compact) {
+  if (sub_compact->compaction->fade_tombstone_level_routing_enabled()) {
+    // The remote result format cannot represent arbitrary output levels.
+    return true;
+  }
   if (sub_compact->compaction->RepairsMissingBlobReferences()) {
     // Remote workers do not receive skip_missing_blob_files, and result
     // validation rejects garbage updates for blob files absent from the
@@ -1949,6 +1959,9 @@ Status CompactionJob::ProcessKeyValue(
 
     const auto& ikey = c_iter->ikey();
     bool use_proximal_output = ikey.sequence > proximal_after_seqno_;
+    int output_level = use_proximal_output
+                           ? sub_compact->compaction->GetProximalLevel()
+                           : sub_compact->compaction->output_level();
 
 #ifndef NDEBUG
     if (sub_compact->compaction->SupportsPerKeyPlacement()) {
@@ -1957,6 +1970,9 @@ Status CompactionJob::ProcessKeyValue(
                                      ikey.sequence, use_proximal_output);
       TEST_SYNC_POINT_CALLBACK("CompactionIterator::PrepareOutput.context",
                                &context);
+      output_level = use_proximal_output
+                         ? sub_compact->compaction->GetProximalLevel()
+                         : sub_compact->compaction->output_level();
       if (use_proximal_output) {
         // Verify that entries sent to the proximal level are within the
         // allowed range (because the input key range of the last level could
@@ -1975,13 +1991,26 @@ Status CompactionJob::ProcessKeyValue(
     }
 #endif  // NDEBUG
 
+    if (sub_compact->compaction->fade_tombstone_level_routing_enabled()) {
+      const int current_input_level = c_iter->GetCurrentInputLevel();
+      if (current_input_level > sub_compact->compaction->start_level()) {
+        output_level = current_input_level;
+      } else if (current_input_level ==
+                     sub_compact->compaction->start_level() &&
+                 (ikey.type == kTypeDeletion ||
+                  ikey.type == kTypeDeletionWithTimestamp)) {
+        output_level =
+            sub_compact->compaction->FadeTombstoneOutputLevel(ikey.user_key);
+      }
+    }
+
     // Add current compaction_iterator key to target compaction output, if the
     // output file needs to be close or open, it will call the `open_file_func`
     // and `close_file_func`.
     // TODO: it would be better to have the compaction file open/close moved
     // into `CompactionOutputs` which has the output file information.
-    status = sub_compact->AddToOutput(*c_iter, use_proximal_output,
-                                      open_file_func, close_file_func,
+    status = sub_compact->AddToOutput(*c_iter, output_level, open_file_func,
+                                      close_file_func,
                                       prev_iter_output_internal_key);
     if (!status.ok()) {
       break;
@@ -2930,8 +2959,8 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
 
   // Pass temperature of the last level files to FileSystem.
   FileOptions fo_copy = file_options_;
-  auto temperature =
-      sub_compact->compaction->GetOutputTemperature(outputs.IsProximalLevel());
+  auto temperature = sub_compact->compaction->GetOutputTemperatureForLevel(
+      outputs.output_level());
   fo_copy.temperature = temperature;
   fo_copy.open_contract = FileOpenContract::kNoReopenForWrite |
                           FileOpenContract::kNoReadersWhileOpenForWrite;
@@ -3002,8 +3031,9 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
   uint64_t epoch_number = sub_compact->compaction->MinInputFileEpochNumber();
   {
     FileMetaData meta;
-    meta.fd = FileDescriptor(file_number,
-                             sub_compact->compaction->output_path_id(), 0);
+    meta.fd = FileDescriptor(
+        file_number,
+        sub_compact->compaction->output_path_id(outputs.output_level()), 0);
     meta.oldest_ancestor_time = oldest_ancestor_time;
     meta.file_creation_time = current_time;
     meta.db_ownership_start_time = current_time;
@@ -3041,8 +3071,9 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
   // with the very same value will be ignored by the fs.
   writable_file->SetWriteLifeTimeHint(fo_copy.write_hint);
   FileTypeSet tmp_set = db_options_.checksum_handoff_file_types;
-  writable_file->SetPreallocationBlockSize(static_cast<size_t>(
-      sub_compact->compaction->OutputFilePreallocationSize()));
+  writable_file->SetPreallocationBlockSize(
+      static_cast<size_t>(sub_compact->compaction->OutputFilePreallocationSize(
+          outputs.output_level())));
   const auto& listeners =
       sub_compact->compaction->immutable_options().listeners;
   outputs.AssignFileWriter(new WritableFileWriter(
@@ -3059,12 +3090,13 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
       cfd->ioptions(), sub_compact->compaction->mutable_cf_options(),
       read_options, write_options, cfd->internal_comparator(),
       cfd->internal_tbl_prop_coll_factories(),
-      sub_compact->compaction->output_compression(),
-      sub_compact->compaction->output_compression_opts(), cfd->GetID(),
-      cfd->GetName(), sub_compact->compaction->output_level(), newest_key_time,
+      sub_compact->compaction->output_compression(outputs.output_level()),
+      sub_compact->compaction->output_compression_opts(outputs.output_level()),
+      cfd->GetID(), cfd->GetName(), outputs.output_level(), newest_key_time,
       bottommost_level_, TableFileCreationReason::kCompaction,
       0 /* oldest_key_time */, db_id_, db_session_id_,
-      sub_compact->compaction->max_output_file_size(), file_number,
+      sub_compact->compaction->max_output_file_size(outputs.output_level()),
+      file_number,
       proximal_after_seqno_ /*last_level_inclusive_max_seqno_threshold*/,
       dbname_ /*db_name*/, IsRemoteCompaction() /*is_remote_compaction*/);
 

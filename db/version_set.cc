@@ -4158,7 +4158,12 @@ void VersionStorageInfo::ComputeFadeExpiredFiles(
         continue;
       }
       // a_max = now - tombstone_time
-      if (current_time - tombstone_time > deadline) {
+      const bool ttl_expired = current_time - tombstone_time > deadline;
+      const bool high_invalidated_entries =
+          mutable_cf_options.fade_b_compaction_threshold > 0 &&
+          f->FadeInvalidatedEntriesEstimate() >=
+              mutable_cf_options.fade_b_compaction_threshold;
+      if (ttl_expired || high_invalidated_entries) {
         fade_expired_files_.emplace_back(level, f);
       }
     }
@@ -8830,6 +8835,7 @@ InternalIterator* VersionSet::MakeInputIterator(
   std::vector<std::pair<std::unique_ptr<TruncatedRangeDelIterator>,
                         std::unique_ptr<TruncatedRangeDelIterator>**>>
       range_tombstones;
+  std::vector<int> input_levels;
   size_t num = 0;
   [[maybe_unused]] size_t num_input_files = 0;
   const TableCacheOpenOptions table_cache_open_options =
@@ -8876,6 +8882,7 @@ InternalIterator* VersionSet::MakeInputIterator(
               /*file_open_metadata=*/nullptr, table_cache_open_options);
           range_tombstones.emplace_back(std::move(range_tombstone_iter),
                                         nullptr);
+          input_levels.push_back(static_cast<int>(c->level(which)));
         }
       } else {
         // Create concatenating iterator for the files from this level
@@ -8891,6 +8898,7 @@ InternalIterator* VersionSet::MakeInputIterator(
             kMaxSequenceNumber, db_options_->statistics.get(), clock_,
             open_ephemeral_table_reader);
         range_tombstones.emplace_back(nullptr, tombstone_iter_ptr);
+        input_levels.push_back(static_cast<int>(c->level(which)));
       }
     }
   }
@@ -8900,7 +8908,7 @@ InternalIterator* VersionSet::MakeInputIterator(
   assert(num <= space);
   InternalIterator* result = NewCompactionMergingIterator(
       &c->column_family_data()->internal_comparator(), list,
-      static_cast<int>(num), range_tombstones, /*arena=*/nullptr,
+      static_cast<int>(num), input_levels, range_tombstones, /*arena=*/nullptr,
       c->column_family_data()->internal_stats());
   delete[] list;
   return result;

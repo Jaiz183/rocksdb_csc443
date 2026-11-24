@@ -27,6 +27,7 @@
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
+#include "db/lookup_key.h"
 #include "db/pinned_iterators_manager.h"
 #include "db/wide/wide_column_serialization.h"
 #include "file/file_prefetch_buffer.h"
@@ -2891,6 +2892,16 @@ InternalIterator* BlockBasedTable::NewIteratorImpl(
     return new (wrap_mem) EagerEmbeddedBlobResolvingIterator(
         this, read_options, iter, /*arena_mode=*/true);
   }
+}
+
+bool BlockBasedTable::KeyMayMatch(const ReadOptions& read_options,
+                                  const Slice& user_key,
+                                  const SliceTransform* prefix_extractor) {
+  LookupKey lookup_key(user_key, kMaxSequenceNumber);
+  BlockCacheLookupContext lookup_context{TableReaderCaller::kCompaction};
+  return FullFilterKeyMayMatch(rep_->filter.get(), lookup_key.internal_key(),
+                               prefix_extractor, nullptr, &lookup_context,
+                               read_options);
 }
 
 FragmentedRangeTombstoneIterator* BlockBasedTable::NewRangeTombstoneIterator(

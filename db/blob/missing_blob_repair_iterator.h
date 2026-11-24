@@ -106,6 +106,8 @@ class MissingBlobRepairIterator : public InternalIterator {
 
   Status status() const override { return status_; }
 
+  int GetCurrentLevel() const override { return input_->GetCurrentLevel(); }
+
   bool PrepareValue() override {
     assert(Valid());
     return true;
