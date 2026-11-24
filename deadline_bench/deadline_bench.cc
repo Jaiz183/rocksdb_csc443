@@ -4,9 +4,11 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 // Workload driver for the tombstone deadline / deadline coalescing draft.
-// Public API only, so the same binary source builds against main (baseline);
-// the new options are passed as a string in CF_OPTS and are simply omitted for
-// the baseline run.
+// The new options are passed as a string in CF_OPTS and omitted for the
+// baseline run. To read each file's true oldest tombstone time, the sampler
+// looks at internal file metadata (db/version_set.h), so the driver only
+// builds against this branch; the baseline is this branch with the feature
+// off.
 //
 // Usage: deadline_bench <db_dir> <run_seconds> <ops_per_second> <out_csv>
 // Environment:
@@ -17,6 +19,9 @@
 //   KEYS      key space (default = PRELOAD)
 //   DEL       fraction of timed ops that are point deletes (default 0.1)
 //   IDLE_S    idle seconds after the timed phase, still sampled (default 40)
+//   AGE_S     seconds to wait after the preload before the timed phase, so
+//             the preloaded data is old when it starts being deleted
+//             (default 0)
 //
 // Prints one summary line "RESULT key=value ..." and writes a per-second CSV.
 
@@ -31,6 +36,9 @@
 #include <thread>
 #include <vector>
 
+#include "db/column_family.h"
+#include "db/db_impl/db_impl.h"
+#include "db/version_set.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/listener.h"
@@ -77,9 +85,12 @@ struct Listener : public EventListener {
 };
 
 struct Sample {
-  uint64_t max_age = 0;          // max(now - oldest_ancester_time) over
-                                 // non-last-level files with deletions
-  uint64_t tombstones = 0;       // deletions in non-last-level files
+  // max(now - oldest_tombstone_time) over non-last-level files with
+  // tombstones: the true age of the oldest tombstone not yet at the bottom.
+  uint64_t max_age = 0;
+  // Same, measured with oldest_ancester_time (the proxy the first draft used).
+  uint64_t max_proxy_age = 0;
+  uint64_t tombstones = 0;  // deletions in non-last-level files
   uint64_t sst_bytes = 0;
   int last_level = 0;
 };
@@ -102,7 +113,21 @@ Sample TakeSample(DB* db) {
     }
     s.tombstones += f.num_deletions;
     if (f.oldest_ancester_time > 0 && f.oldest_ancester_time <= now) {
-      s.max_age = std::max(s.max_age, now - f.oldest_ancester_time);
+      s.max_proxy_age = std::max(s.max_proxy_age, now - f.oldest_ancester_time);
+    }
+  }
+  // True tombstone age from internal metadata, under the DB mutex.
+  DBImpl* impl = static_cast<DBImpl*>(db->GetRootDB());
+  ColumnFamilyData* cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db->DefaultColumnFamily())->cfd();
+  InstrumentedMutexLock l(impl->mutex());
+  const VersionStorageInfo* vs = cfd->current()->storage_info();
+  for (int level = 0; level < s.last_level; level++) {
+    for (FileMetaData* f : vs->LevelFiles(level)) {
+      const uint64_t t = f->TryGetOldestTombstoneTime();
+      if (t != kNoTombstoneTime && t <= now) {
+        s.max_age = std::max(s.max_age, now - t);
+      }
     }
   }
   return s;
@@ -123,6 +148,7 @@ int main(int argc, char** argv) {
   const uint64_t keys = static_cast<uint64_t>(EnvD("KEYS", preload));
   const double del_frac = EnvD("DEL", 0.1);
   const int idle_s = static_cast<int>(EnvD("IDLE_S", 40));
+  const int age_s = static_cast<int>(EnvD("AGE_S", 0));
   const uint64_t deadline = static_cast<uint64_t>(EnvD("DEADLINE", 30));
   const char* cf_opts = getenv("CF_OPTS");
 
@@ -185,6 +211,9 @@ int main(int argc, char** argv) {
     fprintf(stderr, "wait: %s\n", s.ToString().c_str());
     return 1;
   }
+  if (age_s > 0) {
+    std::this_thread::sleep_for(std::chrono::seconds(age_s));
+  }
   options.statistics->Reset();
   {
     std::lock_guard<std::mutex> l(listener->mu);
@@ -195,7 +224,9 @@ int main(int argc, char** argv) {
   user_bytes = 0;
 
   FILE* csv = fopen(out_csv.c_str(), "w");
-  fprintf(csv, "t,phase,max_tomb_age,tombstones_nonlast,sst_bytes,ops\n");
+  fprintf(csv,
+          "t,phase,max_tomb_age,max_proxy_age,tombstones_nonlast,sst_bytes,"
+          "ops\n");
 
   std::atomic<bool> stop{false};
   std::atomic<uint64_t> ops_done{0};
@@ -204,15 +235,19 @@ int main(int argc, char** argv) {
   uint64_t samples = 0;
   uint64_t violation_s = 0;  // seconds with max_age > deadline
   uint64_t idle_peak_age = 0;
+  uint64_t peak_proxy_age = 0;
   std::thread sampler([&] {
     const auto t0 = std::chrono::steady_clock::now();
     for (int t = 1; t <= run_s + idle_s; t++) {
       std::this_thread::sleep_until(t0 + std::chrono::seconds(t));
       Sample smp = TakeSample(db.get());
       const bool idle = t > run_s;
-      fprintf(csv, "%d,%s,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
-              t, idle ? "idle" : "run", smp.max_age, smp.tombstones,
-              smp.sst_bytes, ops_done.load());
+      fprintf(csv,
+              "%d,%s,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+              "\n",
+              t, idle ? "idle" : "run", smp.max_age, smp.max_proxy_age,
+              smp.tombstones, smp.sst_bytes, ops_done.load());
+      peak_proxy_age = std::max(peak_proxy_age, smp.max_proxy_age);
       peak_age = std::max(peak_age, smp.max_age);
       if (idle) {
         idle_peak_age = std::max(idle_peak_age, smp.max_age);
@@ -311,13 +346,15 @@ int main(int argc, char** argv) {
     printf(
         "RESULT opts=\"%s\" pass=%d run_s=%.1f write_amp=%.2f "
         "compact_write_mb=%.1f peak_tomb_age=%" PRIu64
-        " idle_peak_tomb_age=%" PRIu64 " violation_s=%" PRIu64
+        " idle_peak_tomb_age=%" PRIu64 " peak_proxy_age=%" PRIu64
+        " violation_s=%" PRIu64
         " avg_tombstones=%.0f final_sst_mb=%.1f stall_ms=%.0f "
         "deadline_input_files=%" PRIu64
         " reasons=[%s]\n",
         cf_opts ? cf_opts : "", pass ? 1 : 0, run_elapsed,
         user_bytes ? double(compact_w + flush_w) / double(user_bytes) : 0.0,
-        compact_w / 1048576.0, peak_age, idle_peak_age, violation_s,
+        compact_w / 1048576.0, peak_age, idle_peak_age, peak_proxy_age,
+        violation_s,
         samples ? double(sum_tomb) / double(samples) : 0.0,
         fin.sst_bytes / 1048576.0, stall_us / 1000.0,
         listener->deadline_input_files,

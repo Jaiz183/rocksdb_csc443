@@ -649,20 +649,21 @@ class VersionStorageInfo {
   }
 
   // The time at which a file on `level` reaches its tombstone deadline, or 0
-  // if the file has no deadline (no deletions, last level, feature off, or
-  // unknown ancestor time). Uses the deadlines from the last
-  // ComputeCompactionScore().
+  // if the file has no deadline (no tombstones, last level, feature off, or
+  // unknown tombstone time). The clock starts at the file's oldest tombstone
+  // time (FileMetaData::oldest_tombstone_time). Uses the deadlines from the
+  // last ComputeCompactionScore().
   uint64_t TombstoneDeadlineDueTime(int level, FileMetaData* f) const {
     if (level < 0 ||
         static_cast<size_t>(level) >= tombstone_level_deadline_.size() ||
-        tombstone_level_deadline_[level] == 0 || f->num_deletions == 0) {
+        tombstone_level_deadline_[level] == 0) {
       return 0;
     }
-    const uint64_t oldest_ancestor_time = f->TryGetOldestAncestorTime();
-    if (oldest_ancestor_time == kUnknownOldestAncestorTime) {
+    const uint64_t oldest_tombstone_time = f->TryGetOldestTombstoneTime();
+    if (oldest_tombstone_time == kNoTombstoneTime) {
       return 0;
     }
-    return oldest_ancestor_time + tombstone_level_deadline_[level];
+    return oldest_tombstone_time + tombstone_level_deadline_[level];
   }
 
   // Clock reading used by the last ComputeTombstoneDeadlineFiles().

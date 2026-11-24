@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build deadline_bench against a Release static lib of this branch (and,
-# optionally, main for the baseline) and run the comparison matrix.
+# Build deadline_bench against a Release static lib of this branch and run
+# the comparison matrix (the baseline is this branch with the feature off).
 #
 # Usage: REL=/path/to/build-rel OUT=/path/to/results ./run.sh
 # Env: RUN_S (default 90), OPS (default 15000), REPEATS (default 2),

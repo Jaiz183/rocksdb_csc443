@@ -121,6 +121,9 @@ enum NewFileCustomTag : uint32_t {
   kFileOpenMetadata = 17,
   kDbOwnershipStartTime = 18,
   kDataFileProvenance = 19,
+  // Unix time of the oldest (point or range) tombstone in the
+  // file. Safe to ignore by older readers (bit 6 not set).
+  kOldestTombstoneTime = 20,
 
   // If this bit for the custom tag is set, opening DB should fail if
   // we don't know this field.
@@ -137,6 +140,8 @@ constexpr uint64_t kUnknownOldestAncestorTime = 0;
 constexpr uint64_t kUnknownNewestKeyTime = 0;
 constexpr uint64_t kUnknownFileCreationTime = 0;
 constexpr uint64_t kUnknownDbOwnershipStartTime = 0;
+// 0 means the file holds no tombstones (or the time is unknown).
+constexpr uint64_t kNoTombstoneTime = 0;
 constexpr uint64_t kUnknownEpochNumber = 0;
 // If `Options::cf_allow_ingest_behind` is true, this epoch number
 // will be dedicated to files ingested behind.
@@ -332,6 +337,21 @@ struct FileMetaData {
   // 0 means the information is not available.
   uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
 
+  // Unix time (seconds) at which the oldest point or range
+  // tombstone contained in this file was inserted into the memtable. The age
+  // of the oldest tombstone is now - this value.
+  //
+  // - Flush output: earliest tombstone insertion time over the flushed
+  //   memtables (tracked in MemTable::Add).
+  // - Compaction output: min over the input files that carry tombstones, if
+  //   the output file itself still contains tombstones (conservative: it may
+  //   over-estimate the age, never under-estimate it, so deadlines hold).
+  // - Trivial move / manifest rewrite: carried over unchanged.
+  //
+  // kNoTombstoneTime (0) means no tombstones or unknown. Persisted in the
+  // MANIFEST under NewFileCustomTag::kOldestTombstoneTime.
+  uint64_t oldest_tombstone_time = kNoTombstoneTime;
+
   // Unix time when the SST file's contents were built (by flush or
   // compaction, in this DB or another, or by SstFileWriter). Preserved when
   // the file is moved between levels or copied to another temperature.
@@ -452,6 +472,20 @@ struct FileMetaData {
       return reader->GetTableProperties()->oldest_ancestor_time;
     }
     return kUnknownOldestAncestorTime;
+  }
+
+  // Best-known insertion time of the oldest tombstone in this file.
+  // Falls back to the oldest ancestor time (never newer than any entry in the
+  // file) for files that hold tombstones but predate this bookkeeping.
+  // Returns kNoTombstoneTime (0) if the file has no known tombstones.
+  uint64_t TryGetOldestTombstoneTime() {
+    if (oldest_tombstone_time != kNoTombstoneTime) {
+      return oldest_tombstone_time;
+    }
+    if (num_deletions > 0 || num_range_deletions > 0) {
+      return TryGetOldestAncestorTime();
+    }
+    return kNoTombstoneTime;
   }
 
   uint64_t TryGetFileCreationTime() {

@@ -468,6 +468,11 @@ class Compaction {
   // This is used to filter out some input files' ancestor's time range.
   uint64_t MinInputFileOldestAncestorTime(const InternalKey* start,
                                           const InternalKey* end) const;
+  // start and end are the output file's key range. Returns the oldest
+  // tombstone time among input files overlapping that range that hold
+  // tombstones, or std::numeric_limits<uint64_t>::max() if none do.
+  uint64_t MinInputFileOldestTombstoneTime(const InternalKey* start,
+                                           const InternalKey* end) const;
   // Return the minimum epoch number among
   // input files' associated with this compaction
   uint64_t MinInputFileEpochNumber() const;

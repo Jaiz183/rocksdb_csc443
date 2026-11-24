@@ -4099,8 +4099,8 @@ void VersionStorageInfo::ComputeTombstoneDeadlineFiles(
 
   // Levels that can hold tombstones on their way down: L0 plus
   // [base_level, last_level). Split the budget evenly across them; the
-  // deadline of a level is cumulative, since a file's oldest ancestor time
-  // also covers the time its data spent on the levels above.
+  // deadline of a level is cumulative, since a file's oldest tombstone time
+  // is when that tombstone was written, not when it reached this level.
   const int first_non_l0 = std::min(std::max(base_level_, 1), last_level);
   const uint64_t num_deadline_levels =
       1 + static_cast<uint64_t>(last_level - first_non_l0);

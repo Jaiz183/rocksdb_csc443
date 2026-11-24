@@ -1,0 +1,10 @@
+load { 43.07 19.13 27.09 } run=v2_base
+RESULT opts="" pass=1 run_s=60.0 write_amp=6.95 compact_write_mb=535.4 peak_tomb_age=44 idle_peak_tomb_age=44 peak_proxy_age=95 violation_s=19 avg_tombstones=8564 final_sst_mb=59.3 stall_ms=0 deadline_input_files=0 reasons=[LevelL0FilesNum:29/165MB LevelMaxLevelSize:134/369MB ]
+load { 20.48 20.56 26.61 } run=v2_deadline
+RESULT opts="tombstone_deadline_seconds=30" pass=1 run_s=60.0 write_amp=7.42 compact_write_mb=577.4 peak_tomb_age=30 idle_peak_tomb_age=30 peak_proxy_age=90 violation_s=0 avg_tombstones=8082 final_sst_mb=54.9 stall_ms=0 deadline_input_files=30 reasons=[LevelL0FilesNum:29/159MB LevelMaxLevelSize:131/391MB TombstoneDeadline:7/26MB ]
+load { 8.86 16.36 24.03 } run=v1_deadline
+RESULT opts="tombstone_deadline_seconds=30" pass=1 run_s=60.0 write_amp=8.17 compact_write_mb=645.6 peak_tomb_age=29 idle_peak_tomb_age=29 violation_s=0 avg_tombstones=7912 final_sst_mb=50.7 stall_ms=0 deadline_input_files=154 reasons=[LevelL0FilesNum:28/160MB LevelMaxLevelSize:134/361MB TombstoneDeadline:20/124MB ]
+load { 6.07 12.74 21.39 } run=v2_coalesce
+RESULT opts="tombstone_deadline_seconds=30;deadline_coalescing_window_seconds=10" pass=1 run_s=60.0 write_amp=7.76 compact_write_mb=608.3 peak_tomb_age=30 idle_peak_tomb_age=30 peak_proxy_age=81 violation_s=0 avg_tombstones=7732 final_sst_mb=52.8 stall_ms=0 deadline_input_files=33 reasons=[LevelL0FilesNum:29/157MB LevelMaxLevelSize:125/425MB TombstoneDeadline:3/25MB ]
+load { 2.06 8.53 18.36 } run=v1_coalesce
+RESULT opts="tombstone_deadline_seconds=30;deadline_coalescing_window_seconds=10" pass=1 run_s=60.0 write_amp=7.97 compact_write_mb=627.5 peak_tomb_age=30 idle_peak_tomb_age=30 violation_s=0 avg_tombstones=7811 final_sst_mb=52.9 stall_ms=0 deadline_input_files=102 reasons=[LevelL0FilesNum:28/156MB LevelMaxLevelSize:114/389MB TombstoneDeadline:9/81MB ]

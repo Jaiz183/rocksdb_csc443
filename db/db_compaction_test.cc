@@ -6250,6 +6250,72 @@ TEST_F(DBTombstoneDeadlineTest, SizeCompactionAbsorbsNearDeadlineFiles) {
   }
 }
 
+TEST_F(DBTombstoneDeadlineTest, DeadlineStartsAtTombstoneTimeNotDataTime) {
+  env_->SetMockSleep();
+  Options options = DeadlineOptions();
+  DestroyAndReopen(options);
+  Random rnd(301);
+  for (int k = 0; k < kKeysPerFile; k++) {
+    ASSERT_OK(Put(KeyOf(0, k), rnd.RandomString(100)));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  // The L1 file covers the whole key range so the later deletes merge into it.
+  for (int k = 0; k < kKeysPerFile; k++) {
+    ASSERT_OK(Put(KeyOf(0, k), "new"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  std::vector<std::vector<FileMetaData>> files;
+  dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(), &files);
+  ASSERT_EQ(1, files[1].size());
+  const uint64_t data_time = files[1][0].oldest_ancestor_time;
+  ASSERT_EQ(kNoTombstoneTime, files[1][0].oldest_tombstone_time);
+
+  // Delete the upper half 900 s later and merge it into the L1 file. The
+  // output keeps the old ancestor time but gets the new tombstone time.
+  env_->MockSleepForSeconds(900);
+  for (int k = kKeysPerFile / 2; k < kKeysPerFile; k++) {
+    ASSERT_OK(Delete(KeyOf(0, k)));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ("0,1,1", FilesPerLevel());
+  // The tombstone time survives a MANIFEST round trip.
+  Reopen(options);
+  dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(), &files);
+  ASSERT_EQ(1, files[1].size());
+  ASSERT_EQ(data_time, files[1][0].oldest_ancestor_time);
+  ASSERT_EQ(data_time + 900, files[1][0].oldest_tombstone_time);
+
+  // Past the deadline measured from the data, but not from the tombstone:
+  // no deadline compaction.
+  CountDeadlineCompactions();
+  env_->MockSleepForSeconds(static_cast<int>(kDeadline + 1 - 900));
+  ASSERT_OK(dbfull()->SetOptions(
+      {{"tombstone_deadline_seconds", std::to_string(kDeadline)},
+       {"disable_auto_compactions", "false"}}));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(0, deadline_compactions_);
+  ASSERT_EQ("0,1,1", FilesPerLevel());
+
+  // Past the deadline measured from the tombstone.
+  env_->MockSleepForSeconds(900);
+  dbfull()->TriggerPeriodicCompaction();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(1, deadline_compactions_);
+  ASSERT_EQ("0,0,1", FilesPerLevel());
+  ASSERT_EQ(0, DeletionsAtLevel(2));
+  for (int k = 0; k < kKeysPerFile / 2; k++) {
+    ASSERT_EQ("new", Get(KeyOf(0, k)));
+  }
+  for (int k = kKeysPerFile / 2; k < kKeysPerFile; k++) {
+    ASSERT_EQ("NOT_FOUND", Get(KeyOf(0, k)));
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
 TEST_F(DBTombstoneDeadlineTest, CascadesFromL0OnIdleDB) {
   env_->SetMockSleep();
   Options options = DeadlineOptions();

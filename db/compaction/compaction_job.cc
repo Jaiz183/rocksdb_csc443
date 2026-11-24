@@ -2440,6 +2440,27 @@ Status CompactionJob::FinishCompactionOutputFile(
         }
       }
     }
+
+    // Carry the oldest tombstone time forward (borrowed from the FADE
+    // prototype). If tombstones survived into this output file, it inherits
+    // the oldest tombstone time of the overlapping inputs that hold
+    // tombstones. That can only over-estimate the age (a surviving tombstone
+    // is never older than the oldest input tombstone), so deadlines are met
+    // early rather than late. If no tombstone survived, the time is cleared.
+    const TableProperties tp = outputs.GetTableProperties();
+    meta->oldest_tombstone_time = kNoTombstoneTime;
+    if (tp.num_deletions > 0 || tp.num_range_deletions > 0) {
+      const uint64_t t =
+          sub_compact->compaction->MinInputFileOldestTombstoneTime(
+              meta->smallest.size() > 0 ? &(meta->smallest) : nullptr,
+              meta->largest.size() > 0 ? &(meta->largest) : nullptr);
+      meta->oldest_tombstone_time = t != std::numeric_limits<uint64_t>::max()
+                                        ? t
+                                        : meta->oldest_ancestor_time;
+    }
+    TEST_SYNC_POINT_CALLBACK(
+        "CompactionJob::FinishCompactionOutputFile:oldest_tombstone_time",
+        &meta->oldest_tombstone_time);
   }
 
   // Finish and check for file errors

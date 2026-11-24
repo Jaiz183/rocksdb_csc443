@@ -1010,8 +1010,10 @@ struct AdvancedColumnFamilyOptions {
   // evenly across the non-last levels in use (L0 plus base_level .. last
   // level - 1), giving each level a cumulative deadline. A file whose
   // cumulative deadline has passed is compacted to the next level with
-  // CompactionReason::kTombstoneDeadline. The file's oldest ancestor time is
-  // used as a conservative upper bound on the age of its oldest tombstone.
+  // CompactionReason::kTombstoneDeadline. A file's tombstone age is measured
+  // from the time its oldest tombstone was written to the memtable, which is
+  // tracked per file and saved in the MANIFEST. Files written before this
+  // tracking existed fall back to their oldest ancestor time.
   //
   // Deadline compactions run ahead of size-based compactions, except that an
   // L0 compaction is preferred while L0 is at or over

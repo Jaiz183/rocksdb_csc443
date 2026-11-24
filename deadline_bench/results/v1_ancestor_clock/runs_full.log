@@ -1,0 +1,13 @@
+load { 323.59 202.95 118.58 } run=base r=1
+RESULT opts="" pass=1 run_s=60.0 write_amp=7.11 compact_write_mb=549.3 peak_tomb_age=61 idle_peak_tomb_age=61 violation_s=33 avg_tombstones=8982 final_sst_mb=60.5 stall_ms=0 deadline_start_files=0 deadline_input_files=0 reasons=[LevelL0FilesNum:29/163MB LevelMaxLevelSize:135/386MB ]
+load { 250.18 215.21 132.94 } run=deadline r=1
+RESULT opts="tombstone_deadline_seconds=30" pass=1 run_s=60.0 write_amp=7.76 compact_write_mb=608.2 peak_tomb_age=31 idle_peak_tomb_age=31 violation_s=2 avg_tombstones=6644 final_sst_mb=50.7 stall_ms=0 deadline_start_files=2 deadline_input_files=66 reasons=[LevelL0FilesNum:29/163MB LevelMaxLevelSize:140/388MB TombstoneDeadline:12/55MB ]
+load { 191.33 205.77 138.85 } run=coalesce r=1
+RESULT opts="tombstone_deadline_seconds=30;deadline_coalescing_window_seconds=10" pass=1 run_s=60.0 write_amp=8.14 compact_write_mb=642.7 peak_tomb_age=30 idle_peak_tomb_age=30 violation_s=0 avg_tombstones=6414 final_sst_mb=50.7 stall_ms=0 deadline_start_files=2 deadline_input_files=59 reasons=[LevelL0FilesNum:29/161MB LevelMaxLevelSize:126/431MB TombstoneDeadline:5/50MB ]
+load { 127.75 181.00 136.73 } run=base r=2
+RESULT opts="" pass=1 run_s=60.0 write_amp=7.15 compact_write_mb=553.1 peak_tomb_age=62 idle_peak_tomb_age=62 violation_s=32 avg_tombstones=9001 final_sst_mb=60.5 stall_ms=0 deadline_start_files=0 deadline_input_files=0 reasons=[LevelL0FilesNum:29/166MB LevelMaxLevelSize:136/386MB ]
+load { 112.47 161.72 134.44 } run=deadline r=2
+RESULT opts="tombstone_deadline_seconds=30" pass=1 run_s=60.0 write_amp=7.98 compact_write_mb=627.7 peak_tomb_age=31 idle_peak_tomb_age=31 violation_s=3 avg_tombstones=6796 final_sst_mb=50.7 stall_ms=0 deadline_start_files=2 deadline_input_files=70 reasons=[LevelL0FilesNum:29/164MB LevelMaxLevelSize:137/403MB TombstoneDeadline:13/60MB ]
+load { 77.87 135.38 127.19 } run=coalesce r=2
+RESULT opts="tombstone_deadline_seconds=30;deadline_coalescing_window_seconds=10" pass=1 run_s=60.0 write_amp=8.28 compact_write_mb=655.4 peak_tomb_age=30 idle_peak_tomb_age=30 violation_s=0 avg_tombstones=6625 final_sst_mb=50.7 stall_ms=0 deadline_start_files=2 deadline_input_files=100 reasons=[LevelL0FilesNum:29/161MB LevelMaxLevelSize:124/409MB TombstoneDeadline:8/84MB ]
+EXIT 0
