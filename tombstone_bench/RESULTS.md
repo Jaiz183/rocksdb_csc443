@@ -468,3 +468,100 @@ tombstone_bench/results/ablation_v5`.
   after deletes stop. These benchmarks do not exercise that case.
 - Skip-only is still the setting that saves write amp: −2.8% (churn) and −2.7%
   to −4.1% (seqdel).
+
+## fade-plus-skip-level: FADE + skip-level (2026-11-25)
+
+Branch `fade-plus-skip-level` = `fade-oneshot-claude` (FADE) merged with
+`skip-level-tombstone-draft` v5. Skip-level runs without the density trigger
+(`skip_level_tombstone_density_trigger=false`, the best config from v5).
+
+### What the combination does
+
+- FADE decides **when** a file's tombstones must move: its TTL for that level
+  has expired (`CompactionReason::kFadeTtl`).
+- Skip-level decides **how far** they go. Dense FADE picks, like dense
+  size-triggered picks, go through the mode 2 amortized rule and can cross
+  several levels in one rewrite. Those compactions are reported as
+  `kSkipLevelTombstone`, so the FadeTtl counts below are FADE picks that
+  stayed one level.
+
+### Checks before benchmarking
+
+- Clean build with warnings as errors.
+- Tests:
+
+  | suite | result |
+  |---|---|
+  | `compaction_picker_test` | 181/181 |
+  | `db_skip_level_compaction_test` | 8/8 |
+  | `db_compaction_test` | 390/390, including the 6 FADE tests |
+  | `options_test` | 83/83 |
+  | `version_edit_test` | 35/35 |
+
+  `options_settable_test` compiles its tests only on Linux with GCC, so it
+  ran 0 tests on macOS, the same as on the parent branches.
+- New test `FadePickSkipsLevelsWhenCheap`: an expired L1 tombstone file goes
+  L1 -> L2 with skip off, and L1 -> L3 (dropping its tombstones) with mode 2.
+- `RandomizedAgainstModel` now preloads L2 and L3. Before, its tree never got
+  past L1, so neither feature ever ran in it. It runs every skip mode with
+  FADE off and on, against an in-memory model.
+- Smoke run: 15 s per config and workload; all eight passed.
+
+### Setup
+
+Same tree as v5 (MULT=5, LBASE_MB=1, θ = 0.3, mode 2, R = 20). D_th = 10 s,
+3 repeats, rotated order, 60 s per run.
+
+"True tombstone age" is new: the oldest tombstone still above the last level.
+It is measured from a table-properties collector (smallest tombstone seqno per
+SST) and a seqno -> time map, the same method as fade_bench, so it does not
+depend on FADE's own bookkeeping. It is sampled every second.
+
+D_th = 10 s was chosen because a 15 s smoke run with D_th = 30 s never
+reached the bound: churn's natural peak age is about 30-40 s over 60 s, and
+seqdel's is about 6 s.
+
+### Results
+
+| workload | config | write amp (3 runs) | mean | vs base | vs FADE | Welch t | peak true tombstone age | samples over 10 s | upper tombstones vs base |
+|---|---|---|---|---|---|---|---|---|---|
+| seqdel | base | 9.37, 9.22, 9.24 | 9.28 | | | | 6.3-7.7 s | 0/59 | |
+| seqdel | skip | 8.93, 9.13, 8.90 | 8.99 | -3.1% | | -3.5 vs base | 4.8-5.7 s | 0/59 | -14% |
+| seqdel | FADE | 10.36, 10.04, 10.50 | 10.30 | +11.0% | | | 5.9-6.3 s | 0/59 | -6% |
+| seqdel | FADE + skip | 10.03, 10.09, 9.70 | 9.94 | +7.1% | -3.5% | -2.0 vs FADE | 6.1-6.4 s | 0/59 | -12% |
+| churn | base | 4.29, 4.28, 4.30 | 4.29 | | | | 29.6-40.9 s | 49/59 | |
+| churn | skip | 4.17, 4.11, 4.11 | 4.13 | -3.7% | | -7.7 vs base | 24.4-37.1 s | 49/59 | -12% |
+| churn | FADE | 8.96, 9.55, 8.29 | 8.93 | +108% | | | 11.0-11.3 s | 4-6/59 | -37% |
+| churn | FADE + skip | 8.47, 9.34, 8.37 | 8.73 | +103% | -2.3% | -0.4 vs FADE | 10.8 s | 4-5/59 | -47% |
+
+Compaction mix per run (FadeTtl / SkipLevelTombstone):
+
+| workload | FADE | FADE + skip |
+|---|---|---|
+| seqdel | about 52 / 0 | about 40 / 38 |
+| churn | about 145 / 0 | about 45 / 56 |
+
+On churn the skips are mostly L0 -> L5 directly, past two levels.
+
+### Findings
+
+- **Skip-level's saving survives the merge:**
+  - On its own it gives -3.1% (seqdel) and -3.7% (churn) vs base, in line with
+    v5 on its own branch.
+  - On top of FADE it gives -3.5% (seqdel, t = -2.0) and -2.3% (churn) vs FADE.
+  - On churn, FADE's run-to-run spread (sd 0.63) is larger than the gap, so 3
+    repeats don't make the churn number significant (t = -0.4). Paired by
+    repeat, FADE + skip wrote less in 2 of 3 runs.
+- **FADE's bound is kept, slightly tighter.**
+  - Churn peak age: 10.8 s with FADE + skip vs 11.0-11.3 s with FADE alone.
+  - Upper-level tombstones: -47% vs -37%.
+  - A skip sends expired tombstones further, so later TTL expiries have less
+    to do; FADE-only compactions drop from about 145 to about 45 on churn.
+- **FADE is the expensive part:** +11% (seqdel) and +108% (churn) at
+  D_th = 10 s.
+  - With T = 5 and four stages, FADE's exponential split gives the top levels
+    TTLs well under a second, so it fires constantly on churn.
+  - On seqdel the natural peak age is already under D_th, so its cost there
+    comes entirely from those short per-level TTLs.
+  - Tuning D_th or the split is the obvious next lever. Skip-level recovers a
+    few percent of FADE's cost, not most of it.
