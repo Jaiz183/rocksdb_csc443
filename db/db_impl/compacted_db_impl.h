@@ -115,6 +115,11 @@ class CompactedDBImpl : public DBImpl {
                       const Slice* /*begin*/, const Slice* /*end*/) override {
     return Status::NotSupported("Not supported in compacted db mode.");
   }
+  using DBImpl::SecondaryDeleteBelow;
+  Status SecondaryDeleteBelow(ColumnFamilyHandle* /*column_family*/,
+                              uint64_t /*delete_key_floor*/) override {
+    return Status::NotSupported("Not supported in compacted db mode.");
+  }
 
   Status DisableFileDeletions() override {
     return Status::NotSupported("Not supported in compacted db mode.");

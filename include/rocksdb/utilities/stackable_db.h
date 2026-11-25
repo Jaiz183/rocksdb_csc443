@@ -339,6 +339,12 @@ class StackableDB : public DB {
     return db_->DeleteRange(wopts, column_family, start_key, end_key);
   }
 
+  using DB::SecondaryDeleteBelow;
+  Status SecondaryDeleteBelow(ColumnFamilyHandle* column_family,
+                              uint64_t delete_key_floor) override {
+    return db_->SecondaryDeleteBelow(column_family, delete_key_floor);
+  }
+
   using DB::Merge;
   Status Merge(const WriteOptions& options, ColumnFamilyHandle* column_family,
                const Slice& key, const Slice& value) override {

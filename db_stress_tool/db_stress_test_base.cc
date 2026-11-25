@@ -6996,6 +6996,8 @@ void InitializeOptionsFromFlags(
       static_cast<uint32_t>(FLAGS_format_version);
   block_based_options.separate_key_value_in_data_block =
       FLAGS_separate_key_value_in_data_block;
+  block_based_options.kiwi_tile_pages = FLAGS_kiwi_tile_pages;
+  block_based_options.kiwi_delete_key_offset = FLAGS_kiwi_delete_key_offset;
   block_based_options.index_block_restart_interval =
       static_cast<int32_t>(FLAGS_index_block_restart_interval);
   block_based_options.filter_policy = filter_policy;

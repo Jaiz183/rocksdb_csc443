@@ -28,6 +28,7 @@
 #include "table/block_based/block_type.h"
 #include "table/block_based/cachable_entry.h"
 #include "table/block_based/filter_block.h"
+#include "table/block_based/kiwi_tile.h"
 #include "table/block_based/uncompression_dict_reader.h"
 #include "table/embedded_blob_sst.h"
 #include "table/format.h"
@@ -409,6 +410,14 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   ~BlockBasedTable() override;
 
   bool TEST_FilterBlockInCache() const;
+  // nullptr unless the file was written with KiWi delete tiles.
+  const kiwi::Directory* TEST_GetKiWiDirectory() const;
+
+  uint64_t KiWiDeleteFloor() const override;
+
+  // Applies a secondary delete recorded for this file (see
+  // FileMetaData::kiwi_delete_floor). Only a KiWi file can have one.
+  Status SetKiWiDeleteFloor(uint64_t floor);
   bool TEST_IndexBlockInCache() const;
 
   // IndexReader is the interface that provides the functionality for index
@@ -534,6 +543,8 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   friend class PartitionIndexReader;
 
   friend class UncompressionDictReader;
+
+  friend class KiWiTableIterator;
 
  protected:
   Rep* rep_;
@@ -721,6 +732,19 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
                            InternalIterator* meta_iter,
                            const InternalKeyComparator& internal_comparator,
                            BlockCacheLookupContext* lookup_context);
+  // For a KiWi file (see kiwi::kPropTilePages), reads and pins the directory
+  // of page fences and filters; does nothing for any other file.
+  Status ReadKiWiDirectory(const ReadOptions& ro,
+                           FilePrefetchBuffer* prefetch_buffer,
+                           InternalIterator* meta_iter);
+  // The data blocks that an index entry covers: the block it points at, or all
+  // pages of the tile it points at in a KiWi file.
+  Status DataBlockHandlesOf(const IndexValue& index_value,
+                            std::vector<BlockHandle>* handles) const;
+  // Get() for a KiWi file: the tile that may hold `key` is found through the
+  // index, and only its pages whose filter matches are read and merged.
+  Status KiWiGet(const ReadOptions& read_options, const Slice& key,
+                 GetContext* get_context, bool skip_filters);
   // If index and filter blocks do not need to be pinned, `prefetch_all`
   // determines whether they will be read and added to cache. When
   // `avoid_shared_metadata_cache` is set, open-time metadata reads avoid the
@@ -922,6 +946,13 @@ struct BlockBasedTable::Rep {
   // the presence of the embedded blob stats property. Same-file BlobIndex
   // references are only valid when this is true.
   bool has_embedded_blobs = false;
+  // Per-page filters and delete key fences of a KiWi file, pinned for the life
+  // of the reader; null if the file was not written with delete tiles.
+  std::unique_ptr<kiwi::Directory> kiwi_directory;
+  // Where the delete key sits in a value of this KiWi file, and the entries
+  // below the delete floor are deleted (0: none).
+  uint32_t kiwi_delete_key_offset = 0;
+  uint64_t kiwi_delete_floor = 0;
 
   // BlobSource for routing same-file ("embedded") blob reads through the blob
   // value cache + BLOB_DB_* statistics. Owned by the ColumnFamilyData; this

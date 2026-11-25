@@ -444,6 +444,12 @@ static struct BlockBasedTableTypeInfo {
          {offsetof(struct BlockBasedTableOptions,
                    separate_key_value_in_data_block),
           OptionType::kBoolean, OptionVerificationType::kNormal}},
+        {"kiwi_tile_pages",
+         {offsetof(struct BlockBasedTableOptions, kiwi_tile_pages),
+          OptionType::kUInt32T, OptionVerificationType::kNormal}},
+        {"kiwi_delete_key_offset",
+         {offsetof(struct BlockBasedTableOptions, kiwi_delete_key_offset),
+          OptionType::kUInt32T, OptionVerificationType::kNormal}},
         {"uniform_cv_threshold",
          {offsetof(struct BlockBasedTableOptions, uniform_cv_threshold),
           OptionType::kDouble, OptionVerificationType::kNormal}},
@@ -786,7 +792,7 @@ Status BlockBasedTableFactory::NewTableReader(
     std::unique_ptr<RandomAccessFileReader>&& file, uint64_t file_size,
     std::unique_ptr<TableReader>* table_reader,
     bool prefetch_index_and_filter_in_cache) const {
-  return BlockBasedTable::Open(
+  Status s = BlockBasedTable::Open(
       ro, table_reader_options.ioptions, table_reader_options.env_options,
       table_options_, table_reader_options.internal_comparator, std::move(file),
       file_size, table_reader_options.block_protection_bytes_per_key,
@@ -807,6 +813,14 @@ Status BlockBasedTableFactory::NewTableReader(
       table_reader_options.user_defined_timestamps_persisted,
       table_reader_options.avoid_shared_metadata_cache,
       table_reader_options.blob_source);
+  if (s.ok() && table_reader_options.kiwi_delete_floor != 0) {
+    s = static_cast_with_check<BlockBasedTable>(table_reader->get())
+            ->SetKiWiDeleteFloor(table_reader_options.kiwi_delete_floor);
+    if (!s.ok()) {
+      table_reader->reset();
+    }
+  }
+  return s;
 }
 
 TableBuilder* BlockBasedTableFactory::NewTableBuilder(
@@ -956,6 +970,29 @@ Status BlockBasedTableFactory::ValidateOptions(
       table_options_.super_block_alignment_space_overhead_ratio < 4) {
     return Status::InvalidArgument(
         "Super block alignment space overhead is too high");
+  }
+  if (table_options_.kiwi_tile_pages >= 2) {
+    // Unsupported combinations are rejected rather than silently producing
+    // files that would be misread or lose KiWi semantics.
+    if (table_options_.index_type == BlockBasedTableOptions::kHashSearch ||
+        table_options_.partition_filters ||
+        table_options_.user_defined_index_factory != nullptr) {
+      return Status::NotSupported(
+          "kiwi_tile_pages is incompatible with kHashSearch, "
+          "partition_filters and user_defined_index_factory");
+    }
+    if (cf_opts.comparator != nullptr &&
+        cf_opts.comparator->timestamp_size() > 0) {
+      return Status::NotSupported(
+          "kiwi_tile_pages is incompatible with user-defined timestamps");
+    }
+    for (const CompressionOptions* copts :
+         {&cf_opts.compression_opts, &cf_opts.bottommost_compression_opts}) {
+      if (copts->max_dict_bytes > 0 || copts->zstd_max_train_bytes > 0) {
+        return Status::NotSupported(
+            "kiwi_tile_pages is incompatible with compression dictionaries");
+      }
+    }
   }
   if (table_options_.data_block_index_type ==
           BlockBasedTableOptions::kDataBlockBinaryAndHash &&
@@ -1212,6 +1249,12 @@ std::string BlockBasedTableFactory::GetPrintableOptions() const {
            "  super_block_alignment_space_overhead_ratio: %" ROCKSDB_PRIszt
            "\n",
            table_options_.super_block_alignment_space_overhead_ratio);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  kiwi_tile_pages: %" PRIu32 "\n",
+           table_options_.kiwi_tile_pages);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  kiwi_delete_key_offset: %" PRIu32 "\n",
+           table_options_.kiwi_delete_key_offset);
   ret.append(buffer);
   snprintf(buffer, kBufferSize,
            "  max_auto_readahead_size: %" ROCKSDB_PRIszt "\n",

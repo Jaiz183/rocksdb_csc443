@@ -194,6 +194,8 @@ class BlockBasedTableBuilder : public TableBuilder {
   void WritePropertiesBlock(MetaIndexBuilder* meta_index_builder);
   void WriteCompressionDictBlock(MetaIndexBuilder* meta_index_builder);
   void WriteRangeDelBlock(MetaIndexBuilder* meta_index_builder);
+  // Writes the KiWi directory (page fences and filters) as a meta block.
+  void WriteKiWiDirectoryBlock(MetaIndexBuilder* meta_index_builder);
   void WriteFooter(BlockHandle& metaindex_block_handle,
                    BlockHandle& index_block_handle);
 
@@ -237,6 +239,11 @@ class BlockBasedTableBuilder : public TableBuilder {
   // the same data block.  Most clients should not need to use this method.
   // REQUIRES: Finish(), Abandon() have not been called
   void Flush(const Slice* first_key_in_next_block);
+
+  // KiWi counterpart of Flush(): packs the buffered tile into pages ordered by
+  // delete key, writes them and adds one index entry for the whole tile.
+  // `first_key_in_next_tile` is nullptr at the end of the file.
+  void FlushTile(const Slice* first_key_in_next_tile);
 
   // Some compression libraries fail when the uncompressed size is bigger than
   // int. If uncompressed size is bigger than kCompressionSizeLimit, don't

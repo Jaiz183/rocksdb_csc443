@@ -211,6 +211,10 @@ class TableReader {
     return Status::NotSupported("DumpTable() not supported");
   }
 
+  // The KiWi secondary delete floor the table was opened with (see
+  // FileMetaData::kiwi_delete_floor); 0 if none or not a KiWi table.
+  virtual uint64_t KiWiDeleteFloor() const { return 0; }
+
   // check whether there is corruption in this db file
   virtual Status VerifyChecksum(const ReadOptions& /*read_options*/,
                                 TableReaderCaller /*caller*/,

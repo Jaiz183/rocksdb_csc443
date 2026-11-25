@@ -276,6 +276,41 @@ TEST_F(SSTDumpToolTest, GetProperties) {
                       "--show_properties");
 }
 
+// sst_dump reads a KiWi file through the same code paths as the database:
+// iterators, checksum verification and the raw dump of every page.
+TEST_F(SSTDumpToolTest, KiWiFile) {
+  Options opts;
+  opts.env = env();
+  BlockBasedTableOptions table_opts;
+  table_opts.block_size = 256;
+  table_opts.kiwi_tile_pages = 4;
+  table_opts.filter_policy.reset(ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10));
+  opts.table_factory = std::make_shared<BlockBasedTableFactory>(table_opts);
+  const std::string file_path = MakeFilePath("rocksdb_sst_kiwi_test.sst");
+  createSST(opts, file_path);
+
+  for (const char* cmd :
+       {"--command=verify", "--command=scan", "--command=check",
+        "--show_properties", "--command=raw"}) {
+    SCOPED_TRACE(cmd);
+    char* usage[3];
+    auto cleanup_usage = CleanupUsage{usage};
+    PopulateCommandArgs(file_path, cmd, usage);
+    ROCKSDB_NAMESPACE::SSTDumpTool tool;
+    ASSERT_TOOL_PASS(tool.Run(3, usage, opts))
+  }
+
+  // The raw dump lists the pages of the tiles one by one.
+  std::string dump_path = file_path.substr(0, file_path.length() - 4);
+  dump_path.append("_dump.txt");
+  std::string dump;
+  ASSERT_OK(ReadFileToString(opts.env, dump_path, &dump));
+  ASSERT_NE(dump.find("Data Block # 1 "), std::string::npos);
+  ASSERT_EQ(dump.find("Error reading the block"), std::string::npos);
+
+  cleanup(opts, file_path);
+}
+
 TEST_F(SSTDumpToolTest, CompressedSizes) {
   Options opts;
   SSTDumpToolTestCase(opts, /*filter=*/true, /*wide_column_one_in=*/10,

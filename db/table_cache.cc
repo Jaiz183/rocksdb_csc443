@@ -198,6 +198,7 @@ Status TableCache::GetTableReader(
     // Route same-file ("embedded") blob reads through the CFD's BlobSource for
     // caching + stats. nullptr in non-DB contexts (e.g. repair).
     table_reader_options.blob_source = blob_source_;
+    table_reader_options.kiwi_delete_floor = file_meta.kiwi_delete_floor;
     s = mutable_cf_options.table_factory->NewTableReader(
         ro, table_reader_options, std::move(file_reader),
         file_meta.fd.GetFileSize(), table_reader,
@@ -281,7 +282,20 @@ Status TableCache::FindTable(
   uint64_t number = file_meta.fd.GetNumber();
   // NOTE: sharing same Cache with BlobFileCache
   Slice key = GetSliceForFileNumber(&number);
-  *handle = cache_.Lookup(key);
+  // A reader cached from before a KiWi secondary delete was recorded for this
+  // file does not apply the delete; drop it so that the file is reopened with
+  // the floor of its current metadata. Only files with a floor pay for this.
+  const auto lookup = [&]() {
+    *handle = cache_.Lookup(key);
+    if (UNLIKELY(file_meta.kiwi_delete_floor != 0) && *handle != nullptr &&
+        cache_.Value(*handle)->KiWiDeleteFloor() <
+            file_meta.kiwi_delete_floor) {
+      cache_.Release(*handle);
+      cache_.get()->Erase(key);
+      *handle = nullptr;
+    }
+  };
+  lookup();
   TEST_SYNC_POINT_CALLBACK("TableCache::FindTable:0",
                            const_cast<bool*>(&no_io));
 
@@ -302,7 +316,7 @@ Status TableCache::FindTable(
     }
 
     // We check the cache again under loading mutex
-    *handle = cache_.Lookup(key);
+    lookup();
     if (*handle == nullptr) {
       std::unique_ptr<TableReader> table_reader;
       s = GetTableReader(ro, file_options, internal_comparator, file_meta,

@@ -68,6 +68,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/db_impl/db_impl_experimental.cc",
         "db/db_impl/db_impl_files.cc",
         "db/db_impl/db_impl_follower.cc",
+        "db/db_impl/db_impl_kiwi.cc",
         "db/db_impl/db_impl_open.cc",
         "db/db_impl/db_impl_readonly.cc",
         "db/db_impl/db_impl_secondary.cc",
@@ -217,6 +218,8 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "table/block_based/hash_index_reader.cc",
         "table/block_based/index_builder.cc",
         "table/block_based/index_reader_common.cc",
+        "table/block_based/kiwi_table_iterator.cc",
+        "table/block_based/kiwi_tile.cc",
         "table/block_based/multi_scan_index_iterator.cc",
         "table/block_based/parsed_full_filter_block.cc",
         "table/block_based/partitioned_filter_block.cc",
@@ -5398,6 +5401,12 @@ cpp_unittest_wrapper(name="io_tracer_test",
 
 cpp_unittest_wrapper(name="iostats_context_test",
             srcs=["monitoring/iostats_context_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="kiwi_test",
+            srcs=["table/block_based/kiwi_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 

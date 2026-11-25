@@ -516,6 +516,9 @@ DEFINE_SYNC_AND_ASYNC(Status, BlockBasedTable::Get)
   }
   assert(key.size() >= 8);  // key must be internal key
   assert(get_context != nullptr);
+  if (UNLIKELY(rep_->kiwi_directory != nullptr)) {
+    CO_RETURN KiWiGet(read_options, key, get_context, skip_filters);
+  }
   Status s;
 
   FilterBlockReader* const filter =
@@ -1007,6 +1010,16 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
     // Caller should ensure non-empty (performance bug)
     assert(false);
     CO_RETURN;  // Nothing to do
+  }
+
+  if (UNLIKELY(rep_->kiwi_directory != nullptr)) {
+    // KiWi files are looked up one key at a time.
+    for (auto miter = mget_range->begin(); miter != mget_range->end();
+         ++miter) {
+      *(miter->s) = Get(read_options, miter->ikey, miter->get_context,
+                        prefix_extractor, skip_filters);
+    }
+    CO_RETURN;
   }
 
   FilterBlockReader* const filter =

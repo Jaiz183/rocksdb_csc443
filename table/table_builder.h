@@ -120,6 +120,12 @@ struct TableReaderOptions {
   // Column family that owns this table. Empty outside DB-owned table opens.
   std::string column_family_name;
 
+  // KiWi secondary delete (FileMetaData::kiwi_delete_floor): entries of the
+  // file whose delete key is below this value are deleted. 0 means none. Only
+  // valid for a file written with KiWi tiles; opening any other file with a
+  // floor fails.
+  uint64_t kiwi_delete_floor = 0;
+
   // Blob source for routing same-file ("embedded") blob reads through the blob
   // value cache + BLOB_DB_* statistics. Owned by the ColumnFamilyData; the
   // table reader's lifetime is a subset of the CFD's (it is owned via the CFD's

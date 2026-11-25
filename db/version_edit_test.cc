@@ -93,6 +93,58 @@ TEST_F(VersionEditTest, EncodeDecode) {
   TestEncodeDecode(edit);
 }
 
+namespace {
+FileMetaData MakeKiWiFileMeta(uint64_t floor) {
+  FileMetaData meta;
+  meta.fd = FileDescriptor(305, 0, 100, 50, 60);
+  meta.smallest = InternalKey("foo", 50, kTypeValue);
+  meta.largest = InternalKey("zoo", 60, kTypeValue);
+  meta.epoch_number = 7;
+  meta.kiwi_delete_floor = floor;
+  return meta;
+}
+}  // namespace
+
+TEST_F(VersionEditTest, KiWiDeleteFloor) {
+  // Round trip, and the field costs nothing unless it is set.
+  VersionEdit with_floor;
+  with_floor.AddFile(2, MakeKiWiFileMeta(1234567890123));
+  TestEncodeDecode(with_floor);
+  VersionEdit without_floor;
+  without_floor.AddFile(2, MakeKiWiFileMeta(0));
+  std::string encoded_with;
+  std::string encoded_without;
+  with_floor.EncodeTo(&encoded_with, 0 /* ts_sz */);
+  without_floor.EncodeTo(&encoded_without, 0 /* ts_sz */);
+  // tag + length + 7-byte varint of a 41-bit value
+  ASSERT_EQ(encoded_with.size(), encoded_without.size() + 1 + 1 + 6);
+
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded_with));
+  ASSERT_EQ(decoded.GetNewFiles().size(), 1U);
+  ASSERT_EQ(decoded.GetNewFiles()[0].second.kiwi_delete_floor,
+            1234567890123U);
+  ASSERT_NE(decoded.DebugString().find("kiwi_delete_floor:1234567890123"),
+            std::string::npos);
+  VersionEdit decoded_without;
+  ASSERT_OK(decoded_without.DecodeFrom(encoded_without));
+  ASSERT_EQ(decoded_without.GetNewFiles()[0].second.kiwi_delete_floor, 0U);
+  ASSERT_EQ(decoded_without.DebugString().find("kiwi_delete_floor"),
+            std::string::npos);
+
+  // Moving a file to another level (a trivial move, or recording it in a new
+  // MANIFEST) keeps the floor; losing it would resurrect deleted entries.
+  VersionEdit moved;
+  moved.AddExistingFile(3, MakeKiWiFileMeta(42), kProvenanceMovedBetweenLevels);
+  ASSERT_EQ(moved.GetNewFiles()[0].second.kiwi_delete_floor, 42U);
+
+  // Older versions do not know the tag and must refuse the MANIFEST (the
+  // generic rejection of unknown unignorable tags is tested further below).
+  ASSERT_NE(NewFileCustomTag::kKiWiDeleteFloor &
+                NewFileCustomTag::kCustomTagNonSafeIgnoreMask,
+            0U);
+}
+
 TEST_F(VersionEditTest, EncodeDecodeNewFile4) {
   static const uint64_t kBig = 1ull << 50;
 

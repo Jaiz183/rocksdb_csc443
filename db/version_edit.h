@@ -131,7 +131,14 @@ enum NewFileCustomTag : uint32_t {
 
   // Forward incompatible (aka unignorable) fields
   kPathId,
+  // KiWi secondary delete floor. Unignorable: an older version that skipped it
+  // would show entries that were deleted.
+  kKiWiDeleteFloor,
 };
+
+static_assert((NewFileCustomTag::kKiWiDeleteFloor &
+               NewFileCustomTag::kCustomTagNonSafeIgnoreMask) != 0,
+              "kKiWiDeleteFloor must make older versions fail to open the DB");
 
 class VersionSet;
 
@@ -386,6 +393,13 @@ struct FileMetaData {
   // Size of the "tail" part of a SST file
   // "Tail" refers to all blocks after data blocks till the end of the SST file
   uint64_t tail_size = 0;
+
+  // KiWi secondary delete (see BlockBasedTableOptions::kiwi_tile_pages): every
+  // entry of this file whose delete key is below this value was deleted. Such
+  // entries are hidden from reads and dropped by compaction, without the file
+  // having been rewritten. 0 means nothing was deleted. Persisted in the
+  // MANIFEST only when non-zero.
+  uint64_t kiwi_delete_floor = 0;
 
   // Value of the `AdvancedColumnFamilyOptions.persist_user_defined_timestamps`
   // flag when the file is created. Default to true, only when this flag is
@@ -978,6 +992,13 @@ class VersionEdit {
   // on the added file, recording what is happening to it (0 for none).
   void AddExistingFile(int level, const FileMetaData& f,
                        uint32_t provenance_flags_to_set);
+
+  // AddExistingFile() for a KiWi secondary delete: the file keeps its number
+  // and level but gets `floor` as its delete floor, and is marked for
+  // compaction so that compaction picks it up sooner. (The mark is ignored for
+  // files in the last level that holds data, as for any marked file.)
+  void AddFileWithKiWiDeleteFloor(int level, const FileMetaData& f,
+                                  uint64_t floor);
 
   const NewFiles& GetNewFiles() const { return new_files_; }
 

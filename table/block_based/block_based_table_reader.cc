@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -63,6 +64,7 @@
 #include "table/block_based/filter_block.h"
 #include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/full_filter_block.h"
+#include "table/block_based/kiwi_table_iterator.h"
 #include "table/block_based/hash_index_reader.h"
 #include "table/block_based/partitioned_filter_block.h"
 #include "table/block_based/partitioned_index_reader.h"
@@ -72,6 +74,7 @@
 #include "table/format.h"
 #include "table/get_context.h"
 #include "table/internal_iterator.h"
+#include "table/merging_iterator.h"
 #include "table/meta_blocks.h"
 #include "table/multiget_context.h"
 #include "table/persistent_cache_helper.h"
@@ -273,10 +276,15 @@ BlockBasedTable::~BlockBasedTable() {
         // will be in block cache without the index block pointing to it
         // also in block cache.)
         UncacheAggressivenessAdvisor advisor(ua);
+        std::vector<BlockHandle> handles;
         for (iiter->SeekToFirst(); iiter->Valid() && advisor.ShouldContinue();
              iiter->Next()) {
-          bool erased = EraseFromCache(iiter->value().handle);
-          advisor.Report(erased);
+          if (!DataBlockHandlesOf(iiter->value(), &handles).ok()) {
+            break;
+          }
+          for (const BlockHandle& handle : handles) {
+            advisor.Report(EraseFromCache(handle));
+          }
         }
         iiter->status().PermitUncheckedError();
       }
@@ -1000,6 +1008,11 @@ Status BlockBasedTable::Open(
   if (!s.ok()) {
     return s;
   }
+  s = new_table->ReadKiWiDirectory(ro, prefetch_buffer.get(),
+                                   metaindex_iter.get());
+  if (!s.ok()) {
+    return s;
+  }
   rep->verify_checksum_set_on_open = ro.verify_checksums;
   s = new_table->PrefetchIndexAndFilterBlocks(
       ro, prefetch_buffer.get(), metaindex_iter.get(), new_table.get(),
@@ -1679,6 +1692,186 @@ Status BlockBasedTable::ResolveEmbeddedValueForGet(
   return s;
 }
 
+Status BlockBasedTable::ReadKiWiDirectory(const ReadOptions& ro,
+                                          FilePrefetchBuffer* prefetch_buffer,
+                                          InternalIterator* meta_iter) {
+  const auto& props = rep_->table_properties->user_collected_properties;
+  if (props.find(kiwi::kPropTilePages) == props.end()) {
+    return Status::OK();
+  }
+  // A KiWi file cannot be read without its directory: fail the open.
+  BlockHandle handle;
+  Status s = FindMetaBlock(meta_iter, kiwi::kDirectoryBlockName, &handle);
+  if (!s.ok()) {
+    return Status::Corruption("KiWi file without a directory block: " +
+                              s.ToString());
+  }
+  // The directory outlives open and every lookup depends on it, so always
+  // verify its checksum.
+  ReadOptions verified_ro = ro;
+  verified_ro.verify_checksums = true;
+  BlockContents contents;
+  BlockFetcher fetcher(rep_->file.get(), prefetch_buffer, rep_->footer,
+                       verified_ro, handle, &contents, rep_->ioptions,
+                       /*do_uncompress=*/false, /*maybe_compressed=*/false,
+                       BlockType::kProperties, /*decompressor=*/nullptr,
+                       PersistentCacheOptions::kEmpty,
+                       GetMemoryAllocator(rep_->table_options));
+  s = fetcher.ReadBlockContents();
+  if (!s.ok()) {
+    return s;
+  }
+  auto directory = std::make_unique<kiwi::Directory>();
+  s = directory->Decode(contents.data.ToString());
+  if (!s.ok()) {
+    return s;
+  }
+  const auto offset_prop = props.find(kiwi::kPropDeleteKeyOffset);
+  bool offset_ok = offset_prop != props.end();
+  if (offset_ok) {
+    const std::string& text = offset_prop->second;
+    const char* end = text.data() + text.size();
+    const auto parsed = std::from_chars(text.data(), end,
+                                        rep_->kiwi_delete_key_offset);
+    offset_ok = parsed.ec == std::errc() && parsed.ptr == end;
+  }
+  if (!offset_ok) {
+    return Status::Corruption("KiWi file without a valid delete key offset");
+  }
+  rep_->kiwi_directory = std::move(directory);
+  return Status::OK();
+}
+
+Status BlockBasedTable::SetKiWiDeleteFloor(uint64_t floor) {
+  if (rep_->kiwi_directory == nullptr) {
+    return Status::Corruption(
+        "KiWi delete floor recorded for a file without KiWi tiles");
+  }
+  rep_->kiwi_delete_floor = floor;
+  return Status::OK();
+}
+
+uint64_t BlockBasedTable::KiWiDeleteFloor() const {
+  return rep_->kiwi_delete_floor;
+}
+
+Status BlockBasedTable::DataBlockHandlesOf(
+    const IndexValue& index_value, std::vector<BlockHandle>* handles) const {
+  handles->clear();
+  if (rep_->kiwi_directory == nullptr) {
+    handles->push_back(index_value.handle);
+    return Status::OK();
+  }
+  const kiwi::Directory& dir = *rep_->kiwi_directory;
+  const size_t tile_index = dir.FindTile(index_value.handle.offset());
+  if (tile_index == dir.num_tiles()) {
+    return Status::Corruption("KiWi: index entry is not the start of a tile");
+  }
+  const kiwi::Directory::TileView tile = dir.tile(tile_index);
+  for (size_t i = 0; i < tile.num_pages; ++i) {
+    handles->push_back(tile.pages[i].handle);
+  }
+  return Status::OK();
+}
+
+Status BlockBasedTable::KiWiGet(const ReadOptions& read_options,
+                                const Slice& key, GetContext* get_context,
+                                bool skip_filters) {
+  const kiwi::Directory& dir = *rep_->kiwi_directory;
+  const Slice user_key = ExtractUserKey(key);
+  const Comparator* ucmp = rep_->internal_comparator.user_comparator();
+  BlockCacheLookupContext lookup_context{
+      TableReaderCaller::kUserGet, get_context->get_tracing_get_id(),
+      /*get_from_user_specified_snapshot=*/read_options.snapshot != nullptr};
+  std::unique_ptr<InternalIteratorBase<IndexValue>> iiter(NewIndexIterator(
+      read_options, /*disable_prefix_seek=*/false, /*input_iter=*/nullptr,
+      get_context, &lookup_context));
+  Statistics* stats = rep_->ioptions.stats;
+  Status s;
+  bool matched = false;
+  bool used_filter = false;
+  bool done = false;
+  for (iiter->Seek(key); iiter->Valid() && !done; iiter->Next()) {
+    const size_t tile_index = dir.FindTile(iiter->value().handle.offset());
+    if (tile_index == dir.num_tiles()) {
+      s = Status::Corruption("KiWi: index entry is not the start of a tile");
+      break;
+    }
+    // Only pages whose filter matches can hold the key.
+    const kiwi::Directory::TileView tile = dir.tile(tile_index);
+    std::vector<InternalIterator*> pages;
+    for (size_t i = 0; i < tile.num_pages; ++i) {
+      if (!skip_filters && tile.pages[i].bloom.size() > 0) {
+        used_filter = true;
+        if (!dir.PageMayMatch(&tile.pages[i], user_key)) {
+          RecordTick(stats, BLOOM_FILTER_USEFUL);
+          continue;
+        }
+        RecordTick(stats, BLOOM_FILTER_FULL_POSITIVE);
+      }
+      InternalIterator* page = KiWiTableIterator::NewPageIterator(
+          this, read_options, tile.pages[i], get_context, &lookup_context,
+          /*for_compaction=*/false);
+      if (page != nullptr) {
+        pages.push_back(page);
+      }
+    }
+    if (!pages.empty()) {
+      // Versions of one key can sit on different pages, so merge them and let
+      // the context see them newest first, as for any other table.
+      std::unique_ptr<InternalIterator> merged(NewMergingIterator(
+          &rep_->internal_comparator, pages.data(),
+          static_cast<int>(pages.size())));
+      for (merged->Seek(key); merged->Valid(); merged->Next()) {
+        ParsedInternalKey parsed_key;
+        s = ParseInternalKey(merged->key(), &parsed_key,
+                             /*log_err_key=*/false);
+        if (!s.ok()) {
+          break;
+        }
+        Status read_status;
+        const bool more = get_context->SaveValue(parsed_key, merged->value(),
+                                                 &matched, &read_status);
+        if (!read_status.ok()) {
+          s = read_status;
+          break;
+        }
+        if (!more) {
+          done = true;
+          break;
+        }
+      }
+      if (s.ok()) {
+        s = merged->status();
+      }
+      if (s.IsIncomplete() && read_options.read_tier == kBlockCacheTier) {
+        // A page is not in the block cache: the key may exist.
+        get_context->MarkKeyMayExist();
+      }
+      if (!s.ok()) {
+        break;
+      }
+    }
+    // Later tiles only hold larger keys: stop unless this tile ends in the
+    // user key, in which case older versions may continue in the next tile.
+    if (!done && ucmp->CompareWithoutTimestamp(iiter->user_key(), user_key) !=
+                     0) {
+      done = true;
+    }
+  }
+  if (matched && used_filter) {
+    RecordTick(stats, BLOOM_FILTER_FULL_TRUE_POSITIVE);
+  }
+  if (s.ok() && !iiter->status().IsNotFound()) {
+    s = iiter->status();
+  }
+  return s;
+}
+
+const kiwi::Directory* BlockBasedTable::TEST_GetKiWiDirectory() const {
+  return rep_->kiwi_directory.get();
+}
+
 Status BlockBasedTable::ReadRangeDelBlock(
     const ReadOptions& read_options, FilePrefetchBuffer* prefetch_buffer,
     InternalIterator* meta_iter,
@@ -2109,6 +2302,9 @@ size_t BlockBasedTable::ApproximateMemoryUsage() const {
   }
   if (rep_->table_properties) {
     usage += rep_->table_properties->ApproximateMemoryUsage();
+  }
+  if (rep_->kiwi_directory) {
+    usage += rep_->kiwi_directory->ApproximateMemoryUsage();
   }
   // Cached block memory is charged to the block cache. Count the retained raw
   // custom-index block here only when the table reader owns it directly.
@@ -2812,6 +3008,23 @@ InternalIterator* BlockBasedTable::NewIteratorImpl(
     size_t compaction_readahead_size, bool allow_unprepared_value,
     const Slice* seek_target) {
   BlockCacheLookupContext lookup_context{caller};
+  if (UNLIKELY(rep_->kiwi_directory != nullptr)) {
+    // Pages of a KiWi tile are not in key order, so the block-based iterator
+    // cannot be used. KiWi files have no whole-file filter to consult.
+    std::unique_ptr<InternalIteratorBase<IndexValue>> kiwi_index_iter(
+        NewIndexIterator(read_options, /*disable_prefix_seek=*/false,
+                         /*input_iter=*/nullptr, /*get_context=*/nullptr,
+                         &lookup_context));
+    if (arena == nullptr) {
+      return new KiWiTableIterator(
+          this, read_options, rep_->internal_comparator,
+          std::move(kiwi_index_iter), caller);
+    }
+    auto* mem = arena->AllocateAligned(sizeof(KiWiTableIterator));
+    return new (mem) KiWiTableIterator(this, read_options,
+                                       rep_->internal_comparator,
+                                       std::move(kiwi_index_iter), caller);
+  }
   bool need_upper_bound_check =
       read_options.auto_prefix_mode || PrefixExtractorChanged(prefix_extractor);
   bool check_filter =
@@ -3040,7 +3253,10 @@ Status BlockBasedTable::ApproximateKeyAnchors(const ReadOptions& read_options,
   // smaller file. The size might also need to be passed in by the caller based
   // on total compaction size.
   const uint64_t kMaxNumAnchors = uint64_t{128};
-  uint64_t num_blocks = this->GetTableProperties()->num_data_blocks;
+  // Anchors are placed per index entry, which covers a whole tile in KiWi.
+  uint64_t num_blocks = rep_->kiwi_directory != nullptr
+                            ? rep_->kiwi_directory->num_tiles()
+                            : this->GetTableProperties()->num_data_blocks;
   uint64_t num_blocks_per_anchor = num_blocks / kMaxNumAnchors;
   if (num_blocks_per_anchor == 0) {
     num_blocks_per_anchor = 1;
@@ -3139,7 +3355,6 @@ Status BlockBasedTable::Prefetch(const ReadOptions& read_options,
 
   for (begin ? iiter->Seek(*begin) : iiter->SeekToFirst(); iiter->Valid();
        iiter->Next()) {
-    BlockHandle block_handle = iiter->value().handle;
     const bool is_user_key = !rep_->index_key_includes_seq;
     if (end &&
         ((!is_user_key && comparator.Compare(iiter->key(), *end) >= 0) ||
@@ -3154,18 +3369,26 @@ Status BlockBasedTable::Prefetch(const ReadOptions& read_options,
       prefetching_boundary_page = true;
     }
 
-    // Load the block specified by the block_handle into the block cache
-    DataBlockIter biter;
-    Status tmp_status;
-    NewDataBlockIterator<DataBlockIter>(
-        read_options, block_handle, &biter, /*block_type=*/BlockType::kData,
-        /*get_context=*/nullptr, &lookup_context,
-        /*prefetch_buffer=*/nullptr, /*for_compaction=*/false,
-        /*async_read=*/false, tmp_status, /*use_block_cache_for_lookup=*/true);
+    // Load the block(s) specified by the index entry into the block cache
+    std::vector<BlockHandle> handles;
+    Status handles_status = DataBlockHandlesOf(iiter->value(), &handles);
+    if (!handles_status.ok()) {
+      return handles_status;
+    }
+    for (const BlockHandle& handle : handles) {
+      DataBlockIter biter;
+      Status tmp_status;
+      NewDataBlockIterator<DataBlockIter>(
+          read_options, handle, &biter, /*block_type=*/BlockType::kData,
+          /*get_context=*/nullptr, &lookup_context,
+          /*prefetch_buffer=*/nullptr, /*for_compaction=*/false,
+          /*async_read=*/false, tmp_status,
+          /*use_block_cache_for_lookup=*/true);
 
-    if (!biter.status().ok()) {
-      // there was an unexpected error while pre-fetching
-      return biter.status();
+      if (!biter.status().ok()) {
+        // there was an unexpected error while pre-fetching
+        return biter.status();
+      }
     }
   }
 
@@ -3235,14 +3458,23 @@ Status BlockBasedTable::VerifyChecksumInBlocks(
     if (!s.ok()) {
       break;
     }
-    BlockHandle handle = index_iter->value().handle;
-    BlockContents contents;
-    BlockFetcher block_fetcher(
-        rep_->file.get(), &prefetch_buffer, rep_->footer, read_options, handle,
-        &contents, rep_->ioptions, false /* decompress */,
-        false /*maybe_compressed*/, BlockType::kData, nullptr /*decompressor*/,
-        rep_->persistent_cache_options);
-    s = block_fetcher.ReadBlockContents();
+    std::vector<BlockHandle> handles;
+    s = DataBlockHandlesOf(index_iter->value(), &handles);
+    if (!s.ok()) {
+      break;
+    }
+    for (const BlockHandle& handle : handles) {
+      BlockContents contents;
+      BlockFetcher block_fetcher(
+          rep_->file.get(), &prefetch_buffer, rep_->footer, read_options,
+          handle, &contents, rep_->ioptions, false /* decompress */,
+          false /*maybe_compressed*/, BlockType::kData,
+          nullptr /*decompressor*/, rep_->persistent_cache_options);
+      s = block_fetcher.ReadBlockContents();
+      if (!s.ok()) {
+        break;
+      }
+    }
     if (!s.ok()) {
       break;
     }
@@ -3272,6 +3504,11 @@ BlockType BlockBasedTable::GetBlockTypeForMetaBlockByName(
 
   if (meta_block_name == kCompressionDictBlockName) {
     return BlockType::kCompressionDictionary;
+  }
+
+  if (meta_block_name == kiwi::kDirectoryBlockName) {
+    // Written (and read) as a raw, uncached meta block like the properties.
+    return BlockType::kProperties;
   }
 
   if (meta_block_name == kRangeDelBlockName) {
@@ -3610,37 +3847,46 @@ Status BlockBasedTable::GetKVPairsFromDataBlocks(
       break;
     }
 
-    std::unique_ptr<InternalIterator> datablock_iter;
-    Status tmp_status;
-    datablock_iter.reset(NewDataBlockIterator<DataBlockIter>(
-        read_options, blockhandles_iter->value().handle,
-        /*input_iter=*/nullptr, /*block_type=*/BlockType::kData,
-        /*get_context=*/nullptr, /*lookup_context=*/nullptr,
-        /*prefetch_buffer=*/nullptr, /*for_compaction=*/false,
-        /*async_read=*/false, tmp_status, /*use_block_cache_for_lookup=*/true));
-    s = datablock_iter->status();
-
+    // One block per index entry, or one per page of a KiWi tile.
+    std::vector<BlockHandle> handles;
+    s = DataBlockHandlesOf(blockhandles_iter->value(), &handles);
     if (!s.ok()) {
-      // Error reading the block - Skipped
-      continue;
+      break;
     }
-
-    KVPairBlock kv_pair_block;
-    for (datablock_iter->SeekToFirst(); datablock_iter->Valid();
-         datablock_iter->Next()) {
+    for (const BlockHandle& handle : handles) {
+      std::unique_ptr<InternalIterator> datablock_iter;
+      Status tmp_status;
+      datablock_iter.reset(NewDataBlockIterator<DataBlockIter>(
+          read_options, handle,
+          /*input_iter=*/nullptr, /*block_type=*/BlockType::kData,
+          /*get_context=*/nullptr, /*lookup_context=*/nullptr,
+          /*prefetch_buffer=*/nullptr, /*for_compaction=*/false,
+          /*async_read=*/false, tmp_status,
+          /*use_block_cache_for_lookup=*/true));
       s = datablock_iter->status();
+
       if (!s.ok()) {
         // Error reading the block - Skipped
-        break;
+        continue;
       }
-      const Slice& key = datablock_iter->key();
-      const Slice& value = datablock_iter->value();
-      std::string key_copy = std::string(key.data(), key.size());
-      std::string value_copy = std::string(value.data(), value.size());
 
-      kv_pair_block.emplace_back(std::move(key_copy), std::move(value_copy));
+      KVPairBlock kv_pair_block;
+      for (datablock_iter->SeekToFirst(); datablock_iter->Valid();
+           datablock_iter->Next()) {
+        s = datablock_iter->status();
+        if (!s.ok()) {
+          // Error reading the block - Skipped
+          break;
+        }
+        const Slice& key = datablock_iter->key();
+        const Slice& value = datablock_iter->value();
+        std::string key_copy = std::string(key.data(), key.size());
+        std::string value_copy = std::string(value.data(), value.size());
+
+        kv_pair_block.emplace_back(std::move(key_copy), std::move(value_copy));
+      }
+      kv_pair_blocks->push_back(std::move(kv_pair_block));
     }
-    kv_pair_blocks->push_back(std::move(kv_pair_block));
   }
   return Status::OK();
 }
@@ -3914,52 +4160,60 @@ Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream,
 
   size_t block_id = 1;
   for (blockhandles_iter->SeekToFirst(); blockhandles_iter->Valid();
-       block_id++, blockhandles_iter->Next()) {
+       blockhandles_iter->Next()) {
     s = blockhandles_iter->status();
     if (!s.ok()) {
       break;
     }
 
-    BlockHandle bh = blockhandles_iter->value().handle;
-    uint64_t datablock_size = bh.size();
-    datablock_size_min = std::min(datablock_size_min, datablock_size);
-    datablock_size_max = std::max(datablock_size_max, datablock_size);
-    datablock_size_sum += datablock_size;
-
-    out_stream << "Data Block # " << block_id << " @ "
-               << blockhandles_iter->value().handle.ToString(true) << "\n";
-
-    // Read block checksum information
-    DumpBlockChecksumInfo(bh, read_options, "Data block", out_stream);
-
-    out_stream << "--------------------------------------\n";
-
-    std::unique_ptr<InternalIterator> datablock_iter;
-    Status tmp_status;
-    datablock_iter.reset(NewDataBlockIterator<DataBlockIter>(
-        read_options, blockhandles_iter->value().handle,
-        /*input_iter=*/nullptr, /*block_type=*/BlockType::kData,
-        /*get_context=*/nullptr, /*lookup_context=*/nullptr,
-        /*prefetch_buffer=*/nullptr, /*for_compaction=*/false,
-        /*async_read=*/false, tmp_status, /*use_block_cache_for_lookup=*/true));
-    s = datablock_iter->status();
-
+    // One block per index entry, or one per page of a KiWi tile.
+    std::vector<BlockHandle> handles;
+    s = DataBlockHandlesOf(blockhandles_iter->value(), &handles);
     if (!s.ok()) {
-      out_stream << "Error reading the block - Skipped \n\n";
-      continue;
+      break;
     }
+    for (const BlockHandle& bh : handles) {
+      uint64_t datablock_size = bh.size();
+      datablock_size_min = std::min(datablock_size_min, datablock_size);
+      datablock_size_max = std::max(datablock_size_max, datablock_size);
+      datablock_size_sum += datablock_size;
 
-    for (datablock_iter->SeekToFirst(); datablock_iter->Valid();
-         datablock_iter->Next()) {
+      out_stream << "Data Block # " << block_id++ << " @ " << bh.ToString(true)
+                 << "\n";
+
+      // Read block checksum information
+      DumpBlockChecksumInfo(bh, read_options, "Data block", out_stream);
+
+      out_stream << "--------------------------------------\n";
+
+      std::unique_ptr<InternalIterator> datablock_iter;
+      Status tmp_status;
+      datablock_iter.reset(NewDataBlockIterator<DataBlockIter>(
+          read_options, bh,
+          /*input_iter=*/nullptr, /*block_type=*/BlockType::kData,
+          /*get_context=*/nullptr, /*lookup_context=*/nullptr,
+          /*prefetch_buffer=*/nullptr, /*for_compaction=*/false,
+          /*async_read=*/false, tmp_status,
+          /*use_block_cache_for_lookup=*/true));
       s = datablock_iter->status();
+
       if (!s.ok()) {
-        out_stream << "Error reading the block - Skipped \n";
-        break;
+        out_stream << "Error reading the block - Skipped \n\n";
+        continue;
       }
-      DumpKeyValue(datablock_iter->key(), datablock_iter->value(), out_stream,
-                   show_sequence_number_type);
+
+      for (datablock_iter->SeekToFirst(); datablock_iter->Valid();
+           datablock_iter->Next()) {
+        s = datablock_iter->status();
+        if (!s.ok()) {
+          out_stream << "Error reading the block - Skipped \n";
+          break;
+        }
+        DumpKeyValue(datablock_iter->key(), datablock_iter->value(),
+                     out_stream, show_sequence_number_type);
+      }
+      out_stream << "\n";
     }
-    out_stream << "\n";
   }
 
   uint64_t num_datablocks = block_id - 1;

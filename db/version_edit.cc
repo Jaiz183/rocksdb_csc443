@@ -213,6 +213,16 @@ void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
   added.db_ownership_start_time = f.db_ownership_start_time;
   added.oldest_tombstone_time = f.oldest_tombstone_time;
   added.data_file_provenance = f.data_file_provenance | provenance_flags_to_set;
+  // Moving a file between levels must not undo a secondary delete.
+  added.kiwi_delete_floor = f.kiwi_delete_floor;
+}
+
+void VersionEdit::AddFileWithKiWiDeleteFloor(int level, const FileMetaData& f,
+                                             uint64_t floor) {
+  AddExistingFile(level, f, /*provenance_flags_to_set=*/0);
+  FileMetaData& added = new_files_.back().second;
+  added.kiwi_delete_floor = floor;
+  added.marked_for_compaction = true;
 }
 
 bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
@@ -522,6 +532,12 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     PutVarint64(&varint_oldest_tombstone_time, f.oldest_tombstone_time);
     PutLengthPrefixedSlice(dst, Slice(varint_oldest_tombstone_time));
   }
+  if (f.kiwi_delete_floor != 0) {
+    PutVarint32(dst, NewFileCustomTag::kKiWiDeleteFloor);
+    std::string varint_kiwi_delete_floor;
+    PutVarint64(&varint_kiwi_delete_floor, f.kiwi_delete_floor);
+    PutLengthPrefixedSlice(dst, Slice(varint_kiwi_delete_floor));
+  }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
 
@@ -683,6 +699,11 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
         case kOldestTombstoneTime:
           if (!GetVarint64(&field, &f.oldest_tombstone_time)) {
             return "invalid oldest tombstone time";
+          }
+          break;
+        case kKiWiDeleteFloor:
+          if (!GetVarint64(&field, &f.kiwi_delete_floor)) {
+            return "invalid KiWi delete floor";
           }
           break;
         default:
@@ -1203,6 +1224,10 @@ std::string VersionEdit::DebugString(bool hex_key) const {
       r.append(" data_file_provenance:");
       r.append(DataFileProvenanceToString(f.data_file_provenance));
     }
+    if (f.kiwi_delete_floor != 0) {
+      r.append(" kiwi_delete_floor:");
+      AppendNumberTo(&r, f.kiwi_delete_floor);
+    }
     r.append(" file_checksum:");
     r.append(Slice(f.file_checksum).ToString(true));
     r.append(" file_checksum_func_name: ");
@@ -1354,6 +1379,9 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       if (f.data_file_provenance != 0) {
         jw << "DataFileProvenance"
            << DataFileProvenanceToString(f.data_file_provenance);
+      }
+      if (f.kiwi_delete_floor != 0) {
+        jw << "KiWiDeleteFloor" << f.kiwi_delete_floor;
       }
       jw << "FileChecksum" << Slice(f.file_checksum).ToString(true);
       jw << "FileChecksumFuncName" << f.file_checksum_func_name;

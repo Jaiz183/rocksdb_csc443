@@ -875,6 +875,22 @@ DEFINE_bool(separate_key_value_in_data_block,
                 .separate_key_value_in_data_block,
             "If true, data blocks store keys and values separately.");
 
+DEFINE_uint32(kiwi_tile_pages,
+              ROCKSDB_NAMESPACE::BlockBasedTableOptions().kiwi_tile_pages,
+              "BlockBasedTableOptions::kiwi_tile_pages: data blocks per KiWi "
+              "delete tile; 0 or 1 disables KiWi.");
+
+DEFINE_uint32(
+    kiwi_delete_key_offset,
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions().kiwi_delete_key_offset,
+    "BlockBasedTableOptions::kiwi_delete_key_offset: byte offset of the 8-byte "
+    "big-endian delete key in a value (values must be at least offset + 8 "
+    "bytes long when KiWi is on).");
+
+DEFINE_double(kiwi_delete_fraction, 0.1,
+              "Fraction of the entries written by kiwiload, the oldest ones, "
+              "that kiwisecondarydelete deletes.");
+
 DEFINE_string(optimize_key_common_prefix, "",
               "BlockBasedTableOptions::optimize_key_common_prefix: one of "
               "'disabled', 'auto', 'enabled'. Empty leaves the default.");
@@ -5077,6 +5093,16 @@ class Benchmark {
         fresh_db = true;
         num_threads = 1;
         method = &Benchmark::FillEmbeddedBlob;
+      } else if (name == "kiwiload") {
+        fresh_db = true;
+        num_threads = 1;
+        method = &Benchmark::KiWiLoad;
+      } else if (name == "kiwisecondarydelete") {
+        num_threads = 1;
+        method = &Benchmark::KiWiSecondaryDelete;
+      } else if (name == "kiwifullcompaction") {
+        num_threads = 1;
+        method = &Benchmark::KiWiFullCompaction;
       } else if (name == "compactall") {
         CompactAll();
       } else if (name == "compact0") {
@@ -6218,6 +6244,8 @@ class Benchmark {
       block_based_options.block_align = FLAGS_block_align;
       block_based_options.separate_key_value_in_data_block =
           FLAGS_separate_key_value_in_data_block;
+      block_based_options.kiwi_tile_pages = FLAGS_kiwi_tile_pages;
+      block_based_options.kiwi_delete_key_offset = FLAGS_kiwi_delete_key_offset;
       if (!FLAGS_optimize_key_common_prefix.empty()) {
         if (FLAGS_optimize_key_common_prefix == "disabled") {
           block_based_options.optimize_key_common_prefix =
@@ -11605,6 +11633,153 @@ class Benchmark {
   void FillEmbeddedEntity(ThreadState* thread) { FillEmbedded(thread, true); }
 
   void FillEmbeddedBlob(ThreadState* thread) { FillEmbedded(thread, false); }
+
+  // KiWi benchmarks. kiwiload writes --num values at random keys; the 8 bytes
+  // at --kiwi_delete_key_offset of the i-th write are the big-endian number
+  // i + 1, a "timestamp" that grows with every write, so the oldest entries are
+  // the ones with the smallest delete keys. A newer version of a key therefore
+  // never has a smaller delete key than an older one, as
+  // DB::SecondaryDeleteBelow() requires.
+  void KiWiLoad(ThreadState* thread) {
+    DB* db = SelectDB(thread);
+    const size_t offset = FLAGS_kiwi_delete_key_offset;
+    if (static_cast<size_t>(FLAGS_value_size) < offset + 8) {
+      fprintf(stderr,
+              "kiwiload needs --value_size >= --kiwi_delete_key_offset + 8\n");
+      db_bench_exit(1);
+    }
+    RandomGenerator gen;
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+    std::string value;
+    int64_t bytes = 0;
+    for (int64_t i = 0; i < num_; ++i) {
+      GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key);
+      const Slice generated = gen.Generate();
+      value.assign(generated.data(), generated.size());
+      const uint64_t timestamp = static_cast<uint64_t>(i) + 1;
+      for (size_t b = 0; b < 8; ++b) {
+        value[offset + b] =
+            static_cast<char>((timestamp >> (8 * (7 - b))) & 0xff);
+      }
+      Status s = db->Put(write_options_, key, value);
+      if (!s.ok()) {
+        fprintf(stderr, "kiwiload: Put failed: %s\n", s.ToString().c_str());
+        db_bench_exit(1);
+      }
+      bytes += key.size() + value.size();
+      thread->stats.FinishedOps(&db_, db, 1, kWrite);
+    }
+    thread->stats.AddBytes(bytes);
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "(%" PRId64 " writes, delete keys 1..%" PRId64 ")", num_, num_);
+    thread->stats.AddMessage(msg);
+  }
+
+  // Bytes read and written by compactions so far (needs --statistics).
+  std::pair<uint64_t, uint64_t> KiWiCompactionBytes() {
+    if (!dbstats) {
+      return {0, 0};
+    }
+    return {dbstats->getTickerCount(COMPACT_READ_BYTES),
+            dbstats->getTickerCount(COMPACT_WRITE_BYTES)};
+  }
+
+  // Flushes and lets background work finish, so a measurement starts quiet.
+  void KiWiSettle(DB* db) {
+    Status s = db->Flush(FlushOptions());
+    if (s.ok()) {
+      s = db->WaitForCompact(WaitForCompactOptions());
+    }
+    if (!s.ok()) {
+      fprintf(stderr, "kiwi: could not settle the DB: %s\n",
+              s.ToString().c_str());
+      db_bench_exit(1);
+    }
+  }
+
+  // Deletes the oldest --kiwi_delete_fraction of what kiwiload wrote, without a
+  // full compaction. Reports the latency of the call, what compactions read and
+  // wrote meanwhile (expected: nothing), and the compaction that follows by
+  // itself. The latter only rewrites files above the last level with data, so
+  // it is small: the deleted entries are invisible at once but their space is
+  // reclaimed only when compaction rewrites the files.
+  void KiWiSecondaryDelete(ThreadState* thread) {
+    DB* db = SelectDB(thread);
+    // Delete keys are 1..num_, so this deletes the first floor - 1 entries.
+    const uint64_t floor =
+        1 + static_cast<uint64_t>(FLAGS_kiwi_delete_fraction * num_);
+    KiWiSettle(db);
+    const auto before = KiWiCompactionBytes();
+    uint64_t delete_micros = 0;
+    Status s;
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+      const uint64_t start = FLAGS_env->NowMicros();
+      s = db->SecondaryDeleteBelow(floor);
+      delete_micros += FLAGS_env->NowMicros() - start;
+      if (!s.IsBusy()) {
+        break;
+      }
+      db->WaitForCompact(WaitForCompactOptions()).PermitUncheckedError();
+    }
+    if (!s.ok()) {
+      fprintf(stderr, "kiwisecondarydelete: %s\n", s.ToString().c_str());
+      db_bench_exit(1);
+    }
+    const auto after_delete = KiWiCompactionBytes();
+    const uint64_t reclaim_start = FLAGS_env->NowMicros();
+    s = db->WaitForCompact(WaitForCompactOptions());
+    const uint64_t reclaim_micros = FLAGS_env->NowMicros() - reclaim_start;
+    if (!s.ok()) {
+      fprintf(stderr, "kiwisecondarydelete: %s\n", s.ToString().c_str());
+      db_bench_exit(1);
+    }
+    const auto after_reclaim = KiWiCompactionBytes();
+    const double mb = 1024.0 * 1024.0;
+    char msg[300];
+    snprintf(msg, sizeof(msg),
+             "(floor=%" PRIu64 "; delete call %.3f ms, compaction read/write "
+             "%.1f/%.1f MB meanwhile; compaction that followed by itself "
+             "%.3f s, read/write %.1f/%.1f MB)",
+             floor, delete_micros / 1000.0,
+             (after_delete.first - before.first) / mb,
+             (after_delete.second - before.second) / mb,
+             reclaim_micros / 1e6,
+             (after_reclaim.first - after_delete.first) / mb,
+             (after_reclaim.second - after_delete.second) / mb);
+    thread->stats.FinishedOps(&db_, db, 1, kOthers);
+    thread->stats.AddMessage(msg);
+  }
+
+  // The baseline for kiwisecondarydelete: rewriting the whole tree, which is
+  // the least a database without KiWi must do to physically remove entries by
+  // a secondary attribute.
+  void KiWiFullCompaction(ThreadState* thread) {
+    DB* db = SelectDB(thread);
+    KiWiSettle(db);
+    const auto before = KiWiCompactionBytes();
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    const uint64_t start = FLAGS_env->NowMicros();
+    Status s = db->CompactRange(compact_options, nullptr, nullptr);
+    const uint64_t micros = FLAGS_env->NowMicros() - start;
+    if (!s.ok()) {
+      fprintf(stderr, "kiwifullcompaction: %s\n", s.ToString().c_str());
+      db_bench_exit(1);
+    }
+    const auto after = KiWiCompactionBytes();
+    const double mb = 1024.0 * 1024.0;
+    char msg[200];
+    snprintf(msg, sizeof(msg),
+             "(full-tree compaction %.3f s, compaction read/write %.1f/%.1f "
+             "MB)",
+             micros / 1e6, (after.first - before.first) / mb,
+             (after.second - before.second) / mb);
+    thread->stats.FinishedOps(&db_, db, 1, kOthers);
+    thread->stats.AddMessage(msg);
+  }
 
   void CompactAll() {
     std::vector<DB*> dbs;

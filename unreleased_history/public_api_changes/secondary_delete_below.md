@@ -1,0 +1,1 @@
+Added `DB::SecondaryDeleteBelow()` (experimental), which deletes every entry whose KiWi delete key is below a floor without a full compaction. It is supported on column families written with `BlockBasedTableOptions::kiwi_tile_pages`; recording the floor adds an unignorable MANIFEST field, so older versions cannot open such a database.
