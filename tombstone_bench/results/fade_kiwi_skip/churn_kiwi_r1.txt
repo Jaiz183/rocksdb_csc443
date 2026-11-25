@@ -1,0 +1,13 @@
+== churn_kiwi_r1 load={ 31.87 39.47 42.03 }
+cf_opts="" run_s=60.0 ops=1200000 (puts=658427 dels=541573 rdels=0) ops/s=20000
+write_amp=4.379  (compaction 280.7 MB + flush 69.4 MB) / user 80.0 MB
+avg_upper_tombstones=21380  peak_tomb_age_ub=63s  avg_sst_MB=83.15
+true_tomb_age: peak=45.0s avg=23.0s samples_over_10s=49/59
+end_of_run: sst_MB=86.12 upper_tombs=22280 total_tombs=22280 levels_KB=0/0/0/756/2637/13376/71416
+drained:    sst_MB=86.68 upper_tombs=25826 total_tombs=25826 levels_KB=571/0/0/756/2637/13376/71416 space_amp=1.179
+compactions by reason: LevelL0FilesNum=56(73.0MB) LevelMaxLevelSize=113(207.7MB)
+compactions by shape:  L0->L3=56(73.0MB) L3->L4=69(89.2MB) L4->L5=28(83.0MB) L5->L6=16(35.5MB)
+skip-level shapes:     
+L0 compactions:         LevelL0FilesNum=56(avg_l0_files=2.00,avg_in=1.7MB)
+verify: live_keys=670607 mismatches=0 bg_errors=0 -> PASS
+exit=0
