@@ -28,7 +28,7 @@ peeling) rather than swapping in a different filter structure.
 | `kiwi_tile_xor_tight` | `tile` | `NewXorFilterPolicy(1)` (`tile-filter-opt`) | Optimized 8-bit `[fp \|\| page]` per-tile XOR (`+4` slack, 1-derive peel, compact `Directory`, zero-peel `ShiftBasePage`) |
 | `kiwi_tile_xor_tight_16bit` | `tile` | `NewXorFilterPolicy(2)` (`tile-filter-opt`) | Optimized 16-bit `[fp \|\| page]` per-tile XOR (`+4` slack, compact `Directory`) |
 | `kiwi_tile_xor_delete_rank` | `tile` | `{id=xorfilter:1;kiwi_delete_rank_bits=2}` | Per-tile XOR packing 2 sub-page delete-key rank bits (`[fp \|\| rank \|\| page]`) to prune straddling edge pages |
-| `kiwi_sst_xor_index_free` | `sst` | `{id=xorfilter:1;kiwi_file_filter=true}` | SST-wide `Directory` v3 XOR (`[fp \|\| tile \|\| page]`) probed before the index block |
+| `kiwi_sst_xor_index_free` | `sst` | `{id=xorfilter:1;kiwi_file_filter=true}` | SST-wide `Directory` v3 XOR (`[fp \|\| local_page]`) probed before the index block |
 
 ---
 
@@ -141,10 +141,12 @@ edge pages prune keys whose rank bucket's upper bound falls strictly below
 
 ### 6. SST-Wide Index-Free XOR+Tile+Page Filter (`kiwi_sst_xor_index_free`, `kiwi_file_filter`, Directory v3)
 Configured via `FilterPolicy::CreateFromString(..., "{id=xorfilter:1;kiwi_file_filter=true}", ...)`,
-one SST-wide 3-way XOR filter (`[fp || tile_idx || local_page_idx]` encoded in
+one SST-wide 3-way XOR filter (`[fp || local_page_idx]` encoded in
 `DirectoryBuilder::kFormatVersionFileFilter = 3`, where `Order = global_order`)
-resolves absent-key lookups **before** `NewIndexIterator()` is ever called,
-eliminating index-block I/O and binary search on negative queries. If any
+resolves absent-key lookups **before** `NewIndexIterator()` is ever called
+(while positive lookups use the SST tile index for `tile_idx` plus the decoded
+`local_page_idx`), eliminating index-block I/O and binary search on negative
+queries. If any
 multi-version `user_key` spans a tile boundary (`prev_tile_last_user_key ==
 first_user_key`), `BlockBasedTableBuilder` automatically falls back to per-tile
 v2 filters. (`RewriteKiWiTableDroppingPages` is currently limited to v1/v2

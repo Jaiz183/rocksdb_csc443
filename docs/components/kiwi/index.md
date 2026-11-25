@@ -23,6 +23,7 @@ compaction picking), is not implemented here.
 | Per-file floor in the MANIFEST | `FileMetaData::kiwi_delete_floor`, `kKiWiDeleteFloor` in `db/version_edit.{h,cc}` |
 | Per-tile XOR filter design & benchmarks | [tile_filter.md](tile_filter.md) |
 | XOR filter optimizations & augmentations | [tile_filter_optimizations.md](tile_filter_optimizations.md) |
+| Quantitative XOR vs Bloom benchmark summary | [benchmark_summary.md](benchmark_summary.md) |
 | Tests | `table/block_based/kiwi_test.cc`, `DBKiWiTest` and `DBKiWiSecondaryDeleteTest` in `db/db_etc3_test.cc` |
 
 ## Layout
@@ -70,10 +71,11 @@ files have no whole-file filter:
     `kiwi_delete_rank_bits`) to prune straddling edge-page reads after secondary
     deletes ([tile_filter_optimizations.md](tile_filter_optimizations.md)).
 - **Directory v3 (`kiwi_file_filter=true`, `kiwi_sst_xor_index_free`)**: stores
-  one SST-wide 3-way XOR filter (`[fingerprint || tile_index || page_index]`)
-  probed before the SST index block so negative lookups avoid index-block I/O
-  and binary search (automatically falling back to v2 if a multi-version user
-  key spans a tile boundary; see
+  one SST-wide 3-way XOR filter (`[fingerprint || local_page_index]`) probed
+  before the SST index block so negative lookups avoid index-block I/O and
+  binary search, while positive lookups pair the SST tile index with the
+  already-decoded `local_page_index` (automatically falling back to v2 if a
+  multi-version user key spans a tile boundary; see
   [tile_filter_optimizations.md](tile_filter_optimizations.md)).
 
 A file is a KiWi file if and only if it has the table property
