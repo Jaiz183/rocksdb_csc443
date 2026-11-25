@@ -38,6 +38,11 @@ add_executable(options_file_example
 target_link_libraries(options_file_example
   ${ROCKSDB_LIB})
 
+add_executable(xor_filter_query_example
+  xor_filter_query_example.cc)
+target_link_libraries(xor_filter_query_example
+  ${ROCKSDB_LIB})
+
 add_executable(multi_processes_example
   EXCLUDE_FROM_ALL
   multi_processes_example.cc)

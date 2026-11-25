@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <iomanip>
@@ -996,6 +997,42 @@ TEST_F(DBBloomFilterTest, BloomFilterRate) {
     ASSERT_GE(TestGetTickerCount(options, BLOOM_FILTER_USEFUL), maxKey * 0.98);
     ASSERT_GE(GetLevelPerfContext(0).bloom_filter_useful, maxKey * 0.98);
     get_perf_context()->Reset();
+  }
+}
+
+TEST_F(DBBloomFilterTest, XorFilterFingerprintSizes) {
+  ASSERT_THROW(NewXorFilterPolicy(0), std::invalid_argument);
+  ASSERT_THROW(NewXorFilterPolicy(9), std::invalid_argument);
+
+  std::shared_ptr<const FilterPolicy> parsed_policy;
+  ASSERT_OK(FilterPolicy::CreateFromString(ConfigOptions(), "xorfilter:2",
+                                           &parsed_policy));
+  ASSERT_EQ(parsed_policy->GetId(), "rocksdb.XorFilter:2");
+  ASSERT_THROW(FilterPolicy::CreateFromString(ConfigOptions(), "xorfilter:2.5",
+                                              &parsed_policy),
+               std::invalid_argument);
+
+  const std::array<int, 4> fingerprint_bytes = {1, 2, 3, 8};
+  for (int bytes : fingerprint_bytes) {
+    Options options = CurrentOptions();
+    BlockBasedTableOptions table_options;
+    table_options.filter_policy.reset(NewXorFilterPolicy(bytes));
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    DestroyAndReopen(options);
+
+    for (int i = 0; i < 128; ++i) {
+      const std::string key = "xor-key-" + std::to_string(i);
+      ASSERT_OK(Put(key, key));
+    }
+    ASSERT_OK(Flush());
+
+    for (int i = 0; i < 128; ++i) {
+      const std::string key = "xor-key-" + std::to_string(i);
+      ASSERT_EQ(key, Get(key));
+    }
+    for (int i = 128; i < 256; ++i) {
+      ASSERT_EQ("NOT_FOUND", Get("xor-key-" + std::to_string(i)));
+    }
   }
 }
 

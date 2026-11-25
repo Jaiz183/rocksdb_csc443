@@ -9,13 +9,19 @@
 
 #include "rocksdb/filter_policy.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <limits>
 #include <memory>
+#include <queue>
+#include <stack>
+#include <stdexcept>
+#include <tuple>
 
 #include "cache/cache_reservation_manager.h"
 #include "logging/logging.h"
@@ -356,6 +362,379 @@ class XXPH3FilterBitsBuilder : public FilterBitsBuilder {
   };
 
   HashEntriesInfo hash_entries_info_;
+};
+
+struct XorFilterHash {
+  struct XorSlots {
+    uint32_t idx[3];
+    uint64_t fp;
+  };
+
+  // Mix the input hash with the seed before deriving its slots.
+  static inline uint64_t Remix(uint64_t h, uint8_t seed) {
+    h ^= (uint64_t{seed} + 1) * 0x9E3779B97F4A7C15ULL;
+    h ^= h >> 32;
+    h *= 0x9E3779B97F4A7C15ULL;
+    h ^= h >> 29;
+    return h;
+  }
+
+  // Map a 32-bit value to [0, n) using Lemire's fastrange.
+  static inline uint32_t FastRange32(uint32_t x, uint32_t n) {
+    return static_cast<uint32_t>((uint64_t{x} * n) >> 32);
+  }
+
+  // Rotate a 64-bit hash.
+  static inline uint64_t Rotl64(uint64_t x, int r) {
+    return (x << r) | (x >> (64 - r));
+  }
+
+  // Split a hash into three slot indices and a fingerprint.
+  static inline XorSlots Derive(uint64_t h, uint32_t seg_len) {
+    XorSlots s;
+    // Each index lands in its own segment, so the three slots are distinct.
+    s.idx[0] = FastRange32(static_cast<uint32_t>(h), seg_len);
+    s.idx[1] =
+        FastRange32(static_cast<uint32_t>(Rotl64(h, 21)), seg_len) + seg_len;
+    s.idx[2] = FastRange32(static_cast<uint32_t>(Rotl64(h, 42)), seg_len) +
+               2 * seg_len;
+    s.fp = h;
+    return s;
+  }
+
+  // Apply the seed-dependent mix before deriving the slots and fingerprint.
+  static inline XorSlots SeededDerive(uint64_t h, uint32_t seg_len,
+                                      uint8_t seed) {
+    XorSlots slots = Derive(Remix(h, seed), seg_len);
+    slots.fp = Remix(h ^ 0xD6E8FEB86659FD93ULL, seed);
+    return slots;
+  }
+};
+
+uint8_t NormalizeXorFingerprintBytes(int fingerprint_bytes) {
+  if (fingerprint_bytes < 1 || fingerprint_bytes > 8) {
+    throw std::invalid_argument(
+        "XOR fingerprint size must be an integer from 1 to 8 bytes");
+  }
+  return static_cast<uint8_t>(fingerprint_bytes);
+}
+
+uint8_t XorFingerprintBytesFromBits(uint8_t fingerprint_bits) {
+  return static_cast<uint8_t>((fingerprint_bits + 7) / 8);
+}
+
+uint64_t XorFingerprintMaskFromBits(uint8_t fingerprint_bits) {
+  return fingerprint_bits == 64 ? std::numeric_limits<uint64_t>::max()
+                                : (uint64_t{1} << fingerprint_bits) - 1;
+}
+
+uint64_t XorFingerprintMaskFromBytes(uint8_t fingerprint_bytes) {
+  return fingerprint_bytes == 8 ? std::numeric_limits<uint64_t>::max()
+                                : (uint64_t{1} << (fingerprint_bytes * 8)) - 1;
+}
+
+uint64_t ReadXorFingerprint(const char* data, uint32_t slot,
+                            uint8_t fingerprint_bytes) {
+  uint64_t value = 0;
+  const size_t offset = static_cast<size_t>(slot) * fingerprint_bytes;
+  for (uint8_t i = 0; i < fingerprint_bytes; ++i) {
+    value |= static_cast<uint64_t>(static_cast<uint8_t>(data[offset + i]))
+             << (i * 8);
+  }
+  return value;
+}
+
+void WriteXorFingerprint(char* data, uint32_t slot, uint8_t fingerprint_bytes,
+                         uint64_t fingerprint) {
+  const size_t offset = static_cast<size_t>(slot) * fingerprint_bytes;
+  for (uint8_t i = 0; i < fingerprint_bytes; ++i) {
+    data[offset + i] = static_cast<char>(fingerprint >> (i * 8));
+  }
+}
+
+// ---- Builder ----
+class XorFilterBitsBuilder : public XXPH3FilterBitsBuilder {
+ public:
+  XorFilterBitsBuilder(std::atomic<int64_t>* aggregate_rounding_balance,
+                       std::shared_ptr<CacheReservationManager> cache_res_mgr,
+                       bool detect_filter_construct_corruption,
+                       uint8_t fingerprint_bytes)
+      : XXPH3FilterBitsBuilder(aggregate_rounding_balance,
+                               std::move(cache_res_mgr),
+                               detect_filter_construct_corruption),
+        fingerprint_bytes_(fingerprint_bytes),
+        fingerprint_mask_(XorFingerprintMaskFromBytes(fingerprint_bytes)) {}
+  // No copy allowed
+  XorFilterBitsBuilder(const XorFilterBitsBuilder&) = delete;
+  void operator=(const XorFilterBitsBuilder&) = delete;
+  XorFilterBitsBuilder(XorFilterBitsBuilder&&) = delete;
+  void operator=(XorFilterBitsBuilder&&) = delete;
+
+  ~XorFilterBitsBuilder() override {}
+
+  // AddKey, AddKeyAndAlt accumulate hashes in hash_entries_info_.entries
+
+  using FilterBitsBuilder::Finish;  // keep the other overloads visible
+  Slice Finish(std::unique_ptr<const char[]>* buf) override {
+    return Finish(buf, nullptr);
+  }
+
+  Slice Finish(std::unique_ptr<const char[]>* buf, Status* status) override {
+    // 0. verify checksum for corruption
+    Status vs = VerifyChecksumBeforeDedupe();
+    if (!vs.ok()) {
+      ResetEntries();
+      if (status) *status = vs;
+      return Slice();
+    }
+    // 1. dedupe hashes - duplicate hashes make peeling impossible
+    std::sort(hash_entries_info_.entries.begin(),
+              hash_entries_info_.entries.end());
+    auto new_end = std::unique(hash_entries_info_.entries.begin(),
+                               hash_entries_info_.entries.end());
+    hash_entries_info_.entries.erase(new_end, hash_entries_info_.entries.end());
+
+    const uint32_t num_keys = hash_entries_info_.entries.size();
+    const uint32_t filter_size = GetFilterSize(num_keys);
+    const uint32_t payload_size = filter_size - kMetadataLen;
+    const uint32_t seg_len =
+        static_cast<uint32_t>(payload_size / (3 * fingerprint_bytes_));
+    const uint32_t num_slots = 3 * seg_len;
+
+    // alloc buffer w/ space for metadata
+    std::unique_ptr<char[]> mutable_buf = std::make_unique<char[]>(filter_size);
+
+    // try to constuct hypergraph and peel until successful
+    bool peeled = false;
+    uint8_t s_seed = 0;
+    std::stack<std::tuple<uint64_t, uint32_t>> peeled_edges;
+    std::vector<std::set<uint64_t>> hypergraph;
+    for (uint8_t seed = 0; !peeled; seed++) {
+      hypergraph = BuildHypergraph(num_slots, seg_len, seed);
+      peeled_edges = PeelHypergraph(hypergraph, seg_len, seed);
+      peeled = peeled_edges.size() ==
+               num_keys;  // if all edges could be peeled, we succeed
+      s_seed = seed;
+      if (seed == 255) {
+        break;
+      }
+    }
+
+    if (!peeled) {
+      if (status)
+        *status = Status::Corruption(
+            "failed to peel edges over 256 seeds; we're in trouble :(");
+
+      ResetEntries();
+      return Slice();
+    }
+
+    // iterate through the stack of edges and init the filter
+    // init the filter w/ all 0s
+    while (!peeled_edges.empty()) {
+      // get edge, set corresponding vertex entry so all vertices xor to the
+      // fingerprint
+      const uint64_t e = std::get<0>(peeled_edges.top());
+      const uint32_t v = std::get<1>(peeled_edges.top());
+      peeled_edges.pop();
+      XorFilterHash::XorSlots h =
+          XorFilterHash::SeededDerive(e, seg_len, s_seed);
+      uint32_t h0 = h.idx[0], h1 = h.idx[1], h2 = h.idx[2];
+      const uint64_t fingerprint =
+          ReadXorFingerprint(mutable_buf.get(), h0, fingerprint_bytes_) ^
+          ReadXorFingerprint(mutable_buf.get(), h1, fingerprint_bytes_) ^
+          ReadXorFingerprint(mutable_buf.get(), h2, fingerprint_bytes_) ^
+          (h.fp & fingerprint_mask_);
+      WriteXorFingerprint(mutable_buf.get(), v, fingerprint_bytes_,
+                          fingerprint);
+    }
+
+    // write metadata trailer / marker
+    mutable_buf[filter_size - kMetadataLen] = static_cast<char>(-5);
+    mutable_buf[filter_size - kMetadataLen + 1] =
+        static_cast<char>(fingerprint_bytes_);
+    mutable_buf[filter_size - kMetadataLen + 2] = static_cast<char>(s_seed);
+    Slice f(mutable_buf.get(), filter_size);
+    *buf = std::move(mutable_buf);
+    if (status) *status = Status::OK();
+
+    // cleanup: frees hash list, its cache reservation, and the checksum
+    ReserveFinalFilterMemory(filter_size);
+    ResetEntries();
+
+    return f;
+  }
+
+  size_t ApproximateNumEntries(size_t bytes) override {
+    if (bytes <= kMetadataLen) {
+      return 0;
+    }
+    const size_t slots = (bytes - kMetadataLen) / fingerprint_bytes_;
+    if (slots <= 33) {
+      return 0;
+    }
+    return static_cast<size_t>((slots - 32) / 1.23);
+  }
+
+  size_t CalculateSpace(const size_t num_entries) override {
+    return GetFilterSize(num_entries);
+  }
+
+  double EstimatedFpRate(size_t, size_t) override {
+    return std::ldexp(1.0, -8 * fingerprint_bytes_);
+  }
+
+  size_t RoundDownUsableSpace(size_t available_size) override {
+    return available_size;
+  }
+
+ private:
+  uint32_t GetFilterSize(uint32_t num_keys) const {
+    const uint32_t unrounded_filter_length =
+        static_cast<uint32_t>(1.23 * num_keys) + 32;
+    const uint32_t seg_len =
+        (unrounded_filter_length + 2) / 3;  // round seg_len up
+    const uint32_t filter_length = seg_len * 3;
+    return filter_length * fingerprint_bytes_ + kMetadataLen;
+  }
+  // Verify the running XOR checksum BEFORE sorting/deduping hash_entries_info_.
+  // Returns OK if corruption detection is off or the checksum matches.
+  // On failure the entries are reset, so the caller should just bail out.
+  Status VerifyChecksumBeforeDedupe() {
+    return MaybeVerifyHashEntriesChecksum();
+  }
+
+  // Charge the block cache for the final filter buffer and keep the
+  // reservation alive for the lifetime of the builder.
+  // Best-effort: a failed charge is not treated as a build failure.
+  void ReserveFinalFilterMemory(size_t len) {
+    if (!cache_res_mgr_) {
+      return;
+    }
+    std::unique_ptr<CacheReservationManager::CacheReservationHandle> handle;
+    Status s = cache_res_mgr_->MakeCacheReservation(len, &handle);
+    s.PermitUncheckedError();
+    final_filter_cache_res_handles_.push_back(std::move(handle));
+  }
+
+  std::vector<std::set<uint64_t>> BuildHypergraph(uint32_t num_slots,
+                                                  uint32_t seg_len,
+                                                  uint8_t seed) const {
+    // Each key is an edge; the hypergraph stores the keys incident to each
+    // vertex. The vertex array is partitioned into three segments.
+    std::vector<std::set<uint64_t>> hypergraph(num_slots);
+    for (uint64_t edge : hash_entries_info_.entries) {
+      XorFilterHash::XorSlots h =
+          XorFilterHash::SeededDerive(edge, seg_len, seed);
+      for (size_t i = 0; i < 3; i++) {
+        uint32_t vertex = h.idx[i];
+        hypergraph[vertex].insert(edge);
+      }
+    }
+    return hypergraph;
+  }
+
+  std::stack<std::tuple<uint64_t, uint32_t>> PeelHypergraph(
+      std::vector<std::set<uint64_t>>& hypergraph, uint32_t seg_len,
+      uint8_t seed) const {
+    // Start with vertices incident to a single edge, then propagate as edges
+    // are removed.
+    std::queue<uint32_t> queue;
+    for (size_t i = 0; i < hypergraph.size(); i++) {
+      if (hypergraph[i].size() == 1) {
+        queue.push(static_cast<uint32_t>(i));
+      }
+    }
+
+    std::stack<std::tuple<uint64_t, uint32_t>> peeled_edges;
+    while (!queue.empty()) {
+      uint32_t vertex = queue.front();
+      queue.pop();
+      if (!hypergraph[vertex].empty()) {
+        uint64_t edge = *hypergraph[vertex].begin();
+        XorFilterHash::XorSlots h =
+            XorFilterHash::SeededDerive(edge, seg_len, seed);
+        for (size_t i = 0; i < 3; i++) {
+          uint32_t hi = h.idx[i];
+          hypergraph[hi].erase(edge);
+          if (hypergraph[hi].size() == 1) {
+            queue.push(hi);
+          }
+        }
+        peeled_edges.emplace(edge, vertex);
+      }
+    }
+    return peeled_edges;
+  }
+
+  // Check your version: some of these may also need overriding
+  // (e.g. EstimateEntriesAdded, MaybePostVerify).
+  const uint8_t fingerprint_bytes_;
+  const uint64_t fingerprint_mask_;
+};
+
+// ---- Reader ----
+class XorFilterBitsReader : public BuiltinFilterBitsReader {
+ public:
+  using FilterBitsReader::MayMatch;
+
+  explicit XorFilterBitsReader(const char* data, uint8_t seed, uint32_t seg_len,
+                               uint8_t fingerprint_bytes,
+                               uint64_t fingerprint_mask)
+      : data_(data),
+        seed_(seed),
+        seg_len_(seg_len),
+        fingerprint_bytes_(fingerprint_bytes),
+        fingerprint_mask_(fingerprint_mask) {}
+
+  XorFilterBitsReader(const XorFilterBitsReader&) = delete;
+  void operator=(const XorFilterBitsReader&) = delete;
+  XorFilterBitsReader(XorFilterBitsReader&&) = delete;
+  void operator=(XorFilterBitsReader&&) = delete;
+
+  bool MayMatch(const Slice& key) override {
+    // hash key, look up 3 slots, compare fingerprint
+    uint64_t hash = GetSliceHash64(key);
+    return HashMayMatch(hash);
+  }
+
+  bool HashMayMatch(const uint64_t hash) override {
+    XorFilterHash::XorSlots h =
+        XorFilterHash::SeededDerive(hash, seg_len_, seed_);
+    const uint32_t h0 = h.idx[0], h1 = h.idx[1], h2 = h.idx[2];
+    const uint64_t fingerprint =
+        ReadXorFingerprint(data_, h0, fingerprint_bytes_) ^
+        ReadXorFingerprint(data_, h1, fingerprint_bytes_) ^
+        ReadXorFingerprint(data_, h2, fingerprint_bytes_);
+    return (h.fp & fingerprint_mask_) == fingerprint;
+  }
+
+ private:
+  const char* data_;
+  uint8_t seed_;
+  uint32_t seg_len_;
+  uint8_t fingerprint_bytes_;
+  uint64_t fingerprint_mask_;
+};
+
+// ---- Policy ----
+class XorFilterPolicy : public BuiltinFilterPolicy {
+ public:
+  explicit XorFilterPolicy(int fingerprint_bytes)
+      : fingerprint_bytes_(NormalizeXorFingerprintBytes(fingerprint_bytes)) {}
+
+  const char* Name() const override { return "rocksdb.XorFilter"; }
+  std::string GetId() const override {
+    return std::string(Name()) + ":" + std::to_string(fingerprint_bytes_);
+  }
+
+  FilterBitsBuilder* GetBuilderWithContext(
+      const FilterBuildingContext& context) const override {
+    return GetXorFilterBuilderWithContext(context, fingerprint_bytes_);
+  }
+
+ private:
+  const uint8_t fingerprint_bytes_;
 };
 
 // #################### FastLocalBloom implementation ################## //
@@ -1416,6 +1795,10 @@ Status XXPH3FilterBitsBuilder::MaybePostVerify(const Slice& filter_content) {
 }
 }  // namespace
 
+const FilterPolicy* NewXorFilterPolicy(int fingerprint_bytes) {
+  return new XorFilterPolicy(fingerprint_bytes);
+}
+
 const char* BuiltinFilterPolicy::kClassName() {
   return "rocksdb.internal.BuiltinFilter";
 }
@@ -1588,6 +1971,31 @@ BloomLikeFilterPolicy::GetStandard128RibbonBuilderWithContext(
       context.info_log);
 }
 
+FilterBitsBuilder* BuiltinFilterPolicy::GetXorFilterBuilderWithContext(
+    const FilterBuildingContext& context, uint8_t fingerprint_bytes) {
+  const auto options_overrides_iter =
+      context.table_options.cache_usage_options.options_overrides.find(
+          CacheEntryRole::kFilterConstruction);
+  const auto filter_construction_charged =
+      options_overrides_iter !=
+              context.table_options.cache_usage_options.options_overrides.end()
+          ? options_overrides_iter->second.charged
+          : context.table_options.cache_usage_options.options.charged;
+
+  std::shared_ptr<CacheReservationManager> cache_res_mgr;
+  if (context.table_options.block_cache &&
+      filter_construction_charged ==
+          CacheEntryRoleOptions::Decision::kEnabled) {
+    cache_res_mgr = std::make_shared<
+        CacheReservationManagerImpl<CacheEntryRole::kFilterConstruction>>(
+        context.table_options.block_cache);
+  }
+  return new XorFilterBitsBuilder(
+      nullptr, cache_res_mgr,
+      context.table_options.detect_filter_construct_corruption,
+      fingerprint_bytes);
+}
+
 std::string BloomLikeFilterPolicy::GetBitsPerKeySuffix() const {
   std::string rv = ":" + std::to_string(millibits_per_key_ / 1000);
   int frac = millibits_per_key_ % 1000;
@@ -1699,6 +2107,12 @@ BuiltinFilterBitsReader* BuiltinFilterPolicy::GetBuiltinFilterBitsReader(
       case -2:
         // Marker for Ribbon implementations
         return GetRibbonBitsReader(contents);
+      case -4:
+        // Backward compatibility for the earlier bit-width format.
+        return GetXorFilterBitsReader(contents, true);
+      case -5:
+        // Marker for XOR filters with configurable fingerprint byte size.
+        return GetXorFilterBitsReader(contents, false);
       default:
         // Reserved (treat as zero probes, always FP, for now)
         return new AlwaysTrueFilter();
@@ -1830,6 +2244,39 @@ BuiltinFilterBitsReader* BuiltinFilterPolicy::GetBloomBitsReader(
   return new AlwaysTrueFilter();
 }
 
+BuiltinFilterBitsReader* BuiltinFilterPolicy::GetXorFilterBitsReader(
+    const Slice& contents, bool fingerprint_bits_format) {
+  uint32_t filter_size = static_cast<uint32_t>(contents.size());
+  const uint32_t payload_size = filter_size - kMetadataLen;
+  uint8_t fingerprint_bytes;
+  const uint8_t seed = static_cast<uint8_t>(contents.data()[filter_size - 3]);
+  uint64_t fingerprint_mask;
+  if (fingerprint_bits_format) {
+    const uint8_t fingerprint_bits =
+        static_cast<uint8_t>(contents.data()[filter_size - 4]);
+    if (fingerprint_bits < 1 || fingerprint_bits > 64) {
+      return new AlwaysTrueFilter();
+    }
+    fingerprint_bytes = XorFingerprintBytesFromBits(fingerprint_bits);
+    fingerprint_mask = XorFingerprintMaskFromBits(fingerprint_bits);
+  } else {
+    fingerprint_bytes = static_cast<uint8_t>(contents.data()[filter_size - 4]);
+    if (fingerprint_bytes < 1 || fingerprint_bytes > 8) {
+      return new AlwaysTrueFilter();
+    }
+    fingerprint_mask = XorFingerprintMaskFromBytes(fingerprint_bytes);
+  }
+  const uint32_t bytes_per_segmented_slot = 3 * fingerprint_bytes;
+  if (payload_size == 0 || payload_size % bytes_per_segmented_slot != 0) {
+    return new AlwaysTrueFilter();
+  }
+  const uint32_t seg_len = payload_size / bytes_per_segmented_slot;
+
+  return new XorFilterBitsReader(contents.data(), seed, seg_len,
+                                 fingerprint_bytes, fingerprint_mask);
+}
+
+// #region sd
 const FilterPolicy* NewBloomFilterPolicy(double bits_per_key,
                                          bool /*use_block_based_builder*/) {
   // NOTE: use_block_based_builder now ignored so block-based filter is no
@@ -1997,6 +2444,20 @@ static int RegisterBuiltinFilterPolicies(ObjectLibrary& library,
         const std::vector<std::string> vals = StringSplit(uri, ':');
         double bits_per_key = ParseDouble(vals[1]);
         guard->reset(NewRibbonFilterPolicy(bits_per_key));
+        return guard->get();
+      });
+  library.AddFactory<const FilterPolicy>(
+      FilterPatternEntryWithBits("xorfilter").AnotherName("rocksdb.XorFilter"),
+      [](const std::string& uri, std::unique_ptr<const FilterPolicy>* guard,
+         std::string* /* errmsg */) {
+        const std::vector<std::string> vals = StringSplit(uri, ':');
+        size_t parsed_chars;
+        const int fingerprint_bytes = std::stoi(vals[1], &parsed_chars);
+        if (parsed_chars != vals[1].size()) {
+          throw std::invalid_argument(
+              "XOR fingerprint size must be an integer number of bytes");
+        }
+        guard->reset(NewXorFilterPolicy(fingerprint_bytes));
         return guard->get();
       });
   library.AddFactory<const FilterPolicy>(

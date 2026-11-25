@@ -220,4 +220,13 @@ const FilterPolicy* NewBloomFilterPolicy(
 FilterPolicy* NewRibbonFilterPolicy(double bloom_equivalent_bits_per_key,
                                     int bloom_before_level = 0);
 
+// Return a filter policy that uses XOR filters for block-based tables.
+// fingerprint_bytes must be an integer from 1 to 8.
+// Throws std::invalid_argument for an out-of-range value.
+// Older RocksDB versions treat filters written with this policy as may-match.
+// The caller is responsible for eventually deleting the result, though this
+// is typically handled automatically with BlockBasedTableOptions:
+//   table_options.filter_policy.reset(NewXorFilterPolicy(...));
+const FilterPolicy* NewXorFilterPolicy(int fingerprint_bytes);
+
 }  // namespace ROCKSDB_NAMESPACE
