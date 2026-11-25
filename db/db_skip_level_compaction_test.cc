@@ -17,6 +17,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/listener.h"
 #include "test_util/sync_point.h"
+#include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -242,6 +243,17 @@ TEST_F(DBSkipLevelCompactionTest, SnapshotKeepsTombstonesButDataIsCorrect) {
   // not candidates any more (no compaction loop).
   ASSERT_EQ(static_cast<uint64_t>(n / 2), DeletionsAtLevel(3));
   ASSERT_EQ(1U, listener_->Records().size());
+  // Outputs of a skip-level compaction carry the hysteresis flag.
+  {
+    ColumnFamilyData* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                                db_->DefaultColumnFamily())
+                                ->cfd();
+    const auto& l3 = cfd->current()->storage_info()->LevelFiles(3);
+    ASSERT_FALSE(l3.empty());
+    for (const FileMetaData* f : l3) {
+      ASSERT_TRUE(f->from_skip_level_compaction);
+    }
+  }
   for (int i = 0; i < n; i++) {
     ASSERT_EQ(i < n / 2 ? "NOT_FOUND" : "v2", Get(Key(i)));
     ASSERT_EQ("v2", Get(Key(i), snap));
@@ -271,8 +283,8 @@ TEST_F(DBSkipLevelCompactionTest, AmortizedCostPicksTargetByOverlap) {
     // Small L3 overlap: L2 big, L3 small -> the L3 overlap is far below one
     // amortized hop (1 + T) * S, skip to L3.
     // Large L3 overlap: L2 small, L3 big -> the L3 overlap is far above it,
-    // so only one level (L1 -> L2). The growth cap is set high so the
-    // amortized rule alone decides.
+    // so no skip, and the trigger leaves the file alone. The growth cap is set
+    // high so the amortized rule alone decides.
     BuildLayout(n, deep_is_large ? 10 : 2000, deep_is_large ? 2000 : 10);
     listener_->Clear();
     ASSERT_OK(db_->SetOptions({{"skip_level_tombstone_compaction", "2"},
@@ -280,9 +292,15 @@ TEST_F(DBSkipLevelCompactionTest, AmortizedCostPicksTargetByOverlap) {
                                {"disable_auto_compactions", "false"}}));
     ASSERT_OK(dbfull()->TEST_WaitForCompact());
     auto skips = SkipRecords();
-    ASSERT_FALSE(skips.empty());
-    ASSERT_EQ(1, skips[0].base_input_level);
-    ASSERT_EQ(deep_is_large ? 2 : 3, skips[0].output_level);
+    if (deep_is_large) {
+      // Not worth skipping, and the trigger does no one-level compactions.
+      ASSERT_TRUE(skips.empty());
+      ASSERT_EQ("0,1,1,1", FilesPerLevel());
+    } else {
+      ASSERT_FALSE(skips.empty());
+      ASSERT_EQ(1, skips[0].base_input_level);
+      ASSERT_EQ(3, skips[0].output_level);
+    }
     VerifyData(n, deep_is_large ? 10 : 2000);
   }
 }

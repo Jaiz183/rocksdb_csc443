@@ -4059,8 +4059,8 @@ void VersionStorageInfo::ComputeTombstoneDenseFiles(
       mutable_cf_options.skip_level_tombstone_density_threshold;
   for (int level = 0; level < last_non_empty; level++) {
     for (FileMetaData* f : files_[level]) {
-      if (!f->being_compacted && f->num_deletions > 0 &&
-          TombstoneDensity(f) >= threshold) {
+      if (!f->being_compacted && !f->from_skip_level_compaction &&
+          f->num_deletions > 0 && TombstoneDensity(f) >= threshold) {
         tombstone_dense_files_.emplace_back(level, f);
       }
     }

@@ -105,6 +105,16 @@ class LevelCompactionBuilder {
   // True iff the picked start-level inputs should be considered for a
   // skip-level compaction.
   bool ShouldTrySkipLevel() const;
+
+  // Density trigger: tries the tombstone-dense files, densest first, and sets
+  // up the first one for which TrySetupSkipLevelCompaction() finds a target
+  // deeper than the normal output level. A dense file that cannot skip is left
+  // to size-based compaction: a one-level compaction picked only for its
+  // tombstones costs a full extra level crossing and its output is usually
+  // still dense, so it would be picked again at the next level.
+  bool PickSkipLevelTriggerCompaction();
+  // True once TrySetupSkipLevelCompaction() succeeded for the current pick.
+  bool skip_level_set_up_ = false;
   // Tries to turn the picked start-level inputs into a multi-level
   // compaction start_level_ -> t with t deeper than the normal output level.
   // On success fills compaction_inputs_, output_level_, grandparents_ and
@@ -283,10 +293,7 @@ void LevelCompactionBuilder::SetupInitialFiles() {
   // last non-empty level. Runs after size-based compaction so it never
   // starves it.
   parent_index_ = base_index_ = -1;
-  PickFileToCompact(vstorage_->TombstoneDenseFiles(),
-                    CompactToNextLevel::kSkipLastLevel);
-  if (!start_level_inputs_.empty()) {
-    compaction_reason_ = CompactionReason::kSkipLevelTombstone;
+  if (PickSkipLevelTriggerCompaction()) {
     return;
   }
 
@@ -566,7 +573,8 @@ Compaction* LevelCompactionBuilder::PickCompaction() {
   }
   assert(start_level_ >= 0 && output_level_ >= 0);
 
-  if (ShouldTrySkipLevel() && TrySetupSkipLevelCompaction()) {
+  if (skip_level_set_up_ ||
+      (ShouldTrySkipLevel() && TrySetupSkipLevelCompaction())) {
     Compaction* c = GetCompaction();
     TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
     return c;
@@ -631,6 +639,31 @@ Compaction* LevelCompactionBuilder::GetCompaction() {
   vstorage_->ComputeCompactionScore(ioptions_, mutable_cf_options_,
                                     full_history_ts_low_);
   return c;
+}
+
+bool LevelCompactionBuilder::PickSkipLevelTriggerCompaction() {
+  for (const auto& level_file : vstorage_->TombstoneDenseFiles()) {
+    assert(!level_file.second->being_compacted);
+    start_level_ = level_file.first;
+    if (start_level_ >= vstorage_->num_non_empty_levels() - 1 ||
+        (start_level_ == 0 &&
+         !compaction_picker_->level0_compactions_in_progress()->empty())) {
+      continue;
+    }
+    output_level_ =
+        (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
+    start_level_inputs_.files = {level_file.second};
+    start_level_inputs_.level = start_level_;
+    if (!compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
+                                                    &start_level_inputs_)) {
+      continue;
+    }
+    if (TrySetupSkipLevelCompaction()) {
+      return true;
+    }
+  }
+  start_level_inputs_.files.clear();
+  return false;
 }
 
 bool LevelCompactionBuilder::ShouldTrySkipLevel() const {
@@ -819,6 +852,7 @@ bool LevelCompactionBuilder::TrySetupSkipLevelCompaction() {
                    "%zu input levels",
                    cf_name_.c_str(), start, output_level_,
                    compaction_inputs_.size());
+  skip_level_set_up_ = true;
   return true;
 }
 

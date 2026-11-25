@@ -52,6 +52,8 @@ Status CompactionOutputs::Finish(
     meta->fd.file_size = current_bytes;
     meta->tail_size = builder_->GetTailSize();
     meta->marked_for_compaction = builder_->NeedCompact();
+    meta->from_skip_level_compaction = compaction_->compaction_reason() ==
+                                       CompactionReason::kSkipLevelTombstone;
     const TableProperties& tp = builder_->GetTableProperties();
     meta->user_defined_timestamps_persisted =
         static_cast<bool>(tp.user_defined_timestamps_persisted);

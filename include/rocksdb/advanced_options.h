@@ -1031,11 +1031,14 @@ struct AdvancedColumnFamilyOptions {
   //       `skip_level_max_overlap_ratio` * B(n).
   //
   // When enabled, size-triggered compactions whose start-level inputs are
-  // tombstone-dense are extended to skip levels as above. If
+  // tombstone-dense are extended to skip levels as above (they stay normal
+  // one-level compactions when no deeper target qualifies). If
   // `skip_level_tombstone_density_trigger` is also true, tombstone-dense
   // files additionally become a compaction trigger
   // (CompactionReason::kSkipLevelTombstone) that runs after size-based
-  // compaction.
+  // compaction. The trigger only runs compactions that skip at least one
+  // level, and it ignores files written by a kSkipLevelTombstone compaction
+  // until they are rewritten by another compaction.
   //
   // Dynamically changeable through SetOptions() API
   uint32_t skip_level_tombstone_compaction = 0;

@@ -6500,15 +6500,14 @@ void SkipLevelPickerTest::BuildFanoutTree(uint64_t l3_bytes) {
   UpdateVersionStorageInfo();
 }
 
-// Average overlap at L3 (10000): net(L3) = 1100 - 10000 < 0, one level only.
+// Average overlap at L3 (10000): net(L3) = 1100 - 10000 < 0. The trigger does
+// not fall back to a one-level compaction; the file is left to size-based
+// compaction.
 TEST_F(SkipLevelPickerTest, AmortizedDoesNotSkipAverageOverlap) {
   SetMode(2, /*max_ratio=*/1000.0);
   BuildFanoutTree(10000U);
-  auto c = Pick();
-  ASSERT_NE(c, nullptr);
-  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
-  ASSERT_EQ(2, c->output_level());
-  ASSERT_EQ(2U, c->num_input_levels());
+  ASSERT_EQ(1U, vstorage_->TombstoneDenseFiles().size());
+  ASSERT_EQ(Pick(), nullptr);
 }
 
 // Sparse L3 overlap (500): net(L3) = 1100 - 500 = 600 > 0, but L4 is not.
@@ -6525,9 +6524,7 @@ TEST_F(SkipLevelPickerTest, AmortizedSkipsOnlyPastSparseLevel) {
 TEST_F(SkipLevelPickerTest, AmortizedRespectsMaxOverlapRatio) {
   SetMode(2, /*max_ratio=*/1.2);
   BuildFanoutTree(500U);
-  auto c = Pick();
-  ASSERT_NE(c, nullptr);
-  ASSERT_EQ(2, c->output_level());
+  ASSERT_EQ(Pick(), nullptr);
 }
 
 TEST_F(SkipLevelPickerTest, AlwaysIgnoresCost) {
@@ -6539,9 +6536,9 @@ TEST_F(SkipLevelPickerTest, AlwaysIgnoresCost) {
   ASSERT_EQ(4, c->output_level());
 }
 
-// Ratio 1 forbids any deeper target that has overlapping data, which turns
-// mode 2 into "density trigger only, one level at a time".
-TEST_F(SkipLevelPickerTest, RatioOneFallsBackToOneLevel) {
+// Ratio 1 forbids any deeper target that has overlapping data, so the trigger
+// has nothing to do.
+TEST_F(SkipLevelPickerTest, RatioOneDisablesTriggerPick) {
   SetMode(2, /*max_ratio=*/1.0);
   NewVersionStorage(4, kCompactionStyleLevel);
   Add(1, 1U, "100", "149", 100U);
@@ -6549,12 +6546,46 @@ TEST_F(SkipLevelPickerTest, RatioOneFallsBackToOneLevel) {
   Add(3, 3U, "100", "149", 100U);
   SetDense(1U);
   UpdateVersionStorageInfo();
+  ASSERT_EQ(Pick(), nullptr);
+}
+
+// Hysteresis: a dense file written by a skip-level compaction is not a
+// trigger candidate until another compaction rewrites it.
+TEST_F(SkipLevelPickerTest, SkipLevelOutputIsNotTriggerCandidate) {
+  SetMode(1);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 100U);
+  Add(2, 2U, "100", "149", 100U);
+  Add(3, 3U, "100", "149", 100U);
+  SetDense(1U);
+  file_map_.at(1U).first->from_skip_level_compaction = true;
+  UpdateVersionStorageInfo();
+  ASSERT_TRUE(vstorage_->TombstoneDenseFiles().empty());
+  ASSERT_EQ(Pick(), nullptr);
+}
+
+// The densest file cannot skip (its L3 overlap is large), so the trigger moves
+// on to the next dense file, which can.
+TEST_F(SkipLevelPickerTest, TriggerTriesNextDenseFile) {
+  SetMode(2);
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 100U);
+  Add(1, 4U, "500", "549", 100U);
+  Add(2, 2U, "100", "149", 100U);
+  Add(2, 5U, "500", "549", 100U);
+  Add(3, 3U, "100", "149", 100000U);
+  Add(3, 6U, "500", "549", 100U);
+  SetDense(1U);
+  file_map_.at(1U).first->num_deletions = 90;
+  SetDense(4U);
+  UpdateVersionStorageInfo();
+  ASSERT_EQ(2U, vstorage_->TombstoneDenseFiles().size());
+  ASSERT_EQ(1U, vstorage_->TombstoneDenseFiles()[0].second->fd.GetNumber());
   auto c = Pick();
   ASSERT_NE(c, nullptr);
   ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
-  ASSERT_EQ(1, c->start_level());
-  ASSERT_EQ(2, c->output_level());
-  ASSERT_EQ(2U, c->num_input_levels());
+  ASSERT_EQ(4U, c->input(0, 0)->fd.GetNumber());
+  ASSERT_EQ(3, c->output_level());
 }
 
 TEST_F(SkipLevelPickerTest, DensityTriggerOffDoesNotPick) {
@@ -6611,9 +6642,8 @@ TEST_F(SkipLevelPickerTest, MaxCompactionBytesLimitsDepth) {
   SetDense(1U);
   UpdateVersionStorageInfo();
   mutable_cf_options_.max_compaction_bytes = 1000;
-  auto c = Pick();
-  ASSERT_NE(c, nullptr);
-  ASSERT_EQ(2, c->output_level());
+  // L3 does not fit, and the trigger does not do one-level compactions.
+  ASSERT_EQ(Pick(), nullptr);
 }
 
 // A running compaction writing into an intermediate level inside the
@@ -6637,12 +6667,9 @@ TEST_F(SkipLevelPickerTest, RunningCompactionIntoIntermediateLevelBlocksSkip) {
 
   SetMode(1);
   vstorage_->ComputeCompactionScore(ioptions_, mutable_cf_options_, "");
-  auto c = Pick();
-  ASSERT_NE(c, nullptr);
-  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
-  ASSERT_EQ(1U, c->input(0, 0)->fd.GetNumber());
-  // Could not skip past L2 because `running` outputs into L2 within [050,400].
-  ASSERT_EQ(2, c->output_level());
+  // Could not skip past L2 because `running` outputs into L2 within [050,400],
+  // so the trigger picks nothing.
+  ASSERT_EQ(Pick(), nullptr);
 }
 
 TEST_F(SkipLevelPickerTest, NoRunningCompactionAllowsSkip) {

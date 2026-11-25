@@ -296,7 +296,7 @@ reference. v2 rows are from the table above.
    overlap was small. The gain is small and from 2 repeats on a laptop with
    very uneven load (1-minute load 3 to 296), so treat it as "no longer worse,
    possibly slightly better", not as a measured win.
-2. **The density trigger is still the problem.** `trig+sav` is +112% (seqdel)
+2. **The density trigger is still the problem** (addressed in v4 below). `trig+sav` is +112% (seqdel)
    and +394% (churn). Almost all of it is one-level kSkipLevelTombstone
    compactions the trigger picks over and over: L5 -> L6 (1.2 GB per seqdel
    run) and L4 -> L5 (1.4 GB per churn run). The outputs stay above the 0.3
@@ -307,3 +307,96 @@ reference. v2 rows are from the table above.
 3. The rule uses the configured T. With dynamic level bytes the real ratio
    between adjacent levels can differ, so a better estimate would use the
    actual level sizes.
+
+## v4: trigger gate + hysteresis, 5 repeats (2026-11-24)
+
+### Change
+
+The density trigger used to compact a dense file one level down whenever no
+deeper target qualified, and its outputs were usually still dense, so it
+picked the same tombstones again at every level (v3 `trig+sav`: +112% /
++394% write amp). Two changes:
+
+1. **Gate:** the trigger tries the dense files densest first and runs the
+   first one for which the mode-2 rule finds a profitable deeper target. A
+   dense file that cannot skip is left to size-based compaction; the trigger
+   never runs a one-level compaction.
+2. **Hysteresis:** files written by a kSkipLevelTombstone compaction carry an
+   in-memory flag (`FileMetaData::from_skip_level_compaction`, false after
+   reopen) and are not trigger candidates until another compaction rewrites
+   them. Size-based compactions may still pick and extend them.
+
+Size-triggered compactions are unchanged (dense ones are still extended when
+the rule finds a profitable target), so `skip+sav` behaves as in v3.
+
+### Results
+
+`REPEATS=5 ONLY="base trig+sav skip+sav" OUT=.../ablation_v4 ablation.sh`,
+same tree and workloads as v2/v3. 30 runs, all PASS.
+
+| workload | config | rep | load | write amp | compaction MB | avg upper tombstones | space amp | SkipLevel compactions | real skips | levels skipped | verify |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| churn | base | 1 | 32 | 4.24 | 271 | 21077 | 1.167 | 0 | 0 | 0 | PASS |
+| churn | base | 2 | 5 | 4.23 | 270 | 21503 | 1.167 | 0 | 0 | 0 | PASS |
+| churn | base | 3 | 2 | 4.25 | 272 | 21344 | 1.160 | 0 | 0 | 0 | PASS |
+| churn | base | 4 | 2 | 4.24 | 271 | 21746 | 1.149 | 0 | 0 | 0 | PASS |
+| churn | base | 5 | 3 | 4.28 | 274 | 21893 | 1.165 | 0 | 0 | 0 | PASS |
+| churn | trig+sav | 1 | 26 | 5.87 | 401 | 17670 | 1.157 | 113 | 113 | 113 | PASS |
+| churn | trig+sav | 2 | 4 | 5.92 | 405 | 17237 | 1.154 | 113 | 113 | 113 | PASS |
+| churn | trig+sav | 3 | 2 | 5.80 | 395 | 16946 | 1.151 | 113 | 113 | 113 | PASS |
+| churn | trig+sav | 4 | 2 | 5.80 | 395 | 17325 | 1.154 | 113 | 113 | 113 | PASS |
+| churn | trig+sav | 5 | 1 | 5.93 | 405 | 17093 | 1.151 | 113 | 113 | 113 | PASS |
+| churn | skip+sav | 1 | 16 | 4.02 | 253 | 19283 | 1.164 | 57 | 57 | 57 | PASS |
+| churn | skip+sav | 2 | 5 | 4.24 | 270 | 19395 | 1.145 | 56 | 56 | 56 | PASS |
+| churn | skip+sav | 3 | 2 | 4.06 | 256 | 18732 | 1.159 | 56 | 56 | 56 | PASS |
+| churn | skip+sav | 4 | 4 | 4.15 | 263 | 19446 | 1.153 | 56 | 56 | 56 | PASS |
+| churn | skip+sav | 5 | 2 | 4.27 | 273 | 18904 | 1.151 | 57 | 57 | 57 | PASS |
+| seqdel | base | 1 | 162 | 9.14 | 789 | 11224 | 1.187 | 0 | 0 | 0 | PASS |
+| seqdel | base | 2 | 4 | 9.15 | 791 | 11936 | 1.166 | 0 | 0 | 0 | PASS |
+| seqdel | base | 3 | 3 | 9.26 | 801 | 13206 | 1.183 | 0 | 0 | 0 | PASS |
+| seqdel | base | 4 | 2 | 9.38 | 813 | 11516 | 1.176 | 0 | 0 | 0 | PASS |
+| seqdel | base | 5 | 2 | 9.26 | 801 | 9856 | 1.170 | 0 | 0 | 0 | PASS |
+| seqdel | trig+sav | 1 | 76 | 9.64 | 838 | 8499 | 1.185 | 62 | 62 | 62 | PASS |
+| seqdel | trig+sav | 2 | 9 | 9.63 | 837 | 10589 | 1.177 | 67 | 67 | 67 | PASS |
+| seqdel | trig+sav | 3 | 3 | 9.72 | 846 | 11196 | 1.168 | 61 | 61 | 61 | PASS |
+| seqdel | trig+sav | 4 | 2 | 9.55 | 829 | 10683 | 1.178 | 65 | 65 | 65 | PASS |
+| seqdel | trig+sav | 5 | 2 | 9.77 | 851 | 10078 | 1.172 | 67 | 67 | 67 | PASS |
+| seqdel | skip+sav | 1 | 41 | 8.99 | 775 | 11220 | 1.187 | 48 | 48 | 48 | PASS |
+| seqdel | skip+sav | 2 | 5 | 9.17 | 792 | 11061 | 1.171 | 40 | 40 | 40 | PASS |
+| seqdel | skip+sav | 3 | 4 | 8.87 | 763 | 11466 | 1.188 | 44 | 44 | 44 | PASS |
+| seqdel | skip+sav | 4 | 1 | 8.97 | 773 | 11308 | 1.184 | 40 | 40 | 40 | PASS |
+| seqdel | skip+sav | 5 | 3 | 8.91 | 767 | 9050 | 1.194 | 43 | 43 | 43 | PASS |
+
+| workload | config | runs | mean write amp | vs base | mean avg upper tombstones | vs base | mean real skips |
+|---|---|---|---|---|---|---|---|
+| churn | base | 5 | 4.25 | +0.0% | 21513 | +0.0% | 0.0 |
+| churn | trig+sav | 5 | 5.86 | +38.0% | 17254 | -19.8% | 113.0 |
+| churn | skip+sav | 5 | 4.15 | -2.4% | 19152 | -11.0% | 56.4 |
+| seqdel | base | 5 | 9.24 | +0.0% | 11548 | +0.0% | 0.0 |
+| seqdel | trig+sav | 5 | 9.66 | +4.6% | 10209 | -11.6% | 64.4 |
+| seqdel | skip+sav | 5 | 8.98 | -2.8% | 10821 | -6.3% | 43.0 |
+
+Write amp per run, sorted (mean, sample sd; t = Welch t vs base):
+
+| workload | config | runs | mean | sd | t vs base |
+|---|---|---|---|---|---|
+| seqdel | base | 9.14 9.16 9.26 9.26 9.38 | 9.24 | 0.10 | |
+| seqdel | skip+sav | 8.87 8.91 8.97 8.99 9.17 | 8.98 (-2.8%) | 0.12 | -3.8 |
+| seqdel | trig+sav | 9.55 9.63 9.64 9.72 9.77 | 9.66 (+4.6%) | 0.09 | +7.3 |
+| churn | base | 4.23 4.24 4.24 4.26 4.28 | 4.25 | 0.02 | |
+| churn | skip+sav | 4.02 4.06 4.15 4.24 4.27 | 4.15 (-2.4%) | 0.11 | -2.0 |
+| churn | trig+sav | 5.80 5.80 5.87 5.92 5.93 | 5.86 (+38.0%) | 0.06 | +55 |
+
+### Findings
+
+1. **The gate and hysteresis fixed the runaway trigger** (+112% -> +4.6% on
+   seqdel, +394% -> +38% on churn), and every trigger compaction now skips a
+   level. They did not push write amp below base: the trigger still runs
+   compactions size-based compaction would not have run yet, and on churn it
+   fires on almost every L0 flush (113 L0 -> L4 per run). It buys 12% (seqdel)
+   to 20% (churn) fewer upper-level tombstones for that cost.
+2. **Skip-only mode 2 (no trigger) is the write-amp configuration.** seqdel:
+   -2.8%, 5 of 5 runs below the base mean, t = -3.8 (about p < 0.01 with ~8
+   degrees of freedom). churn: -2.4%, 4 of 5 below the base mean but with a
+   much larger spread than base (sd 0.11 vs 0.02), t = -2.0 (about p ~ 0.1),
+   so on churn the improvement is suggestive, not established.

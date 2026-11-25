@@ -1,0 +1,11 @@
+== churn_skip+sav_r1 load={ 15.64 44.48 40.70 }
+cf_opts="skip_level_tombstone_compaction=2;skip_level_tombstone_density_trigger=false;skip_level_tombstone_density_threshold=0.3" run_s=60.0 ops=1200000 (puts=658427 dels=541573 rdels=0) ops/s=19998
+write_amp=4.019  (compaction 252.8 MB + flush 68.5 MB) / user 80.0 MB
+avg_upper_tombstones=19283  peak_tomb_age_ub=62s  avg_sst_MB=82.05
+end_of_run: sst_MB=85.07 upper_tombs=18996 total_tombs=18996 levels_KB=0/0/0/0/2740/13502/70867
+drained:    sst_MB=85.62 upper_tombs=22542 total_tombs=22542 levels_KB=563/0/0/0/2740/13502/70867 space_amp=1.164
+compactions by reason: LevelMaxLevelSize=34(109.7MB) SkipLevelTombstone=57(143.2MB)
+compactions by shape:  L0->L4=56(143.1MB) L4->L5=23(83.3MB) L4->L6=1(0.0MB) L5->L6=11(26.3MB)
+skip-level shapes:      L0->L4=56(143.1MB) L4->L6=1(0.0MB)
+verify: live_keys=670607 mismatches=0 bg_errors=0 -> PASS
+exit=0
