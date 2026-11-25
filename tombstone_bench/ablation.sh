@@ -16,6 +16,7 @@
 #              extended by the mode 2 rule (needs a branch with both features)
 #   kiwi       KiWi delete tiles on (KIWI_TILE_PAGES=$KIWI pages), no
 #              FADE/skip; needs a branch with KiWi
+#   kiwi+fade  KiWi tiles + fade
 #   kiwi+fade+skip  KiWi tiles + fade+skip
 #
 # A config is "name|cf_opts" or "name|cf_opts|extra env" (e.g. KiWi's
@@ -56,6 +57,7 @@ CONFIGS=(
   "fade|delete_persistence_threshold=$DTH"
   "fade+skip|delete_persistence_threshold=$DTH;$T=2;skip_level_tombstone_density_trigger=false"
   "kiwi||KIWI_TILE_PAGES=$KIWI"
+  "kiwi+fade|delete_persistence_threshold=$DTH|KIWI_TILE_PAGES=$KIWI"
   "kiwi+fade+skip|delete_persistence_threshold=$DTH;$T=2;skip_level_tombstone_density_trigger=false|KIWI_TILE_PAGES=$KIWI"
 )
 if [ -n "${ONLY:-}" ]; then
