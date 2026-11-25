@@ -6417,7 +6417,7 @@ class SkipLevelPickerTest : public CompactionPickerTest {
     mutable_cf_options_.skip_level_max_overlap_ratio = max_ratio;
     mutable_cf_options_.max_compaction_bytes = 1ULL << 40;
   }
-  void BuildFanout10Tree();
+  void BuildFanoutTree(uint64_t l3_bytes);
   std::unique_ptr<Compaction> Pick() {
     return std::unique_ptr<Compaction>(level_compaction_picker.PickCompaction(
         cf_name_, mutable_cf_options_, mutable_db_options_,
@@ -6471,8 +6471,8 @@ TEST_F(SkipLevelPickerTest, LastLevelFileIsNotACandidate) {
   ASSERT_TRUE(vstorage_->TombstoneDenseFiles().empty());
 }
 
-// Mode 2: B(L2) = 200, B(L3) = 300; growth 1.5 <= 20, so skip to L3.
-TEST_F(SkipLevelPickerTest, CascadeSavingsSkipsWhenGrowthIsBounded) {
+// Mode 2, T = 10, S = 100: net(L3) = 1 * 11 * 100 - 100 = 1000 > 0, skip.
+TEST_F(SkipLevelPickerTest, AmortizedSkipsWhenDeepOverlapIsSmall) {
   SetMode(2, /*max_ratio=*/20.0);
   NewVersionStorage(4, kCompactionStyleLevel);
   Add(1, 1U, "100", "149", 100U);
@@ -6487,32 +6487,52 @@ TEST_F(SkipLevelPickerTest, CascadeSavingsSkipsWhenGrowthIsBounded) {
   ASSERT_EQ(3U, c->num_input_levels());
 }
 
-// A tree with fanout 10: B(L2) = 1100, B(L3) = 11100 (10.1x),
-// B(L4) = 111100 (101x). With ratio 20, mode 2 skips one level (to L3) while
-// mode 1 goes all the way to L4.
-void SkipLevelPickerTest::BuildFanout10Tree() {
+// Start file S = 100 at L1 over a tree with fanout 10 at L2 (1000), then
+// `l3_bytes` at L3 and 100000 at L4. T = 10, so one amortized hop of S costs
+// 1100 and net(L4) = 2200 - (l3_bytes + 100000) < 0 always.
+void SkipLevelPickerTest::BuildFanoutTree(uint64_t l3_bytes) {
   NewVersionStorage(5, kCompactionStyleLevel);
   Add(1, 1U, "100", "149", 100U);
   Add(2, 2U, "100", "149", 1000U);
-  Add(3, 3U, "100", "149", 10000U);
+  Add(3, 3U, "100", "149", l3_bytes);
   Add(4, 4U, "100", "149", 100000U);
   SetDense(1U);
   UpdateVersionStorageInfo();
 }
 
-TEST_F(SkipLevelPickerTest, CascadeSavingsStopsWhereGrowthExceedsRatio) {
-  SetMode(2, /*max_ratio=*/20.0);
-  BuildFanout10Tree();
+// Average overlap at L3 (10000): net(L3) = 1100 - 10000 < 0, one level only.
+TEST_F(SkipLevelPickerTest, AmortizedDoesNotSkipAverageOverlap) {
+  SetMode(2, /*max_ratio=*/1000.0);
+  BuildFanoutTree(10000U);
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
+  ASSERT_EQ(2, c->output_level());
+  ASSERT_EQ(2U, c->num_input_levels());
+}
+
+// Sparse L3 overlap (500): net(L3) = 1100 - 500 = 600 > 0, but L4 is not.
+TEST_F(SkipLevelPickerTest, AmortizedSkipsOnlyPastSparseLevel) {
+  SetMode(2, /*max_ratio=*/1000.0);
+  BuildFanoutTree(500U);
   auto c = Pick();
   ASSERT_NE(c, nullptr);
   ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
   ASSERT_EQ(3, c->output_level());
-  ASSERT_EQ(3U, c->num_input_levels());
 }
 
-TEST_F(SkipLevelPickerTest, AlwaysIgnoresGrowthRatio) {
+// The growth cap still applies: B(L3) / B(L2) = 1600 / 1100 > 1.2.
+TEST_F(SkipLevelPickerTest, AmortizedRespectsMaxOverlapRatio) {
+  SetMode(2, /*max_ratio=*/1.2);
+  BuildFanoutTree(500U);
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(2, c->output_level());
+}
+
+TEST_F(SkipLevelPickerTest, AlwaysIgnoresCost) {
   SetMode(1, /*max_ratio=*/20.0);
-  BuildFanout10Tree();
+  BuildFanoutTree(10000U);
   auto c = Pick();
   ASSERT_NE(c, nullptr);
   ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());

@@ -713,17 +713,24 @@ bool LevelCompactionBuilder::TrySetupSkipLevelCompaction() {
   inputs.push_back(start_inputs);
   uint64_t total_bytes = start_bytes;
 
-  // Mode 2 (cascade savings). Let B(j) = total_bytes after adding level j and
-  // n = first_next. Bringing this key range to level t one level at a time
-  // writes about B(n) + B(n+1) + ... + B(t); skipping writes B(t) once. The
-  // estimated saving savings(t) = B(n) + ... + B(t-1) only grows with t, so we
-  // take the deepest t whose compaction is not more than
-  // skip_level_max_overlap_ratio times larger than the normal one (B(n)).
+  // Mode 2 (amortized cascade). Let S = start_bytes, n = first_next, B(j) =
+  // total_bytes after adding level j, and T = max_bytes_for_level_multiplier.
+  // The first hop (start -> n) costs B(n) either way. In steady state every
+  // later one-level hop of S bytes costs about (1 + T) * S amortized: the
+  // overlap it meets at the next level is shared with data arriving from other
+  // compactions. Skipping to t instead pays the measured extra overlap
+  // B(t) - B(n) now, so the estimated saving is
+  //   net(t) = (t - n) * (1 + T) * S - (B(t) - B(n)),
+  // which is positive only when the overlap below n is well under the tree's
+  // average. Take the t with the largest net(t) > 0 (ties go deeper); also
+  // never let the compaction grow past skip_level_max_overlap_ratio * B(n).
+  const double hop_bytes =
+      (1.0 + mutable_cf_options_.max_bytes_for_level_multiplier) *
+      static_cast<double>(start_bytes);
   int best_level = -1;
   size_t best_num_inputs = 0;
-  uint64_t normal_bytes = 0;   // B(n)
-  uint64_t savings_bytes = 0;  // savings(j) for the current j
-  uint64_t best_savings_bytes = 0;
+  uint64_t normal_bytes = 0;  // B(n)
+  double best_net = 0.0;
   for (int j = first_next; j <= last; j++) {
     InternalKey smallest;
     InternalKey largest;
@@ -750,20 +757,28 @@ bool LevelCompactionBuilder::TrySetupSkipLevelCompaction() {
     }
     if (j == first_next) {
       normal_bytes = total_bytes;
+      best_level = j;
+      best_num_inputs = inputs.size();
+      continue;
     }
-    if (mode != 1) {
-      const double growth =
-          static_cast<double>(total_bytes) / static_cast<double>(normal_bytes);
-      if (growth > mutable_cf_options_.skip_level_max_overlap_ratio) {
-        // B(j) only grows with j, so no deeper level can qualify either.
-        break;
-      }
+    if (mode == 1) {
+      best_level = j;
+      best_num_inputs = inputs.size();
+      continue;
     }
-    best_level = j;
-    best_num_inputs = inputs.size();
-    best_savings_bytes = savings_bytes;
-    // Going one level deeper also avoids writing B(j) as an intermediate.
-    savings_bytes += total_bytes;
+    const double growth =
+        static_cast<double>(total_bytes) / static_cast<double>(normal_bytes);
+    if (growth > mutable_cf_options_.skip_level_max_overlap_ratio) {
+      // B(j) only grows with j, so no deeper level can qualify either.
+      break;
+    }
+    const double net = static_cast<double>(j - first_next) * hop_bytes -
+                       static_cast<double>(total_bytes - normal_bytes);
+    if (net > 0.0 && net >= best_net) {
+      best_level = j;
+      best_num_inputs = inputs.size();
+      best_net = net;
+    }
   }
   TEST_SYNC_POINT_CALLBACK(
       "LevelCompactionBuilder::TrySetupSkipLevelCompaction:BestLevel",
@@ -775,10 +790,11 @@ bool LevelCompactionBuilder::TrySetupSkipLevelCompaction() {
 
   ROCKS_LOG_BUFFER(log_buffer_,
                    "[%s] Skip-level tombstone compaction L%d -> L%d (normal "
-                   "L%d): %" PRIu64 " normal bytes, est. %" PRIu64
-                   " cascade bytes saved",
+                   "L%d): %" PRIu64
+                   " normal bytes, est. %.0f bytes saved "
+                   "(mode 2 only)",
                    cf_name_.c_str(), start, best_level, first_next,
-                   normal_bytes, best_savings_bytes);
+                   normal_bytes, best_net);
   inputs.resize(best_num_inputs);
   output_level_ = best_level;
   start_level_inputs_ = inputs[0];

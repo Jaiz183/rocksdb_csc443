@@ -1018,15 +1018,17 @@ struct AdvancedColumnFamilyOptions {
   //   1 = always: target the deepest feasible level (the last non-empty level
   //       when possible, limited by `max_compaction_bytes` and by files that
   //       are already being compacted).
-  //   2 = cascade-savings: let B(t) be the input bytes of a compaction from
-  //       the start level straight to level t (start files plus overlapping
-  //       files at every level down to t) and n the normal output level. A
-  //       one-level-at-a-time cascade writes about B(n) + ... + B(t) bytes to
-  //       bring the same key range to t, while the skip writes B(t), so the
-  //       skip saves about savings(t) = B(n) + ... + B(t-1). Savings grow with
-  //       depth, so this picks the deepest feasible t whose B(t) / B(n) is at
-  //       most `skip_level_max_overlap_ratio`, which bounds how much larger
-  //       than the normal compaction a skip compaction may be.
+  //   2 = amortized cascade: let S be the start files' bytes, n the normal
+  //       output level, B(t) the input bytes of a compaction from the start
+  //       level straight to level t, and T = max_bytes_for_level_multiplier.
+  //       Pushing S down one level at a time costs about (1 + T) * S per
+  //       level after the first (amortized over the data that shares the
+  //       deeper overlap), while the skip pays the measured B(t) - B(n). This
+  //       picks the t with the largest positive
+  //         (t - n) * (1 + T) * S - (B(t) - B(n)),
+  //       i.e. it skips only where the overlap below n is well under the
+  //       tree's average, and never lets B(t) exceed
+  //       `skip_level_max_overlap_ratio` * B(n).
   //
   // When enabled, size-triggered compactions whose start-level inputs are
   // tombstone-dense are extended to skip levels as above. If

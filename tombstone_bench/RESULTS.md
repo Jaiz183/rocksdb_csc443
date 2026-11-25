@@ -227,7 +227,83 @@ overlapping data (growth 1.0 passes ratio 1).
    `trig+skip` on seqdel (about 124 vs 139 levels per run) with no write-amp
    difference; on churn the two were identical in skips.
 
-Next step suggested by (3): replace the saving estimate with the amortized
-one, i.e. skip to t only if B(t) <= S * (1 + T * (t - start)), which accepts a
-skip exactly when the measured deep overlap is well below the tree's average
-(for example sequential deletes over a range that has little old data).
+Finding (3) led to v3 below.
+
+## v3: amortized-cascade mode 2 (2026-11-24)
+
+### Rule
+
+S = start-file bytes, n = normal output level, B(t) = input bytes of the
+compaction from the start level straight to t, T =
+`max_bytes_for_level_multiplier`. The first hop costs B(n) either way. Each
+later one-level hop of S bytes costs about (1 + T) * S in steady state,
+because the overlap it meets is shared with data arriving from other
+compactions. The skip pays the measured extra overlap B(t) - B(n) now:
+
+    net(t) = (t - n) * (1 + T) * S - (B(t) - B(n))
+
+Mode 2 takes the t with the largest positive net(t) (ties deeper), still
+capped by `skip_level_max_overlap_ratio` * B(n). For a one-level skip this is
+simply "skip past level n+1 only if the overlap there is at most (1 + T) * S",
+against the T^2 * S a uniformly spread key range would meet. v2's rule
+compared against B(n) + ... + B(t-1), which charged the cascade the whole deep
+overlap for this key range alone.
+
+### Results
+
+Same setup as the v2 ablation (`ONLY="base trig+sav skip+sav"
+OUT=.../ablation_v3 ablation.sh`); base was rerun for a same-session
+reference. v2 rows are from the table above.
+
+| workload | config | rep | load | write amp | compaction MB | avg upper tombstones | space amp | SkipLevel compactions | real skips | levels skipped | verify |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| churn | base | 1 | 33 | 4.13 | 262 | 20666 | 1.175 | 0 | 0 | 0 | PASS |
+| churn | base | 2 | 2 | 4.14 | 263 | 21772 | 1.170 | 0 | 0 | 0 | PASS |
+| churn | trig+sav | 1 | 16 | 20.49 | 1570 | 10815 | 1.131 | 226 | 113 | 113 | PASS |
+| churn | trig+sav | 2 | 2 | 20.37 | 1560 | 10924 | 1.131 | 224 | 113 | 113 | PASS |
+| churn | skip+sav | 1 | 7 | 4.07 | 257 | 19119 | 1.164 | 56 | 56 | 56 | PASS |
+| churn | skip+sav | 2 | 3 | 4.03 | 254 | 18704 | 1.166 | 56 | 56 | 56 | PASS |
+| seqdel | base | 1 | 296 | 9.29 | 804 | 10926 | 1.194 | 0 | 0 | 0 | PASS |
+| seqdel | base | 2 | 4 | 9.30 | 805 | 10428 | 1.164 | 0 | 0 | 0 | PASS |
+| seqdel | trig+sav | 1 | 137 | 19.32 | 1779 | 4063 | 1.172 | 149 | 81 | 81 | PASS |
+| seqdel | trig+sav | 2 | 4 | 20.11 | 1857 | 3131 | 1.173 | 144 | 82 | 82 | PASS |
+| seqdel | skip+sav | 1 | 62 | 9.15 | 790 | 9682 | 1.172 | 48 | 48 | 48 | PASS |
+| seqdel | skip+sav | 2 | 3 | 9.06 | 782 | 11399 | 1.197 | 44 | 44 | 44 | PASS |
+
+| workload | config | runs | mean write amp | vs base | mean avg upper tombstones | vs base | mean real skips |
+|---|---|---|---|---|---|---|---|
+| churn | base | 2 | 4.13 | +0.0% | 21219 | +0.0% | 0.0 |
+| churn | trig+sav | 2 | 20.43 | +394.1% | 10870 | -48.8% | 113.0 |
+| churn | skip+sav | 2 | 4.05 | -1.9% | 18912 | -10.9% | 56.0 |
+| seqdel | base | 2 | 9.29 | +0.0% | 10677 | +0.0% | 0.0 |
+| seqdel | trig+sav | 2 | 19.72 | +112.2% | 3597 | -66.3% | 81.5 |
+| seqdel | skip+sav | 2 | 9.10 | -2.0% | 10540 | -1.3% | 46.0 |
+
+| config | v2 write amp vs base | v3 write amp vs base | v3 upper tombstones vs base |
+|---|---|---|---|
+| seqdel skip+sav | +19.7% | -2.0% | -1.3% |
+| churn skip+sav | +153.7% | -1.9% | -10.9% |
+| seqdel trig+sav | +238.5% | +112.2% | -66.3% |
+| churn trig+sav | +413.5% | +394.1% | -48.8% |
+
+### Findings
+
+1. **With the amortized rule, skipping no longer costs write amp.** Without
+   the density trigger, mode 2 wrote about 2% less than base on both
+   workloads (both repeats agree; base repeats were within 0.2% of each
+   other) and held 11% fewer upper-level tombstones on churn. The skips it
+   still takes are L0 -> L4 (past L3) and L3 -> L5, i.e. one level where the
+   overlap was small. The gain is small and from 2 repeats on a laptop with
+   very uneven load (1-minute load 3 to 296), so treat it as "no longer worse,
+   possibly slightly better", not as a measured win.
+2. **The density trigger is still the problem.** `trig+sav` is +112% (seqdel)
+   and +394% (churn). Almost all of it is one-level kSkipLevelTombstone
+   compactions the trigger picks over and over: L5 -> L6 (1.2 GB per seqdel
+   run) and L4 -> L5 (1.4 GB per churn run). The outputs stay above the 0.3
+   density threshold, so they are picked again. The trigger needs hysteresis
+   (for example, do not re-pick a file produced by a kSkipLevelTombstone
+   compaction until it has been rewritten for another reason), a budget, or a
+   much higher threshold before it is useful.
+3. The rule uses the configured T. With dynamic level bytes the real ratio
+   between adjacent levels can differ, so a better estimate would use the
+   actual level sizes.

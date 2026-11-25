@@ -8,8 +8,11 @@
 #   skip       no density trigger; dense size-triggered compactions skip to
 #              the deepest feasible level (mode 1)
 #   trig+skip  trigger on, skip to the deepest feasible level (mode 1)
-#   trig+sav   trigger on, cascade-savings mode 2 with the default ratio
-#   skip+sav   no trigger, cascade-savings mode 2 on dense size picks
+#   trig+sav   trigger on, mode 2 (v2: cascade-savings bound; v3: amortized
+#              cascade rule) with the default ratio
+#   skip+sav   no trigger, mode 2 on dense size picks
+#
+# ONLY="base trig+sav" runs just the named configs.
 #
 # Runs on a deeper tree than run.sh (MULT=5, LBASE_MB=1) so that a start file
 # can skip more than one level. Results go to $OUT (one .txt + .csv per run).
@@ -38,6 +41,13 @@ CONFIGS=(
   "trig+sav|$T=2"
   "skip+sav|$T=2;skip_level_tombstone_density_trigger=false"
 )
+if [ -n "${ONLY:-}" ]; then
+  KEEP=()
+  for c in "${CONFIGS[@]}"; do
+    case " $ONLY " in *" ${c%%|*} "*) KEEP+=("$c") ;; esac
+  done
+  CONFIGS=("${KEEP[@]}")
+fi
 N=${#CONFIGS[@]}
 for rep in $(seq 1 "$REPEATS"); do
   for w in "${WORKLOADS[@]}"; do
