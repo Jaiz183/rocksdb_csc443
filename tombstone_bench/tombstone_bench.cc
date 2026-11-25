@@ -27,6 +27,9 @@
 //   MULT=10 LBASE_MB=4   max_bytes_for_level_multiplier / _base (smaller
 //                        values give a deeper tree for the same data)
 //   SEED=1
+//   KIWI_TILE_PAGES=0    (branches with KiWi only) >= 2 writes KiWi delete
+//                        tiles of this many pages; values then carry their
+//                        version as the delete key (see Val())
 //   AGE_LIMIT=0          if > 0, also count the samples whose true tombstone
 //                        age exceeds this many seconds (e.g. FADE's D_th)
 // Output: human-readable summary on stdout, <out_prefix>.csv (1 row/second).
@@ -67,11 +70,23 @@ std::string Key(uint64_t k) {
   snprintf(b, sizeof(b), "key%012" PRIu64, k);
   return b;
 }
+// KiWi delete key D: when KIWI_TILE_PAGES >= 2, bytes [24, 32) of every value
+// hold the version as an 8-byte big-endian integer. Versions only grow, so a
+// newer version of a key never has a smaller D (KiWi's contract).
+constexpr uint32_t kKiWiDeleteKeyOffset = 24;
+bool g_kiwi = false;
+
 std::string Val(uint64_t k, uint32_t ver) {
   char b[32];
   snprintf(b, sizeof(b), "%012" PRIu64 "-%08x", k, ver);
   std::string v(b);
   v.resize(kValueSize, 'v');
+  if (g_kiwi) {
+    for (int i = 0; i < 8; i++) {
+      v[kKiWiDeleteKeyOffset + i] = static_cast<char>(
+          (static_cast<uint64_t>(ver) >> (8 * (7 - i))) & 0xff);
+    }
+  }
   return v;
 }
 double EnvD(const char* n, double d) {
@@ -302,6 +317,9 @@ int main(int argc, char** argv) {
   options.statistics = CreateDBStatistics();
   BlockBasedTableOptions bbto;
   bbto.filter_policy.reset(NewBloomFilterPolicy(10));
+  bbto.kiwi_tile_pages = static_cast<uint32_t>(EnvD("KIWI_TILE_PAGES", 0));
+  bbto.kiwi_delete_key_offset = kKiWiDeleteKeyOffset;
+  g_kiwi = bbto.kiwi_tile_pages >= 2;
   options.table_factory.reset(NewBlockBasedTableFactory(bbto));
   auto listener = std::make_shared<Listener>();
   options.listeners.push_back(listener);
