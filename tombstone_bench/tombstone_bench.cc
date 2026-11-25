@@ -14,12 +14,23 @@
 //   KEYS=1000000   key space          PRELOAD=1000000 keys loaded first
 //   OPS=20000      target ops/s       DEL=0.1  point-delete fraction
 //   RDEL=0         range-delete fraction   RW=100 range width (keys)
-//   DELPAT=uniform|seq   uniform: delete random keys; seq: deletes sweep
-//                        the key space in order (expiry-style deletes)
+//   DELPAT=uniform|seq|churn   uniform: delete random keys; seq: deletes
+//                        sweep the key space in order (expiry-style deletes);
+//                        churn: see CHURN/HOT below
+//   CHURN=0.9 HOT=20000  (DELPAT=churn only) a CHURN fraction of ops toggles
+//                        one of HOT keys spread evenly over the key space:
+//                        delete it if present, else re-insert it. Each hot key
+//                        is deleted and re-inserted many times, so tombstones
+//                        and live versions of the same key sit at several
+//                        levels at once. Other ops are uniform puts; DEL and
+//                        RDEL are ignored.
+//   MULT=10 LBASE_MB=4   max_bytes_for_level_multiplier / _base (smaller
+//                        values give a deeper tree for the same data)
 //   SEED=1
 // Output: human-readable summary on stdout, <out_prefix>.csv (1 row/second).
 // Exits non-zero if the final full scan disagrees with the in-memory model.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -73,6 +84,8 @@ struct Listener : public EventListener {
   std::mutex mu;
   std::map<std::string, std::pair<int, uint64_t>> by_reason;  // count, bytes
   std::map<std::string, std::pair<int, uint64_t>> by_shape;   // "L1->L3"
+  // Shapes of SkipLevelTombstone compactions only.
+  std::map<std::string, std::pair<int, uint64_t>> skip_shape;
   std::atomic<int> errors{0};
   void OnCompactionCompleted(DB*, const CompactionJobInfo& ci) override {
     if (!ci.status.ok()) {
@@ -82,7 +95,13 @@ struct Listener : public EventListener {
     snprintf(shape, sizeof(shape), "L%d->L%d", ci.base_input_level,
              ci.output_level);
     std::lock_guard<std::mutex> l(mu);
-    auto& r = by_reason[GetCompactionReasonString(ci.compaction_reason)];
+    const std::string reason = GetCompactionReasonString(ci.compaction_reason);
+    if (reason == "SkipLevelTombstone") {
+      auto& k = skip_shape[shape];
+      k.first++;
+      k.second += ci.stats.total_output_bytes;
+    }
+    auto& r = by_reason[reason];
     r.first++;
     r.second += ci.stats.total_output_bytes;
     auto& s = by_shape[shape];
@@ -150,15 +169,22 @@ int main(int argc, char** argv) {
   const double del_frac = EnvD("DEL", 0.1);
   const double rdel_frac = EnvD("RDEL", 0.0);
   const uint64_t rw = static_cast<uint64_t>(EnvD("RW", 100));
-  const bool seq_del = EnvS("DELPAT", "uniform") == "seq";
+  const std::string delpat = EnvS("DELPAT", "uniform");
+  const bool seq_del = delpat == "seq";
+  const bool churn = delpat == "churn";
+  const double churn_frac = EnvD("CHURN", 0.9);
+  const uint64_t hot = std::max<uint64_t>(
+      1, std::min(kKeys, static_cast<uint64_t>(EnvD("HOT", 20000))));
+  const uint64_t hot_stride = kKeys / hot;
   const std::string cf_opts = EnvS("CF_OPTS", "");
 
   Options options;
   options.create_if_missing = true;
   options.write_buffer_size = 1 << 20;
   options.target_file_size_base = 1 << 20;
-  options.max_bytes_for_level_base = 4 << 20;
-  options.max_bytes_for_level_multiplier = 10;
+  options.max_bytes_for_level_base =
+      static_cast<uint64_t>(EnvD("LBASE_MB", 4) * (1 << 20));
+  options.max_bytes_for_level_multiplier = EnvD("MULT", 10);
   options.level0_file_num_compaction_trigger = 4;
   options.max_background_jobs = 4;
   options.compression = kNoCompression;
@@ -219,6 +245,7 @@ int main(int argc, char** argv) {
     std::lock_guard<std::mutex> l(listener->mu);
     listener->by_reason.clear();
     listener->by_shape.clear();
+    listener->skip_shape.clear();
   }
 
   FILE* csv = fopen((prefix + ".csv").c_str(), "w");
@@ -258,7 +285,28 @@ int main(int argc, char** argv) {
       continue;
     }
     const double r = U(rng);
-    if (r < rdel_frac) {
+    if (churn) {
+      uint64_t k;
+      bool del = false;
+      if (r < churn_frac) {
+        k = (rng() % hot) * hot_stride;
+        del = model[k] != 0;
+      } else {
+        k = rng() % kKeys;
+      }
+      std::string key = Key(k);
+      if (del) {
+        s = db->Delete(wo, key);
+        model[k] = 0;
+        user_bytes += key.size();
+        dels++;
+      } else {
+        s = db->Put(wo, key, Val(k, ver));
+        model[k] = ver;
+        user_bytes += key.size() + kValueSize;
+        puts++;
+      }
+    } else if (r < rdel_frac) {
       uint64_t k = seq_del ? seq_cursor : rng() % kKeys;
       uint64_t e = std::min(kKeys, k + rw);
       s = db->DeleteRange(wo, db->DefaultColumnFamily(), Key(k), Key(e));
@@ -381,6 +429,11 @@ int main(int argc, char** argv) {
     }
     printf("\ncompactions by shape: ");
     for (auto& kv : listener->by_shape) {
+      printf(" %s=%d(%.1fMB)", kv.first.c_str(), kv.second.first,
+             kv.second.second / 1048576.0);
+    }
+    printf("\nskip-level shapes:     ");
+    for (auto& kv : listener->skip_shape) {
       printf(" %s=%d(%.1fMB)", kv.first.c_str(), kv.second.first,
              kv.second.second / 1048576.0);
     }

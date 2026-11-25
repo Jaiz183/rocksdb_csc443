@@ -4043,6 +4043,7 @@ void VersionStorageInfo::ComputeTombstoneDenseFiles(
     const MutableCFOptions& mutable_cf_options) {
   tombstone_dense_files_.clear();
   if (mutable_cf_options.skip_level_tombstone_compaction == 0 ||
+      !mutable_cf_options.skip_level_tombstone_density_trigger ||
       compaction_style_ != CompactionStyle::kCompactionStyleLevel) {
     return;
   }

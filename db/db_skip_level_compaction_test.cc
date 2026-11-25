@@ -262,18 +262,19 @@ TEST_F(DBSkipLevelCompactionTest, OffModeDoesNotSkip) {
   VerifyData(n, 10);
 }
 
-TEST_F(DBSkipLevelCompactionTest, CostBasedPicksTargetByOverlap) {
+TEST_F(DBSkipLevelCompactionTest, CascadeSavingsBoundsCompactionGrowth) {
   const int n = 200;
   for (bool deep_is_large : {false, true}) {
     SCOPED_TRACE(deep_is_large ? "large L3 overlap" : "small L3 overlap");
     Options options = SkipOptions();
     DestroyAndReopen(options);
-    // Small L3 overlap: L2 big, L3 small -> skip to L3.
-    // Large L3 overlap: L2 small, L3 big -> one level only (L1 -> L2).
+    // Small L3 overlap: L2 big, L3 small -> B(L3) ~= B(L2), skip to L3.
+    // Large L3 overlap: L2 small, L3 big -> B(L3) is over 5x B(L2), so only
+    // one level (L1 -> L2).
     BuildLayout(n, deep_is_large ? 10 : 2000, deep_is_large ? 2000 : 10);
     listener_->Clear();
     ASSERT_OK(db_->SetOptions({{"skip_level_tombstone_compaction", "2"},
-                               {"skip_level_max_overlap_ratio", "1000"},
+                               {"skip_level_max_overlap_ratio", "5"},
                                {"disable_auto_compactions", "false"}}));
     ASSERT_OK(dbfull()->TEST_WaitForCompact());
     auto skips = SkipRecords();

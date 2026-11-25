@@ -96,6 +96,8 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       skip_level_tombstone_compaction(options.skip_level_tombstone_compaction),
       skip_level_tombstone_density_threshold(
           options.skip_level_tombstone_density_threshold),
+      skip_level_tombstone_density_trigger(
+          options.skip_level_tombstone_density_trigger),
       skip_level_max_overlap_ratio(options.skip_level_max_overlap_ratio),
       sample_for_compression(options.sample_for_compression),
       last_level_temperature(options.last_level_temperature),
@@ -436,6 +438,8 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log,
                    "     Options.skip_level_tombstone_density_threshold: %f",
                    skip_level_tombstone_density_threshold);
+  ROCKS_LOG_HEADER(log, "     Options.skip_level_tombstone_density_trigger: %d",
+                   skip_level_tombstone_density_trigger);
   ROCKS_LOG_HEADER(log, "     Options.skip_level_max_overlap_ratio: %f",
                    skip_level_max_overlap_ratio);
   const auto& it_temp = temperature_to_string.find(default_temperature);

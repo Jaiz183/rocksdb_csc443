@@ -762,6 +762,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "read_triggered_compaction_threshold=0.5;"
       "skip_level_tombstone_compaction=2;"
       "skip_level_tombstone_density_threshold=0.25;"
+      "skip_level_tombstone_density_trigger=false;"
       "skip_level_max_overlap_ratio=8.0;"
       "sample_for_compression=0;"
       "enable_blob_files=true;"

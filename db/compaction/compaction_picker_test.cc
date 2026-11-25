@@ -6412,11 +6412,12 @@ class SkipLevelPickerTest : public CompactionPickerTest {
     f->num_entries = 100;
     f->num_deletions = 80;
   }
-  void SetMode(uint32_t mode, double max_ratio = 10.0) {
+  void SetMode(uint32_t mode, double max_ratio = 20.0) {
     mutable_cf_options_.skip_level_tombstone_compaction = mode;
     mutable_cf_options_.skip_level_max_overlap_ratio = max_ratio;
     mutable_cf_options_.max_compaction_bytes = 1ULL << 40;
   }
+  void BuildFanout10Tree();
   std::unique_ptr<Compaction> Pick() {
     return std::unique_ptr<Compaction>(level_compaction_picker.PickCompaction(
         cf_name_, mutable_cf_options_, mutable_db_options_,
@@ -6470,30 +6471,64 @@ TEST_F(SkipLevelPickerTest, LastLevelFileIsNotACandidate) {
   ASSERT_TRUE(vstorage_->TombstoneDenseFiles().empty());
 }
 
-TEST_F(SkipLevelPickerTest, CostBasedPicksDeepWhenOverlapIsSmall) {
-  SetMode(2, /*max_ratio=*/100.0);
+// Mode 2: B(L2) = 200, B(L3) = 300; growth 1.5 <= 20, so skip to L3.
+TEST_F(SkipLevelPickerTest, CascadeSavingsSkipsWhenGrowthIsBounded) {
+  SetMode(2, /*max_ratio=*/20.0);
   NewVersionStorage(4, kCompactionStyleLevel);
   Add(1, 1U, "100", "149", 100U);
   Add(2, 2U, "100", "149", 100U);
   Add(3, 3U, "100", "149", 100U);
   SetDense(1U);
   UpdateVersionStorageInfo();
-  // score(L2) = 1 / 2, score(L3) = 2 / 3 -> L3
   auto c = Pick();
   ASSERT_NE(c, nullptr);
   ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
   ASSERT_EQ(3, c->output_level());
+  ASSERT_EQ(3U, c->num_input_levels());
 }
 
-TEST_F(SkipLevelPickerTest, CostBasedStopsWhenDeepOverlapIsLarge) {
-  SetMode(2, /*max_ratio=*/100.0);
+// A tree with fanout 10: B(L2) = 1100, B(L3) = 11100 (10.1x),
+// B(L4) = 111100 (101x). With ratio 20, mode 2 skips one level (to L3) while
+// mode 1 goes all the way to L4.
+void SkipLevelPickerTest::BuildFanout10Tree() {
+  NewVersionStorage(5, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 100U);
+  Add(2, 2U, "100", "149", 1000U);
+  Add(3, 3U, "100", "149", 10000U);
+  Add(4, 4U, "100", "149", 100000U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+}
+
+TEST_F(SkipLevelPickerTest, CascadeSavingsStopsWhereGrowthExceedsRatio) {
+  SetMode(2, /*max_ratio=*/20.0);
+  BuildFanout10Tree();
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
+  ASSERT_EQ(3, c->output_level());
+  ASSERT_EQ(3U, c->num_input_levels());
+}
+
+TEST_F(SkipLevelPickerTest, AlwaysIgnoresGrowthRatio) {
+  SetMode(1, /*max_ratio=*/20.0);
+  BuildFanout10Tree();
+  auto c = Pick();
+  ASSERT_NE(c, nullptr);
+  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
+  ASSERT_EQ(4, c->output_level());
+}
+
+// Ratio 1 forbids any deeper target that has overlapping data, which turns
+// mode 2 into "density trigger only, one level at a time".
+TEST_F(SkipLevelPickerTest, RatioOneFallsBackToOneLevel) {
+  SetMode(2, /*max_ratio=*/1.0);
   NewVersionStorage(4, kCompactionStyleLevel);
   Add(1, 1U, "100", "149", 100U);
   Add(2, 2U, "100", "149", 100U);
-  Add(3, 3U, "100", "149", 1000U);
+  Add(3, 3U, "100", "149", 100U);
   SetDense(1U);
   UpdateVersionStorageInfo();
-  // score(L2) = 1 / 2, score(L3) = 2 / 12 -> normal one-level compaction.
   auto c = Pick();
   ASSERT_NE(c, nullptr);
   ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
@@ -6502,18 +6537,32 @@ TEST_F(SkipLevelPickerTest, CostBasedStopsWhenDeepOverlapIsLarge) {
   ASSERT_EQ(2U, c->num_input_levels());
 }
 
-TEST_F(SkipLevelPickerTest, CostBasedRespectsMaxOverlapRatio) {
-  SetMode(2, /*max_ratio=*/2.5);
+TEST_F(SkipLevelPickerTest, DensityTriggerOffDoesNotPick) {
+  SetMode(1);
+  mutable_cf_options_.skip_level_tombstone_density_trigger = false;
   NewVersionStorage(4, kCompactionStyleLevel);
   Add(1, 1U, "100", "149", 100U);
   Add(2, 2U, "100", "149", 100U);
   Add(3, 3U, "100", "149", 100U);
   SetDense(1U);
   UpdateVersionStorageInfo();
-  // L3 would be better (2/3 > 1/2) but its ratio 3 exceeds 2.5.
+  ASSERT_TRUE(vstorage_->TombstoneDenseFiles().empty());
+  ASSERT_FALSE(level_compaction_picker.NeedsCompaction(vstorage_.get()));
+}
+
+TEST_F(SkipLevelPickerTest, DensityTriggerOffStillExtendsSizePick) {
+  SetMode(1);
+  mutable_cf_options_.skip_level_tombstone_density_trigger = false;
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(1, 1U, "100", "149", 1000000000U);  // over the L1 size limit
+  Add(2, 2U, "100", "149", 1000U);
+  Add(3, 3U, "100", "149", 1000U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
   auto c = Pick();
   ASSERT_NE(c, nullptr);
-  ASSERT_EQ(2, c->output_level());
+  ASSERT_EQ(CompactionReason::kSkipLevelTombstone, c->compaction_reason());
+  ASSERT_EQ(3, c->output_level());
 }
 
 TEST_F(SkipLevelPickerTest, StartsFromL0ThroughBaseLevel) {

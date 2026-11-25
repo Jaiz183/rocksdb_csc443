@@ -106,3 +106,128 @@ The same driver builds against `main`; there the mode 1/2 runs fail fast with
 "Extra option not recognized" because the options do not exist.
 
 Unit test results: see `TEST_RESULTS.txt`.
+
+## v2: cascade-savings mode 2 and the trigger/skip ablation (2026-11-24)
+
+### What changed
+
+- Mode 2 (`skip_level_tombstone_compaction=2`) no longer uses
+  `score(t) = (t - start) / (B(t) / S)`. That score can never favour a deeper
+  level in a leveled tree: B grows about T-fold per level while the numerator
+  grows by 1, so it always fell back to a one-level compaction (v1 mode 2
+  never skipped).
+- New mode 2: B(t) = bytes of the compaction from the start level straight to
+  level t, n = normal output level. A one-level-at-a-time cascade of the same
+  key range writes about B(n) + ... + B(t); the skip writes B(t). The
+  estimated saving savings(t) = B(n) + ... + B(t-1) grows with t, so mode 2
+  takes the deepest feasible t with B(t) / B(n) <= `skip_level_max_overlap_ratio`
+  (default now 20 = 2T: one extra level, not two). The picker logs B(n) and
+  the estimated saving for every skip.
+- New option `skip_level_tombstone_density_trigger` (default true). False
+  disables the density trigger, so only dense size-triggered compactions are
+  extended. This plus ratio 1 (no deeper level with data qualifies) separates
+  "trigger" from "skip" for the ablation.
+- New `DELPAT=churn` workload in the driver, plus `MULT` / `LBASE_MB` to make
+  the tree deeper, and a per-shape tally of SkipLevelTombstone compactions.
+
+### Setup
+
+`ablation.sh`: same driver settings as above except T = 5 and a 1 MB level
+base, so L0, L3, L4, L5 and L6 are in use (a start file can skip up to two
+levels). Density threshold 0.3 for every non-base config (churn files are
+about 45% tombstones, so the 0.5 default never fires on churn). 60 s at 20k
+ops/s after a 1M-key preload, 2 repeats, config order rotated per repeat.
+
+- `seqdel`: 30% point deletes sweeping the key space in order.
+- `churn`: 90% of ops toggle one of 20,000 hot keys spread evenly over the
+  key space (delete it if present, else re-insert it); 10% uniform puts.
+  Every hot key is deleted and re-inserted about 50 times per run.
+
+| config | options (plus density 0.3) | meaning |
+|---|---|---|
+| base | none | stock behaviour |
+| trig | mode 2, ratio 1 | density trigger, one level at a time |
+| skip | mode 1, trigger off | skip on dense size picks only, deepest level |
+| trig+skip | mode 1 | both, deepest level |
+| trig+sav | mode 2, ratio 20 | both, cascade-savings bound |
+| skip+sav | mode 2, ratio 20, trigger off | skip on size picks, bounded |
+
+"real skips" counts SkipLevelTombstone compactions whose output level is
+deeper than the normal one (for L0, the base level seen in the base run).
+The few "real skips" in `trig` are artifacts: L0 -> L4 after the trigger
+emptied L3 and the dynamic base level moved, and L3 -> L5 where L4 had no
+overlapping data (growth 1.0 passes ratio 1).
+
+| workload | config | rep | load | write amp | compaction MB | avg upper tombstones | space amp | SkipLevel compactions | real skips | levels skipped | verify |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| churn | base | 1 | 4 | 4.04 | 255 | 20993 | 1.161 | 0 | 0 | 0 | PASS |
+| churn | base | 2 | 1 | 4.24 | 270 | 21343 | 1.161 | 0 | 0 | 0 | PASS |
+| churn | trig | 1 | 20 | 20.30 | 1555 | 10772 | 1.132 | 238 | 103 | 103 | PASS |
+| churn | trig | 2 | 1 | 20.01 | 1531 | 10971 | 1.145 | 457 | 0 | 0 | PASS |
+| churn | skip | 1 | 8 | 10.72 | 788 | 12394 | 1.126 | 57 | 57 | 114 | PASS |
+| churn | skip | 2 | 2 | 10.64 | 782 | 12601 | 1.139 | 56 | 56 | 112 | PASS |
+| churn | trig+skip | 1 | 4 | 19.91 | 1523 | 10665 | 1.130 | 116 | 113 | 226 | PASS |
+| churn | trig+skip | 2 | 3 | 19.79 | 1514 | 10794 | 1.132 | 113 | 113 | 226 | PASS |
+| churn | trig+sav | 1 | 3 | 20.95 | 1606 | 10827 | 1.130 | 235 | 113 | 114 | PASS |
+| churn | trig+sav | 2 | 2 | 21.59 | 1658 | 10258 | 1.137 | 256 | 114 | 114 | PASS |
+| churn | skip+sav | 1 | 2 | 10.49 | 770 | 12487 | 1.135 | 56 | 56 | 112 | PASS |
+| churn | skip+sav | 2 | 2 | 10.52 | 773 | 12608 | 1.136 | 56 | 56 | 112 | PASS |
+| seqdel | base | 1 | 54 | 9.15 | 791 | 11930 | 1.176 | 0 | 0 | 0 | PASS |
+| seqdel | base | 2 | 2 | 9.23 | 798 | 11107 | 1.193 | 0 | 0 | 0 | PASS |
+| seqdel | trig | 1 | 30 | 30.55 | 2871 | 3306 | 1.162 | 207 | 7 | 7 | PASS |
+| seqdel | trig | 2 | 3 | 23.39 | 2175 | 3459 | 1.162 | 172 | 7 | 7 | PASS |
+| seqdel | skip | 1 | 16 | 10.86 | 957 | 11103 | 1.164 | 47 | 47 | 78 | PASS |
+| seqdel | skip | 2 | 3 | 10.93 | 964 | 10076 | 1.167 | 46 | 46 | 76 | PASS |
+| seqdel | trig+skip | 1 | 7 | 29.48 | 2767 | 3027 | 1.148 | 146 | 83 | 141 | PASS |
+| seqdel | trig+skip | 2 | 3 | 31.91 | 3004 | 2752 | 1.143 | 157 | 79 | 136 | PASS |
+| seqdel | trig+sav | 1 | 4 | 31.32 | 2946 | 3123 | 1.153 | 167 | 67 | 123 | PASS |
+| seqdel | trig+sav | 2 | 3 | 30.91 | 2906 | 2438 | 1.151 | 169 | 68 | 125 | PASS |
+| seqdel | skip+sav | 1 | 3 | 11.04 | 520 | 9864 | 1.137 | 25 | 25 | 40 | PASS |
+| seqdel | skip+sav | 2 | 3 | 10.96 | 967 | 9948 | 1.179 | 48 | 48 | 78 | PASS |
+
+| workload | config | runs | mean write amp | vs base | mean avg upper tombstones | vs base | mean real skips |
+|---|---|---|---|---|---|---|---|
+| churn | base | 2 | 4.14 | +0.0% | 21168 | +0.0% | 0.0 |
+| churn | trig | 2 | 20.15 | +386.6% | 10872 | -48.6% | 51.5 |
+| churn | skip | 2 | 10.68 | +157.8% | 12498 | -41.0% | 56.5 |
+| churn | trig+skip | 2 | 19.85 | +379.2% | 10730 | -49.3% | 113.0 |
+| churn | trig+sav | 2 | 21.27 | +413.5% | 10542 | -50.2% | 113.5 |
+| churn | skip+sav | 2 | 10.51 | +153.7% | 12548 | -40.7% | 56.0 |
+| seqdel | base | 2 | 9.19 | +0.0% | 11518 | +0.0% | 0.0 |
+| seqdel | trig | 2 | 26.97 | +193.4% | 3382 | -70.6% | 7.0 |
+| seqdel | skip | 2 | 10.89 | +18.5% | 10590 | -8.1% | 46.5 |
+| seqdel | trig+skip | 2 | 30.70 | +234.0% | 2890 | -74.9% | 81.0 |
+| seqdel | trig+sav | 2 | 31.11 | +238.5% | 2780 | -75.9% | 67.5 |
+| seqdel | skip+sav | 2 | 11.00 | +19.7% | 9906 | -14.0% | 36.5 |
+
+### Findings
+
+1. **Skipping did not reduce write amp in either workload.** With the trigger
+   off, skipping cost +18.5% (`skip`) / +19.7% (`skip+sav`) on seqdel and
+   +158% / +154% on churn, for 8-14% (seqdel) and 41% (churn) fewer
+   tombstones above the last level. The two bounded/unbounded variants are
+   within noise of each other.
+2. **The density trigger is the dominant cost.** At threshold 0.3 it raises
+   write amp 2.9x (seqdel) and 4.9x (churn) on its own (`trig`). Its outputs
+   stay dense (churn keeps re-deleting the same keys), so the same key ranges
+   are picked again and again: in churn `trig` wrote 1.4 GB in L4 -> L5
+   compactions versus 0.3 GB in base. It needs hysteresis or a rate limit.
+3. **The cascade-savings model is too optimistic.** It charges the cascade the
+   full B(j) at every level for this key range alone. In a real leveled tree
+   the deep overlap is shared: when level j-1 later compacts into j, its file
+   carries data from many upper compactions, so the per-byte cost of a level
+   crossing is about T (amortized), not B(j)/S. With O_j ~ S T^(j-i) a skip of
+   k levels writes about S T^k now, versus about S T k amortized for the
+   cascade, so a skip only pays when the deep overlap is unusually small. In
+   churn there is a second effect: a tombstone is usually superseded by the
+   key's re-insert near the top of the tree, so in the cascade most
+   tombstones never travel far, while a skip pays the full deep overlap at
+   once.
+4. **Mode 2's bound rarely bound.** `trig+sav` skipped fewer levels than
+   `trig+skip` on seqdel (about 124 vs 139 levels per run) with no write-amp
+   difference; on churn the two were identical in skips.
+
+Next step suggested by (3): replace the saving estimate with the amortized
+one, i.e. skip to t only if B(t) <= S * (1 + T * (t - start)), which accepts a
+skip exactly when the measured deep overlap is well below the tree's average
+(for example sequential deletes over a range that has little old data).

@@ -380,6 +380,8 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
       moptions.skip_level_tombstone_compaction;
   cf_opts->skip_level_tombstone_density_threshold =
       moptions.skip_level_tombstone_density_threshold;
+  cf_opts->skip_level_tombstone_density_trigger =
+      moptions.skip_level_tombstone_density_trigger;
   cf_opts->skip_level_max_overlap_ratio = moptions.skip_level_max_overlap_ratio;
   cf_opts->preclude_last_level_data_seconds =
       moptions.preclude_last_level_data_seconds;
