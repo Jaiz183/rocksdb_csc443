@@ -1029,6 +1029,72 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   double read_triggered_compaction_threshold = 0.0;
 
+  // [CSC443 draft] Skip-level tombstone compaction (leveled compaction only).
+  //
+  // A "tombstone-dense" file is a file above the last non-empty level whose
+  // num_deletions / num_entries (num_deletions includes range deletions) is
+  // at least `skip_level_tombstone_density_threshold`. Instead of pushing such
+  // a file down one level at a time (L -> L+1 -> ... -> Lmax, rewriting the
+  // tombstones at every hop), a single multi-level compaction takes the file
+  // plus every overlapping file in the intermediate levels and writes the
+  // result straight into a deeper level. When that level is the bottommost
+  // one, the tombstones (and the data they shadow) are dropped right away.
+  //
+  // Modes:
+  //   0 = off (default): no change from stock RocksDB.
+  //   1 = always: target the deepest feasible level (the last non-empty level
+  //       when possible, limited by `max_compaction_bytes` and by files that
+  //       are already being compacted).
+  //   2 = amortized cascade: let S be the start files' bytes, n the normal
+  //       output level, B(t) the input bytes of a compaction from the start
+  //       level straight to level t, and T = max_bytes_for_level_multiplier.
+  //       Pushing S down one level at a time costs about (1 + T) * S per
+  //       level after the first (amortized over the data that shares the
+  //       deeper overlap), while the skip pays the measured B(t) - B(n). This
+  //       picks the t with the largest positive
+  //         (t - n) * (1 + T) * S - (B(t) - B(n)),
+  //       i.e. it skips only where the overlap below n is well under the
+  //       tree's average, and never lets B(t) exceed
+  //       `skip_level_max_overlap_ratio` * B(n).
+  //
+  // When enabled, size-triggered compactions and FADE compactions
+  // (CompactionReason::kFadeTtl, see `delete_persistence_threshold`) whose
+  // start-level inputs are tombstone-dense are extended to skip levels as
+  // above (they stay normal one-level compactions when no deeper target
+  // qualifies). If
+  // `skip_level_tombstone_density_trigger` is also true, tombstone-dense
+  // files in L1 and below additionally become a compaction trigger
+  // (CompactionReason::kSkipLevelTombstone) that runs after size-based
+  // compaction. L0 files are left to the L0 file-count trigger, so that one
+  // compaction out of L0 still takes a whole batch of flushed files. The
+  // trigger only runs compactions that skip at least one level, and it
+  // ignores files written by a kSkipLevelTombstone compaction until they are
+  // rewritten by another compaction.
+  //
+  // Dynamically changeable through SetOptions() API
+  uint32_t skip_level_tombstone_compaction = 0;
+
+  // See `skip_level_tombstone_compaction`. Valid range: (0, 1].
+  //
+  // Dynamically changeable through SetOptions() API
+  double skip_level_tombstone_density_threshold = 0.5;
+
+  // See `skip_level_tombstone_compaction`. Whether tombstone-dense files are
+  // picked for compaction on their own (true) or only when a size-triggered
+  // compaction picks them anyway (false).
+  //
+  // Dynamically changeable through SetOptions() API
+  bool skip_level_tombstone_density_trigger = true;
+
+  // See `skip_level_tombstone_compaction` (cascade-savings mode only). Must
+  // be >= 1. With level size multiplier T, going one level deeper makes the
+  // compaction about T times larger, so the default (2 * T for T = 10)
+  // allows skipping one level but not two. A value of 1 disables skipping
+  // whenever the deeper level has overlapping data.
+  //
+  // Dynamically changeable through SetOptions() API
+  double skip_level_max_overlap_ratio = 20.0;
+
   // If this option is set then 1 in N blocks are compressed
   // using a fast (lz4) and slow (zstd) compression algorithm.
   // The compressibility is reported as stats and the stored

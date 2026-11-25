@@ -313,6 +313,12 @@ struct FileMetaData {
 
   bool marked_for_compaction = false;  // True if client asked us nicely to
                                        // compact this file.
+  // [CSC443 draft] True if this file was written by a kSkipLevelTombstone
+  // compaction. In memory only (false after reopen). Such files are not
+  // tombstone-density trigger candidates (see
+  // VersionStorageInfo::ComputeTombstoneDenseFiles), so the trigger cannot
+  // pick the same tombstones again until another compaction rewrites them.
+  bool from_skip_level_compaction = false;
   Temperature temperature = Temperature::kUnknown;
 
   // How this DB got the file's contents and what has happened to the file

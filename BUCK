@@ -5100,6 +5100,12 @@ cpp_unittest_wrapper(name="db_secondary_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="db_skip_level_compaction_test",
+            srcs=["db/db_skip_level_compaction_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="db_split_merge_test",
             srcs=["utilities/db_split_merge_test.cc"],
             deps=[":rocksdb_test_lib"],

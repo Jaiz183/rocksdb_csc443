@@ -1,0 +1,10 @@
+== uniform_m0_r1 load={ 250.18 215.21 132.94 }
+cf_opts="" run_s=60.0 ops=1200000 (puts=1080114 dels=119886 rdels=0) ops/s=20000
+write_amp=8.455  (compaction 893.2 MB + flush 122.8 MB) / user 120.2 MB
+avg_upper_tombstones=11507  peak_tomb_age_ub=41s  avg_sst_MB=92.24
+end_of_run: sst_MB=103.53 upper_tombs=14271 total_tombs=14271 levels_KB=0/0/0/0/6044/8727/91243
+drained:    sst_MB=101.09 upper_tombs=11418 total_tombs=11418 levels_KB=602/0/0/0/2904/8373/91632 space_amp=1.125
+compactions by reason: LevelL0FilesNum=38(239.9MB) LevelMaxLevelSize=228(653.4MB)
+compactions by shape:  L0->L4=38(239.9MB) L4->L5=108(162.9MB) L5->L6=120(490.5MB)
+verify: live_keys=819084 mismatches=0 bg_errors=0 -> PASS
+exit=0

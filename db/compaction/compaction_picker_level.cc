@@ -15,6 +15,7 @@
 
 #include "db/version_edit.h"
 #include "logging/log_buffer.h"
+#include "logging/logging.h"
 #include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -41,6 +42,9 @@ bool LevelCompactionPicker::NeedsCompaction(
     return true;
   }
   if (!vstorage->ReadTriggeredCompactionFiles().empty()) {
+    return true;
+  }
+  if (!vstorage->TombstoneDenseFiles().empty()) {
     return true;
   }
   for (int i = 0; i <= vstorage->MaxInputLevel(); i++) {
@@ -107,6 +111,29 @@ class LevelCompactionBuilder {
   bool SetupOtherInputsIfNeeded();
 
   Compaction* GetCompaction();
+
+  // Skip-level tombstone compaction (see
+  // AdvancedColumnFamilyOptions::skip_level_tombstone_compaction).
+  //
+  // True iff the picked start-level inputs should be considered for a
+  // skip-level compaction.
+  bool ShouldTrySkipLevel() const;
+
+  // Density trigger: tries the tombstone-dense files, densest first, and sets
+  // up the first one for which TrySetupSkipLevelCompaction() finds a target
+  // deeper than the normal output level. A dense file that cannot skip is left
+  // to size-based compaction: a one-level compaction picked only for its
+  // tombstones costs a full extra level crossing and its output is usually
+  // still dense, so it would be picked again at the next level.
+  bool PickSkipLevelTriggerCompaction();
+  // True once TrySetupSkipLevelCompaction() succeeded for the current pick.
+  bool skip_level_set_up_ = false;
+  // Tries to turn the picked start-level inputs into a multi-level
+  // compaction start_level_ -> t with t deeper than the normal output level.
+  // On success fills compaction_inputs_, output_level_, grandparents_ and
+  // compaction_reason_ and returns true. On failure leaves the builder state
+  // untouched so the normal path can proceed.
+  bool TrySetupSkipLevelCompaction();
 
   // From `start_level_`, pick files to compact to `output_level_`.
   // Returns false if there is no file to compact.
@@ -343,6 +370,14 @@ void LevelCompactionBuilder::SetupInitialFiles() {
   // [FADE] The tree is saturated but no size-based compaction was possible
   // (e.g. the saturated levels are busy): do not let expired files wait.
   if (tree_saturated && PickFadeCompaction()) {
+    return;
+  }
+
+  // Skip-level tombstone compaction trigger: tombstone-dense files above the
+  // last non-empty level. Runs after size-based compaction so it never
+  // starves it.
+  parent_index_ = base_index_ = -1;
+  if (PickSkipLevelTriggerCompaction()) {
     return;
   }
 
@@ -622,6 +657,13 @@ Compaction* LevelCompactionBuilder::PickCompaction() {
   }
   assert(start_level_ >= 0 && output_level_ >= 0);
 
+  if (skip_level_set_up_ ||
+      (ShouldTrySkipLevel() && TrySetupSkipLevelCompaction())) {
+    Compaction* c = GetCompaction();
+    TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
+    return c;
+  }
+
   // If it is a L0 -> base level compaction, we need to set up other L0
   // files if needed.
   if (!SetupOtherL0FilesIfNeeded()) {
@@ -681,6 +723,225 @@ Compaction* LevelCompactionBuilder::GetCompaction() {
   vstorage_->ComputeCompactionScore(ioptions_, mutable_cf_options_,
                                     full_history_ts_low_);
   return c;
+}
+
+bool LevelCompactionBuilder::PickSkipLevelTriggerCompaction() {
+  for (const auto& level_file : vstorage_->TombstoneDenseFiles()) {
+    assert(!level_file.second->being_compacted);
+    start_level_ = level_file.first;
+    if (start_level_ >= vstorage_->num_non_empty_levels() - 1 ||
+        (start_level_ == 0 &&
+         !compaction_picker_->level0_compactions_in_progress()->empty())) {
+      continue;
+    }
+    output_level_ =
+        (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
+    start_level_inputs_.files = {level_file.second};
+    start_level_inputs_.level = start_level_;
+    if (!compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
+                                                    &start_level_inputs_)) {
+      continue;
+    }
+    if (TrySetupSkipLevelCompaction()) {
+      return true;
+    }
+  }
+  start_level_inputs_.files.clear();
+  return false;
+}
+
+bool LevelCompactionBuilder::ShouldTrySkipLevel() const {
+  if (mutable_cf_options_.skip_level_tombstone_compaction == 0 ||
+      is_l0_trivial_move_ || output_level_ == start_level_ ||
+      start_level_inputs_.empty()) {
+    return false;
+  }
+  if (compaction_reason_ == CompactionReason::kSkipLevelTombstone) {
+    return true;
+  }
+  // Size-triggered and FADE (expired tombstone TTL) picks can be extended.
+  // FADE decides when a file's tombstones must move down; the skip rule
+  // decides how many levels they can cross in that one rewrite.
+  if (compaction_reason_ != CompactionReason::kLevelL0FilesNum &&
+      compaction_reason_ != CompactionReason::kLevelMaxLevelSize &&
+      compaction_reason_ != CompactionReason::kFadeTtl) {
+    return false;
+  }
+  // Only extend the pick if the start inputs are dense.
+  uint64_t entries = 0;
+  uint64_t deletions = 0;
+  for (const FileMetaData* f : start_level_inputs_.files) {
+    entries += f->num_entries;
+    deletions += f->num_deletions;
+  }
+  return entries > 0 &&
+         static_cast<double>(deletions) >=
+             mutable_cf_options_.skip_level_tombstone_density_threshold *
+                 static_cast<double>(entries);
+}
+
+bool LevelCompactionBuilder::TrySetupSkipLevelCompaction() {
+  const int start = start_level_;
+  const int last = vstorage_->num_non_empty_levels() - 1;
+  const int first_next = (start == 0) ? vstorage_->base_level() : start + 1;
+  // If the normal output level is already the last level there is nothing to
+  // skip.
+  if (first_next >= last) {
+    return false;
+  }
+  const uint32_t mode = mutable_cf_options_.skip_level_tombstone_compaction;
+
+  CompactionInputFiles start_inputs = start_level_inputs_;
+  if (start == 0) {
+    // Same rule as GetOverlappingL0Files(): only one compaction out of L0 at a
+    // time, and take every L0 file overlapping the picked range.
+    if (!compaction_picker_->level0_compactions_in_progress()->empty()) {
+      return false;
+    }
+    InternalKey smallest;
+    InternalKey largest;
+    compaction_picker_->GetRange(start_inputs, &smallest, &largest);
+    start_inputs.files.clear();
+    vstorage_->GetOverlappingInputs(0, &smallest, &largest, &start_inputs.files,
+                                    /*hint_index=*/-1, /*file_index=*/nullptr,
+                                    /*expand_range=*/true);
+    if (compaction_picker_->AreFilesInCompaction(start_inputs.files)) {
+      return false;
+    }
+  }
+  const uint64_t start_bytes = TotalFileSize(start_inputs.files);
+  if (start_bytes == 0) {
+    return false;
+  }
+
+  // Every level in (start, t] must not receive output from a running
+  // compaction in our (final) key range: data written there while we move
+  // newer data past it would end up above older data... or below newer data.
+  auto conflicts_with_running =
+      [&](const std::vector<CompactionInputFiles>& inputs, int t) {
+        for (int j = first_next; j <= t; j++) {
+          if (compaction_picker_->FilesRangeOverlapWithCompaction(
+                  inputs, j,
+                  Compaction::EvaluateProximalLevel(
+                      vstorage_, mutable_cf_options_, ioptions_, start, j))) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+  std::vector<CompactionInputFiles> inputs;
+  inputs.push_back(start_inputs);
+  uint64_t total_bytes = start_bytes;
+
+  // Mode 2 (amortized cascade). Let S = start_bytes, n = first_next, B(j) =
+  // total_bytes after adding level j, and T = max_bytes_for_level_multiplier.
+  // The first hop (start -> n) costs B(n) either way. In steady state every
+  // later one-level hop of S bytes costs about (1 + T) * S amortized: the
+  // overlap it meets at the next level is shared with data arriving from other
+  // compactions. Skipping to t instead pays the measured extra overlap
+  // B(t) - B(n) now, so the estimated saving is
+  //   net(t) = (t - n) * (1 + T) * S - (B(t) - B(n)),
+  // which is positive only when the overlap below n is well under the tree's
+  // average. Take the t with the largest net(t) > 0 (ties go deeper); also
+  // never let the compaction grow past skip_level_max_overlap_ratio * B(n).
+  const double hop_bytes =
+      (1.0 + mutable_cf_options_.max_bytes_for_level_multiplier) *
+      static_cast<double>(start_bytes);
+  int best_level = -1;
+  size_t best_num_inputs = 0;
+  uint64_t normal_bytes = 0;  // B(n)
+  double best_net = 0.0;
+  for (int j = first_next; j <= last; j++) {
+    InternalKey smallest;
+    InternalKey largest;
+    compaction_picker_->GetRange(inputs, &smallest, &largest,
+                                 Compaction::kInvalidLevel);
+    CompactionInputFiles level_inputs;
+    level_inputs.level = j;
+    vstorage_->GetOverlappingInputs(j, &smallest, &largest,
+                                    &level_inputs.files);
+    if (!level_inputs.empty()) {
+      if (!compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
+                                                      &level_inputs)) {
+        // Some file at this depth is being compacted: cannot go deeper.
+        break;
+      }
+      total_bytes += TotalFileSize(level_inputs.files);
+      inputs.push_back(level_inputs);
+    }
+    if (total_bytes > mutable_cf_options_.max_compaction_bytes) {
+      break;
+    }
+    if (conflicts_with_running(inputs, j)) {
+      break;
+    }
+    if (j == first_next) {
+      normal_bytes = total_bytes;
+      best_level = j;
+      best_num_inputs = inputs.size();
+      continue;
+    }
+    if (mode == 1) {
+      best_level = j;
+      best_num_inputs = inputs.size();
+      continue;
+    }
+    const double growth =
+        static_cast<double>(total_bytes) / static_cast<double>(normal_bytes);
+    if (growth > mutable_cf_options_.skip_level_max_overlap_ratio) {
+      // B(j) only grows with j, so no deeper level can qualify either.
+      break;
+    }
+    const double net = static_cast<double>(j - first_next) * hop_bytes -
+                       static_cast<double>(total_bytes - normal_bytes);
+    if (net > 0.0 && net >= best_net) {
+      best_level = j;
+      best_num_inputs = inputs.size();
+      best_net = net;
+    }
+  }
+  TEST_SYNC_POINT_CALLBACK(
+      "LevelCompactionBuilder::TrySetupSkipLevelCompaction:BestLevel",
+      &best_level);
+  if (best_level <= first_next) {
+    // Not deeper than a normal compaction: let the normal path handle it.
+    return false;
+  }
+
+  ROCKS_LOG_BUFFER(log_buffer_,
+                   "[%s] Skip-level tombstone compaction L%d -> L%d (normal "
+                   "L%d): %" PRIu64
+                   " normal bytes, est. %.0f bytes saved "
+                   "(mode 2 only)",
+                   cf_name_.c_str(), start, best_level, first_next,
+                   normal_bytes, best_net);
+  inputs.resize(best_num_inputs);
+  output_level_ = best_level;
+  start_level_inputs_ = inputs[0];
+  compaction_inputs_ = std::move(inputs);
+  compaction_reason_ = CompactionReason::kSkipLevelTombstone;
+
+  // Grandparents: first level below the output level with overlapping files.
+  InternalKey smallest;
+  InternalKey largest;
+  compaction_picker_->GetRange(compaction_inputs_, &smallest, &largest,
+                               Compaction::kInvalidLevel);
+  grandparents_.clear();
+  for (int level = output_level_ + 1;
+       level < compaction_picker_->NumberLevels(); level++) {
+    vstorage_->GetOverlappingInputs(level, &smallest, &largest, &grandparents_);
+    if (!grandparents_.empty()) {
+      break;
+    }
+  }
+  ROCKS_LOG_BUFFER(log_buffer_,
+                   "[%s] Skip-level tombstone compaction: L%d -> L%d, "
+                   "%zu input levels",
+                   cf_name_.c_str(), start, output_level_,
+                   compaction_inputs_.size());
+  skip_level_set_up_ = true;
+  return true;
 }
 
 /*

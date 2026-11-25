@@ -1,0 +1,11 @@
+== churn_base_r4 load={ 1.66 3.48 13.74 }
+cf_opts="" run_s=60.0 ops=1200000 (puts=658427 dels=541573 rdels=0) ops/s=20000
+write_amp=4.242  (compaction 270.7 MB + flush 68.5 MB) / user 80.0 MB
+avg_upper_tombstones=21746  peak_tomb_age_ub=63s  avg_sst_MB=82.36
+end_of_run: sst_MB=86.06 upper_tombs=25034 total_tombs=25034 levels_KB=622/0/0/622/2305/13955/70623
+drained:    sst_MB=84.48 upper_tombs=16538 total_tombs=16538 levels_KB=0/0/0/0/2161/13301/71041 space_amp=1.149
+compactions by reason: LevelL0FilesNum=57(75.9MB) LevelMaxLevelSize=115(194.8MB)
+compactions by shape:  L0->L3=57(75.9MB) L3->L4=66(85.2MB) L4->L5=33(76.2MB) L5->L6=16(33.5MB)
+skip-level shapes:     
+verify: live_keys=670607 mismatches=0 bg_errors=0 -> PASS
+exit=0

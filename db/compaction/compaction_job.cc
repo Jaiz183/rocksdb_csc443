@@ -172,6 +172,8 @@ const char* GetCompactionReasonString(CompactionReason compaction_reason) {
       return "ReadTriggered";
     case CompactionReason::kFadeTtl:
       return "FadeTtl";
+    case CompactionReason::kSkipLevelTombstone:
+      return "SkipLevelTombstone";
     case CompactionReason::kNumOfReasons:
       // fall through
     default:

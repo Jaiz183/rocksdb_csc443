@@ -625,6 +625,24 @@ static std::unordered_map<std::string, OptionTypeInfo>
                    read_triggered_compaction_threshold),
           OptionType::kDouble, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"skip_level_tombstone_compaction",
+         {offsetof(struct MutableCFOptions, skip_level_tombstone_compaction),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"skip_level_tombstone_density_threshold",
+         {offsetof(struct MutableCFOptions,
+                   skip_level_tombstone_density_threshold),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"skip_level_tombstone_density_trigger",
+         {offsetof(struct MutableCFOptions,
+                   skip_level_tombstone_density_trigger),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"skip_level_max_overlap_ratio",
+         {offsetof(struct MutableCFOptions, skip_level_max_overlap_ratio),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"preclude_last_level_data_seconds",
          {offsetof(struct MutableCFOptions, preclude_last_level_data_seconds),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -1303,6 +1321,14 @@ void MutableCFOptions::Dump(Logger* log) const {
                  periodic_compaction_seconds);
   ROCKS_LOG_INFO(log, "    read_triggered_compaction_threshold: %f",
                  read_triggered_compaction_threshold);
+  ROCKS_LOG_INFO(log, "        skip_level_tombstone_compaction: %" PRIu32,
+                 skip_level_tombstone_compaction);
+  ROCKS_LOG_INFO(log, " skip_level_tombstone_density_threshold: %f",
+                 skip_level_tombstone_density_threshold);
+  ROCKS_LOG_INFO(log, "   skip_level_tombstone_density_trigger: %d",
+                 skip_level_tombstone_density_trigger);
+  ROCKS_LOG_INFO(log, "           skip_level_max_overlap_ratio: %f",
+                 skip_level_max_overlap_ratio);
   ROCKS_LOG_INFO(log,
                  "              preclude_last_level_data_seconds: %" PRIu64,
                  preclude_last_level_data_seconds);

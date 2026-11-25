@@ -1510,6 +1510,7 @@ if(WITH_TESTS)
         db/db_bloom_filter_test.cc
         db/db_compaction_filter_test.cc
         db/db_compaction_test.cc
+        db/db_skip_level_compaction_test.cc
         db/db_compaction_abort_test.cc
         db/db_clip_test.cc
         utilities/db_split_merge_test.cc
