@@ -14,6 +14,18 @@ import re
 import sys
 
 d = sys.argv[1]
+
+
+def l0_files_per_compaction(t):
+    # "L0 compactions:" line (absent in older runs): reason=n(avg_l0_files=x,...)
+    if "L0 compactions:" not in t:
+        return float("nan")
+    line = t.split("L0 compactions:")[1].splitlines()[0]
+    parts = re.findall(r"=(\d+)\(avg_l0_files=([\d.]+)", line)
+    n = sum(int(a) for a, _ in parts)
+    return sum(int(a) * float(b) for a, b in parts) / n if n else float("nan")
+
+
 ORDER = ["base", "trig", "skip", "trig+skip", "trig+sav", "skip+sav"]
 rows = []
 for path in sorted(glob.glob(os.path.join(d, "*.txt"))):
@@ -40,6 +52,7 @@ for path in sorted(glob.glob(os.path.join(d, "*.txt"))):
         tomb=f(r"avg_upper_tombstones=(\d+)", int),
         space=f(r"space_amp=([\d.]+)"),
         sl=f(r"SkipLevelTombstone=(\d+)", int, 0),
+        l0f=l0_files_per_compaction(t),
         ok="PASS" if "-> PASS" in t else "FAIL"))
 
 # The normal L0 output level (base level) is taken from the base config's run
@@ -61,11 +74,11 @@ for r in rows:
             r["real"] += n
             r["lvls"] += n * (b - nxt)
 
-print("| workload | config | rep | load | write amp | compaction MB | avg upper tombstones | space amp | SkipLevel compactions | real skips | levels skipped | verify |")
-print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+print("| workload | config | rep | load | write amp | compaction MB | avg upper tombstones | space amp | SkipLevel compactions | real skips | levels skipped | L0 files per L0 compaction | verify |")
+print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
 key = lambda r: (r["w"], ORDER.index(r["c"]) if r["c"] in ORDER else 99, r["rep"])
 for r in sorted(rows, key=key):
-    print("| {w} | {c} | {rep} | {load:.0f} | {wa:.2f} | {comp:.0f} | {tomb} | {space:.3f} | {sl} | {real} | {lvls} | {ok} |".format(**r))
+    print("| {w} | {c} | {rep} | {load:.0f} | {wa:.2f} | {comp:.0f} | {tomb} | {space:.3f} | {sl} | {real} | {lvls} | {l0f:.2f} | {ok} |".format(**r))
 
 print()
 print("| workload | config | runs | mean write amp | vs base | mean avg upper tombstones | vs base | mean real skips |")

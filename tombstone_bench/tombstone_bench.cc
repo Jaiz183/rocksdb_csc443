@@ -86,6 +86,14 @@ struct Listener : public EventListener {
   std::map<std::string, std::pair<int, uint64_t>> by_shape;   // "L1->L3"
   // Shapes of SkipLevelTombstone compactions only.
   std::map<std::string, std::pair<int, uint64_t>> skip_shape;
+  // Compactions that start at L0, by reason: how many L0 files each one
+  // takes and how many bytes it reads in total (L0 + overlapping levels).
+  struct L0Stat {
+    int n = 0;
+    uint64_t l0_files = 0;
+    uint64_t in_bytes = 0;
+  };
+  std::map<std::string, L0Stat> l0_stat;
   std::atomic<int> errors{0};
   void OnCompactionCompleted(DB*, const CompactionJobInfo& ci) override {
     if (!ci.status.ok()) {
@@ -100,6 +108,14 @@ struct Listener : public EventListener {
       auto& k = skip_shape[shape];
       k.first++;
       k.second += ci.stats.total_output_bytes;
+    }
+    if (ci.base_input_level == 0) {
+      auto& z = l0_stat[reason];
+      z.n++;
+      for (auto& f : ci.input_file_infos) {
+        z.l0_files += f.level == 0 ? 1 : 0;
+      }
+      z.in_bytes += ci.stats.total_input_bytes;
     }
     auto& r = by_reason[reason];
     r.first++;
@@ -246,6 +262,7 @@ int main(int argc, char** argv) {
     listener->by_reason.clear();
     listener->by_shape.clear();
     listener->skip_shape.clear();
+    listener->l0_stat.clear();
   }
 
   FILE* csv = fopen((prefix + ".csv").c_str(), "w");
@@ -436,6 +453,13 @@ int main(int argc, char** argv) {
     for (auto& kv : listener->skip_shape) {
       printf(" %s=%d(%.1fMB)", kv.first.c_str(), kv.second.first,
              kv.second.second / 1048576.0);
+    }
+    printf("\nL0 compactions:        ");
+    for (auto& kv : listener->l0_stat) {
+      const auto& z = kv.second;
+      printf(" %s=%d(avg_l0_files=%.2f,avg_in=%.1fMB)", kv.first.c_str(), z.n,
+             z.n ? static_cast<double>(z.l0_files) / z.n : 0.0,
+             z.n ? z.in_bytes / 1048576.0 / z.n : 0.0);
     }
     printf("\n");
   }

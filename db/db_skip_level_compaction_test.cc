@@ -197,7 +197,10 @@ TEST_F(DBSkipLevelCompactionTest, AlwaysModeFromL0) {
   ASSERT_EQ("1,1,0,1", FilesPerLevel());
   listener_->Clear();
 
+  // L0 files are not density-trigger candidates; the L0 file-count trigger
+  // picks the file and the skip extension takes it to L3.
   ASSERT_OK(db_->SetOptions({{"skip_level_tombstone_compaction", "1"},
+                             {"level0_file_num_compaction_trigger", "1"},
                              {"disable_auto_compactions", "false"}}));
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   auto skips = SkipRecords();

@@ -6616,8 +6616,25 @@ TEST_F(SkipLevelPickerTest, DensityTriggerOffStillExtendsSizePick) {
   ASSERT_EQ(3, c->output_level());
 }
 
+// A dense L0 file is not a trigger candidate: it waits for the L0
+// file-count trigger so that the overlap below is shared by a batch of files.
+TEST_F(SkipLevelPickerTest, DenseL0FileIsNotTriggerCandidate) {
+  SetMode(1);
+  mutable_cf_options_.level0_file_num_compaction_trigger = 4;
+  NewVersionStorage(4, kCompactionStyleLevel);
+  Add(0, 1U, "100", "149", 100U);
+  Add(1, 2U, "120", "200", 100U);
+  Add(3, 3U, "050", "400", 100U);
+  SetDense(1U);
+  UpdateVersionStorageInfo();
+  ASSERT_TRUE(vstorage_->TombstoneDenseFiles().empty());
+  ASSERT_EQ(Pick(), nullptr);
+}
+
+// Once the L0 file-count trigger fires, the dense L0 pick skips levels.
 TEST_F(SkipLevelPickerTest, StartsFromL0ThroughBaseLevel) {
   SetMode(1);
+  mutable_cf_options_.level0_file_num_compaction_trigger = 1;
   NewVersionStorage(4, kCompactionStyleLevel);
   Add(0, 1U, "100", "149", 100U);
   Add(1, 2U, "120", "200", 100U);

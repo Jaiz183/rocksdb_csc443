@@ -1034,11 +1034,13 @@ struct AdvancedColumnFamilyOptions {
   // tombstone-dense are extended to skip levels as above (they stay normal
   // one-level compactions when no deeper target qualifies). If
   // `skip_level_tombstone_density_trigger` is also true, tombstone-dense
-  // files additionally become a compaction trigger
+  // files in L1 and below additionally become a compaction trigger
   // (CompactionReason::kSkipLevelTombstone) that runs after size-based
-  // compaction. The trigger only runs compactions that skip at least one
-  // level, and it ignores files written by a kSkipLevelTombstone compaction
-  // until they are rewritten by another compaction.
+  // compaction. L0 files are left to the L0 file-count trigger, so that one
+  // compaction out of L0 still takes a whole batch of flushed files. The
+  // trigger only runs compactions that skip at least one level, and it
+  // ignores files written by a kSkipLevelTombstone compaction until they are
+  // rewritten by another compaction.
   //
   // Dynamically changeable through SetOptions() API
   uint32_t skip_level_tombstone_compaction = 0;

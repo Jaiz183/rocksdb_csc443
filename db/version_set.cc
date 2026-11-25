@@ -4057,7 +4057,13 @@ void VersionStorageInfo::ComputeTombstoneDenseFiles(
   }
   const double threshold =
       mutable_cf_options.skip_level_tombstone_density_threshold;
-  for (int level = 0; level < last_non_empty; level++) {
+  // L0 files are not candidates. Every L0 file covers about the whole key
+  // range, so a compaction out of L0 rereads the same overlap no matter how
+  // many L0 files it takes; picking one file as soon as it is flushed pays
+  // that overlap per file instead of sharing it across the
+  // level0_file_num_compaction_trigger files that size-based compaction
+  // batches. Dense L0 files still skip levels when that compaction runs.
+  for (int level = 1; level < last_non_empty; level++) {
     for (FileMetaData* f : files_[level]) {
       if (!f->being_compacted && !f->from_skip_level_compaction &&
           f->num_deletions > 0 && TombstoneDensity(f) >= threshold) {

@@ -400,3 +400,71 @@ Write amp per run, sorted (mean, sample sd; t = Welch t vs base):
    degrees of freedom). churn: -2.4%, 4 of 5 below the base mean but with a
    much larger spread than base (sd 0.11 vs 0.02), t = -2.0 (about p ~ 0.1),
    so on churn the improvement is suggestive, not established.
+
+## v5: density trigger ignores L0, 3 repeats (2026-11-25)
+
+### Diagnosis
+
+`tombstone_bench` now prints, for every compaction that starts at L0, how many
+L0 files it took ("L0 compactions:" line). On the v4 code
+(`results/diag_v4_l0`, one run each):
+
+| v4 | L0 compactions | L0 files each | MB read per compaction | MB read per L0 file |
+|---|---|---|---|---|
+| churn base | 56 | 2.00 | 1.7 | 0.85 |
+| churn skip+sav | 56 | 2.00 | 3.4 | 1.7 |
+| churn trig+sav | 113 | 1.00 | 2.8 | 2.8 |
+| seqdel trig+sav (trigger picks only) | 56 | 1.25 | 3.3 | 2.6 |
+
+The trigger took each dense L0 file as soon as it was flushed. L0 files span
+about the whole key range, so the overlap below is about the same for 1 file
+or 2, and the trigger paid it once per file. The amortized rule did not object:
+it compares "skip now" with "cascade now", not with "wait and batch". Charging
+the trigger for its whole compaction was also considered and rejected. Churn's
+real per-level cost (about 1.2 × S) is so far below the (1 + T) · S estimate
+that such a rule would still approve these compactions.
+
+### Change
+
+`ComputeTombstoneDenseFiles()` starts at L1: dense L0 files are no longer
+trigger candidates. They wait for the L0 file-count compaction, which still
+skips levels when the amortized rule says so. The skip rule itself, the
+trigger's "skip at least one level" gate and the hysteresis flag are
+unchanged.
+
+### Results
+
+Same setup as v4 (MULT=5, LBASE_MB=1, θ = 0.3, mode 2, R = 20), 3 repeats,
+rotated config order. `skip` = skip+sav (trigger off), `trig+skip` = trig+sav.
+
+| workload | config | write amp per run | mean | vs base | Welch t vs base | upper tombstones vs base | L0 files per L0 compaction |
+|---|---|---|---|---|---|---|---|
+| churn | base | 4.26, 4.20, 4.24 | 4.23 | | | | 2.00 |
+| churn | skip | 4.09, 4.14, 4.12 | 4.11 | −2.8% | −5.1 | −11.4% | 2.00 |
+| churn | trig+skip | 4.05, 4.15, 4.13 | 4.11 | −2.8% | −3.5 | −10.8% | 2.00 |
+| seqdel | base | 9.41*, 9.25, 9.28 | 9.31 | | | | 2.00 |
+| seqdel | skip | 8.77, 9.01, 9.02 | 8.93 | −4.1% | −4.0 | −1.3% | 1.99 |
+| seqdel | trig+skip | 8.81, 9.17, 9.15 | 9.04 | −2.9% | −2.1 | −0.9% | 1.97 |
+
+\* Repeat 1 ran under a load average of about 100 (other work on the laptop);
+its seqdel runs all wrote less, base included. Without repeat 1, seqdel is
+−2.7% (skip) and −1.1% (trig+skip).
+
+Full per-run table: `python3 tombstone_bench/summarize_ablation.py
+tombstone_bench/results/ablation_v5`.
+
+### Findings
+
+- **The trigger no longer costs write amp.** v4 trig+skip was +38% (churn) and
+  +4.6% (seqdel); v5 is −2.8% and −2.9%. L0 compactions take 2 files again in
+  every config.
+- **Trigger + skip is now about equal to skip-only.** The difference is within
+  noise: Welch t = −0.2 on churn and +0.8 on seqdel. On churn the trigger finds
+  no L1+ candidates and the runs are the same compactions (56 L0 -> L4 skips).
+  On seqdel it adds a few L3 -> L5 skips that save about as much as they cost.
+- **The trigger now adds nothing measurable** on these workloads, for write amp
+  or for upper-level tombstones. Its remaining use is for trees where dense
+  files sit in L1+ while no size-based compaction reaches them, for example
+  after deletes stop. These benchmarks do not exercise that case.
+- Skip-only is still the setting that saves write amp: −2.8% (churn) and −2.7%
+  to −4.1% (seqdel).
