@@ -1,8 +1,9 @@
 # KiWi Per-Tile XOR+Page Filter (`tile-filter`)
 
-This note documents the per-tile XOR+page filter optimization implemented on
-the `tile-filter` branch and benchmarked against both pre-XOR baselines and
-eager filter reconstruction.
+This note documents the baseline per-tile XOR+page filter implementations
+(`kiwi_tile_xor_baseline` and `kiwi_tile_xor_baseline_16bit`) introduced on the
+`tile-filter` branch and benchmarked against both pre-XOR baselines and eager
+filter reconstruction.
 
 - Implementation:
   - [`XorFilterHash` / `XorFilterPolicy`](../../../table/block_based/filter_policy_internal.h)
@@ -97,9 +98,9 @@ Pre-XOR baselines included in every benchmark:
 - `kiwi_no_filter`: KiWi without any filter (`filter_policy = nullptr`)
 - `kiwi_page_bloom10`: Original KiWi per-page 10-bit Bloom filters (v1)
 
-Tile-XOR configurations:
-- `kiwi_tile_xor1`: Per-tile XOR+page filter with 1-byte fingerprint (`8 + ceil(log2(h))` bits/slot)
-- `kiwi_tile_xor2`: Per-tile XOR+page filter with 2-byte fingerprint (`16 + ceil(log2(h))` bits/slot)
+Baseline per-tile XOR configurations (`kiwi_{granularity}_xor_{description}`):
+- `kiwi_tile_xor_baseline`: Per-tile XOR+page filter with 1-byte (8-bit) fingerprint (`8 + ceil(log2(h))` bits/slot, `+32` segment slack)
+- `kiwi_tile_xor_baseline_16bit`: Per-tile XOR+page filter with 2-byte (16-bit) fingerprint (`16 + ceil(log2(h))` bits/slot, `+32` segment slack)
 
 Query metrics are split into:
 - **Memory-access time** (`mem_*`): 512 MB `LRUCache` pre-warmed by full scan,
@@ -115,29 +116,31 @@ Query metrics are split into:
 | 0 | `plain_bloom10` | 133.7 | 1850.0 | 444.5 | 1602.2 | 3.85 | 0.44 | 0.885% | 1.00 | 10.16 | 0.00 | 402.7 | 22.11 |
 | 4 | `kiwi_no_filter` | 121.1 | 4718.4 | 4440.7 | 4579.3 | 13.35 | 12.54 | 0.000% | 0.00 | 0.00 | 5.53 | 889.1 | 21.94 |
 | 4 | `kiwi_page_bloom10` | 125.9 | 2539.1 | 983.9 | 1748.7 | 4.22 | 0.99 | 0.069% | 4.00 | 16.48 | 22.01 | 1291.5 | 22.33 |
-| 4 | `kiwi_tile_xor1` | 111.8 | 1654.5 | 915.4 | 1594.5 | 3.82 | 0.91 | 0.402% | 1.00 | 15.28 | 20.70 | 921.2 | 22.30 |
-| 4 | `kiwi_tile_xor2` | 109.8 | 1660.7 | 871.9 | 1587.2 | 3.65 | 0.88 | 0.003% | 1.00 | 27.11 | 32.52 | 1209.8 | 22.58 |
+| 4 | `kiwi_tile_xor_baseline` | 111.8 | 1654.5 | 915.4 | 1594.5 | 3.82 | 0.91 | 0.402% | 1.00 | 15.28 | 20.70 | 921.2 | 22.30 |
+| 4 | `kiwi_tile_xor_baseline_16bit` | 109.8 | 1660.7 | 871.9 | 1587.2 | 3.65 | 0.88 | 0.003% | 1.00 | 27.11 | 32.52 | 1209.8 | 22.58 |
 | 8 | `kiwi_no_filter` | 106.0 | 5160.0 | 5267.7 | 6058.2 | 20.98 | 21.22 | 0.000% | 0.00 | 0.00 | 5.52 | 869.7 | 21.98 |
 | 8 | `kiwi_page_bloom10` | 111.8 | 1917.2 | 1033.1 | 1735.3 | 3.94 | 1.03 | 0.072% | 8.00 | 16.54 | 22.06 | 1273.5 | 22.37 |
-| 8 | `kiwi_tile_xor1` | 122.8 | 1642.7 | 848.4 | 1564.4 | 3.73 | 0.91 | 0.398% | 1.00 | 15.07 | 20.41 | 852.9 | 22.33 |
-| 8 | `kiwi_tile_xor2` | 121.4 | 1698.4 | 847.6 | 1627.2 | 3.72 | 0.86 | 0.001% | 1.00 | 25.86 | 31.20 | 1116.3 | 22.59 |
+| 8 | `kiwi_tile_xor_baseline` | 122.8 | 1642.7 | 848.4 | 1564.4 | 3.73 | 0.91 | 0.398% | 1.00 | 15.07 | 20.41 | 852.9 | 22.33 |
+| 8 | `kiwi_tile_xor_baseline_16bit` | 121.4 | 1698.4 | 847.6 | 1627.2 | 3.72 | 0.86 | 0.001% | 1.00 | 25.86 | 31.20 | 1116.3 | 22.59 |
 | 16 | `kiwi_no_filter` | 99.2 | 9738.4 | 9309.7 | 9361.0 | 41.80 | 41.45 | 0.000% | 0.00 | 0.00 | 5.52 | 855.9 | 22.02 |
 | 16 | `kiwi_page_bloom10` | 119.6 | 1893.3 | 1127.8 | 1835.7 | 4.21 | 1.17 | 0.073% | 15.99 | 16.57 | 22.09 | 1260.5 | 22.42 |
-| 16 | `kiwi_tile_xor1` | 125.3 | 1531.3 | 799.2 | 1479.4 | 3.63 | 0.81 | 0.381% | 1.00 | 15.59 | 20.90 | 830.0 | 22.39 |
-| 16 | `kiwi_tile_xor2` | 120.7 | 1512.6 | 799.5 | 1521.3 | 3.60 | 0.80 | 0.003% | 1.00 | 25.91 | 31.21 | 1081.7 | 22.63 |
+| 16 | `kiwi_tile_xor_baseline` | 125.3 | 1531.3 | 799.2 | 1479.4 | 3.63 | 0.81 | 0.381% | 1.00 | 15.59 | 20.90 | 830.0 | 22.39 |
+| 16 | `kiwi_tile_xor_baseline_16bit` | 120.7 | 1512.6 | 799.5 | 1521.3 | 3.60 | 0.80 | 0.003% | 1.00 | 25.91 | 31.21 | 1081.7 | 22.63 |
 
 Key observations:
-- **1 filter probe vs `h` probes**: `kiwi_tile_xor1`/`xor2` stay at `1.00` filter
-  check per lookup regardless of `h`, while `kiwi_page_bloom10` probes `4`, `8`,
-  and `16` Bloom filters per lookup.
-- **Query latency**: At `h = 16`, `kiwi_tile_xor1` improves memory-access query
-  time by **19.1%** on present keys (`1531 vs 1893 ns`) and **29.1%** on absent
-  keys (`799 vs 1128 ns`), and improves I/O-inclusive query time by **13.8%** on
-  present keys (`3.63 vs 4.21 us`) and **30.8%** on absent keys (`0.81 vs 1.17 us`).
+- **1 filter probe vs `h` probes**: `kiwi_tile_xor_baseline` and
+  `kiwi_tile_xor_baseline_16bit` stay at `1.00` filter check per lookup
+  regardless of `h`, while `kiwi_page_bloom10` probes `4`, `8`, and `16` Bloom
+  filters per lookup.
+- **Query latency**: At `h = 16`, `kiwi_tile_xor_baseline` improves memory-access
+  query time by **19.1%** on present keys (`1531 vs 1893 ns`) and **29.1%** on
+  absent keys (`799 vs 1128 ns`), and improves I/O-inclusive query time by
+  **13.8%** on present keys (`3.63 vs 4.21 us`) and **30.8%** on absent keys
+  (`0.81 vs 1.17 us`).
 - **Space & pinned memory**: Because `FastLocalBloom` enforces a minimum of one
   64-byte (512-bit) cache line per page, `kiwi_page_bloom10` actually uses
   `16.5 bits/key` on 4 KB pages (~31 keys/page), plus `h` `FilterBitsReader`
-  objects per tile (`1260--1292 KB` `TableReader` memory). `kiwi_tile_xor1`
+  objects per tile (`1260--1292 KB` `TableReader` memory). `kiwi_tile_xor_baseline`
   pools the entire tile into one filter (`15.1--15.6 bits/key`) and cuts
   `TableReader` memory by **28.7%--34.2%** (`830--921 KB`).
 
@@ -153,18 +156,18 @@ and **lazy `fp || page_idx` floor invalidation** (`DB::SecondaryDeleteBelow`):
 | 10% | `plain_bloom10` (full rewrite) | 258.78 | -- | 395.6 / 0.42 / 0.01 | 1536.2 / 3.89 | 247.9 -> 223.9 -> -- -> 223.9 | 402.7 -> 362.7 | 22.11 -> 19.91 -> 19.91 |
 | 10% | `kiwi_no_filter` | 0.67 | 130.69 | 5299.6 / 21.37 / 7.92 | 5556.6 / 21.79 | 0.0 -> 0.0 -> -- -> 0.0 | 869.7 -> 781.4 | 21.98 -> 21.98 -> 19.79 |
 | 10% | `kiwi_page_bloom10` | 0.93 | 132.51 | 1759.5 / 3.66 / 0.91 | 1864.0 / 4.01 | 403.8 -> 403.8 -> -- -> 363.5 | 1273.5 -> 1144.9 | 22.37 -> 22.37 -> 20.14 |
-| 10% | `kiwi_tile_xor1` (**eager recon**) | **31.58** (11.73 io + 18.18 peel) | -- | -- | -- | 368.0 -> -- -> **336.2** -> -- | -- | 22.33 -> 22.33 -> -- |
-| 10% | `kiwi_tile_xor1` (**lazy floor**) | **1.05** | 145.88 | 1617.3 / 3.48 / 0.90 | 1682.8 / 3.77 | 368.0 -> 368.0 -> -- -> 331.2 | 852.9 -> 766.3 | 22.33 -> 22.33 -> 20.11 |
-| 10% | `kiwi_tile_xor2` (**lazy floor**) | **0.82** (eager: 32.62) | 144.39 | 1612.8 / 3.49 / 0.90 | 1689.2 / 3.70 | 631.4 -> 631.4 -> 576.2 -> 568.2 | 1116.3 -> 1003.3 | 22.59 -> 22.59 -> 20.34 |
+| 10% | `kiwi_tile_xor_baseline` (**eager recon**) | **31.58** (11.73 io + 18.18 peel) | -- | -- | -- | 368.0 -> -- -> **336.2** -> -- | -- | 22.33 -> 22.33 -> -- |
+| 10% | `kiwi_tile_xor_baseline` (**lazy floor**) | **1.05** | 145.88 | 1617.3 / 3.48 / 0.90 | 1682.8 / 3.77 | 368.0 -> 368.0 -> -- -> 331.2 | 852.9 -> 766.3 | 22.33 -> 22.33 -> 20.11 |
+| 10% | `kiwi_tile_xor_baseline_16bit` (**lazy floor**) | **0.82** (eager: 32.62) | 144.39 | 1612.8 / 3.49 / 0.90 | 1689.2 / 3.70 | 631.4 -> 631.4 -> 576.2 -> 568.2 | 1116.3 -> 1003.3 | 22.59 -> 22.59 -> 20.34 |
 | 50% | `plain_bloom10` (full rewrite) | 294.46 | -- | 398.9 / 0.43 / 0.01 | 1584.1 / 3.53 | 247.9 -> 119.9 -> -- -> 119.9 | 402.7 -> 202.7 | 22.11 -> 11.06 -> 11.06 |
 | 50% | `kiwi_no_filter` | 0.52 | 77.73 | 3626.1 / 12.78 / 4.62 | 3641.3 / 12.99 | 0.0 -> 0.0 -> -- -> 0.0 | 869.7 -> 436.0 | 21.98 -> 21.98 -> 11.01 |
 | 50% | `kiwi_page_bloom10` | 1.27 | 81.16 | 1167.4 / 1.51 / 0.14 | 1816.4 / 3.91 | 403.8 -> 403.8 -> -- -> 202.0 | 1273.5 -> 638.0 | 22.37 -> 22.37 -> 11.21 |
-| 50% | `kiwi_tile_xor1` (**eager recon**) | **19.49** (7.08 io + 11.19 peel) | -- | -- | -- | 368.0 -> -- -> **197.7** -> -- | -- | 22.33 -> 22.33 -> -- |
-| 50% | `kiwi_tile_xor1` (**lazy floor**) | **0.79** | 86.63 | 1016.1 / 1.34 / 0.14 | 1681.8 / 3.61 | 368.0 -> 368.0 -> -- -> 184.0 | 852.9 -> 427.6 | 22.33 -> 22.33 -> 11.19 |
-| 50% | `kiwi_tile_xor2` (**lazy floor**) | **1.01** (eager: 18.66) | 87.57 | 1016.2 / 1.33 / 0.14 | 1839.3 / 3.69 | 631.4 -> 631.4 -> 341.5 -> 315.7 | 1116.3 -> 559.3 | 22.59 -> 22.59 -> 11.32 |
+| 50% | `kiwi_tile_xor_baseline` (**eager recon**) | **19.49** (7.08 io + 11.19 peel) | -- | -- | -- | 368.0 -> -- -> **197.7** -> -- | -- | 22.33 -> 22.33 -> -- |
+| 50% | `kiwi_tile_xor_baseline` (**lazy floor**) | **0.79** | 86.63 | 1016.1 / 1.34 / 0.14 | 1681.8 / 3.61 | 368.0 -> 368.0 -> -- -> 184.0 | 852.9 -> 427.6 | 22.33 -> 22.33 -> 11.19 |
+| 50% | `kiwi_tile_xor_baseline_16bit` (**lazy floor**) | **1.01** (eager: 18.66) | 87.57 | 1016.2 / 1.33 / 0.14 | 1839.3 / 3.69 | 631.4 -> 631.4 -> 341.5 -> 315.7 | 1116.3 -> 559.3 | 22.59 -> 22.59 -> 11.32 |
 | 75% | `plain_bloom10` (full rewrite) | 321.51 | -- | 395.1 / 0.42 / 0.01 | 1417.2 / 3.48 | 247.9 -> 63.9 -> -- -> 63.9 | 402.7 -> 106.7 | 22.11 -> 5.54 -> 5.54 |
 | 75% | `kiwi_page_bloom10` | 1.80 | 46.93 | 1146.8 / 1.39 / 0.10 | 1770.7 / 3.87 | 403.8 -> 403.8 -> -- -> 101.0 | 1273.5 -> 320.2 | 22.37 -> 22.37 -> 5.62 |
-| 75% | `kiwi_tile_xor1` (**lazy floor**) | **0.87** (eager: 10.44) | 50.02 | 976.8 / 1.19 / 0.09 | 1599.7 / 3.60 | 368.0 -> 368.0 -> 107.7 -> 92.0 | 852.9 -> 215.0 | 22.33 -> 22.33 -> 5.61 |
+| 75% | `kiwi_tile_xor_baseline` (**lazy floor**) | **0.87** (eager: 10.44) | 50.02 | 976.8 / 1.19 / 0.09 | 1599.7 / 3.60 | 368.0 -> 368.0 -> 107.7 -> 92.0 | 852.9 -> 215.0 | 22.33 -> 22.33 -> 5.61 |
 
 Key observations:
 - **Avoiding reconstruction cuts delete latency by 12x--30x**: Lazy
@@ -192,26 +195,26 @@ in-memory model):
 | `seqdel` | `plain_bloom10` | 591,253 | 1.69 | 5.13 | 1659.0 | 494.3 | 3.71 | 0.52 | 0.01 | 172 -> 186 | 341 -> 367 | 15.3 -> 16.4 |
 | `seqdel` | `kiwi_no_filter` | 589,626 | 1.70 | 4.74 | 7540.2 | 6598.9 | 32.56 | 28.14 | 10.80 | 0 -> 0 | 636 -> 755 | 15.0 -> 17.7 |
 | `seqdel` | `kiwi_page_bloom10` | 574,392 | 1.74 | 4.59 | 2430.4 | 1558.2 | 4.89 | 1.69 | 0.05 | 270 -> 309 | 885 -> 1022 | 15.0 -> 17.0 |
-| `seqdel` | `kiwi_tile_xor1` | **509,503** | **1.96** | 5.35 | **1757.2** | **906.4** | **3.87** | **0.95** | **0.00** | 254 -> 269 | **623 -> 666** | 15.4 -> 16.4 |
-| `seqdel` | `kiwi_tile_xor2` | 530,756 | 1.88 | 5.59 | 1678.2 | 1153.5 | 3.79 | 1.51 | 0.17 | 442 -> 506 | 824 -> 919 | 15.8 -> 17.1 |
+| `seqdel` | `kiwi_tile_xor_baseline` | **509,503** | **1.96** | 5.35 | **1757.2** | **906.4** | **3.87** | **0.95** | **0.00** | 254 -> 269 | **623 -> 666** | 15.4 -> 16.4 |
+| `seqdel` | `kiwi_tile_xor_baseline_16bit` | 530,756 | 1.88 | 5.59 | 1678.2 | 1153.5 | 3.79 | 1.51 | 0.17 | 442 -> 506 | 824 -> 919 | 15.8 -> 17.1 |
 | `churn` | `plain_bloom10` | 738,824 | 1.35 | 3.14 | 1809.2 | 847.3 | 3.92 | 1.17 | 0.15 | 167 -> 215 | 334 -> 403 | 15.0 -> 17.6 |
 | `churn` | `kiwi_no_filter` | 718,712 | 1.39 | 2.59 | 15730.9 | 15374.5 | 67.11 | 67.52 | 26.13 | 0 -> 0 | 623 -> 774 | 14.8 -> 18.2 |
 | `churn` | `kiwi_page_bloom10` | 655,965 | 1.52 | 2.73 | 2748.6 | 2096.8 | 4.92 | 2.43 | 0.16 | 274 -> 339 | 912 -> 1087 | 15.2 -> 17.9 |
-| `churn` | `kiwi_tile_xor1` | **605,403** | **1.65** | 3.00 | **1930.5** | **1227.9** | **4.21** | **1.47** | **0.10** | 248 -> 290 | **616 -> 706** | 15.1 -> 16.8 |
-| `churn` | `kiwi_tile_xor2` | 564,964 | 1.77 | 3.13 | 2011.1 | 1312.1 | 4.13 | 1.54 | 0.10 | 426 -> 507 | 791 -> 931 | 15.3 -> 17.2 |
+| `churn` | `kiwi_tile_xor_baseline` | **605,403** | **1.65** | 3.00 | **1930.5** | **1227.9** | **4.21** | **1.47** | **0.10** | 248 -> 290 | **616 -> 706** | 15.1 -> 16.8 |
+| `churn` | `kiwi_tile_xor_baseline_16bit` | 564,964 | 1.77 | 3.13 | 2011.1 | 1312.1 | 4.13 | 1.54 | 0.10 | 426 -> 507 | 791 -> 931 | 15.3 -> 17.2 |
 
-**Does performance necessarily go up?** **No:**
+**Does performance necessarily go up?** **No** (prior to `tile-filter-opt`):
 1. On **write/delete-heavy LSM churn** (`seqdel` and `churn`), overall op
-   throughput **decreases by 7.7%--13.9%** with `kiwi_tile_xor1`/`xor2` relative
-   to `kiwi_page_bloom10` (`510k vs 574k ops/s` in `seqdel`; `605k vs 656k ops/s`
-   in `churn`). Constructing an XOR filter requires building and peeling a
-   3-uniform hypergraph (~3.6--4.1x slower filter build than Bloom in
-   `examples/xor_filter_query_example`: `14.43--16.40 ms` vs `3.99 ms`), so when
-   every `1 MB` flush and compaction (`w_amp = 2.6--5.6`) re-peels tile filters,
-   build CPU dominates.
-2. On **queries and `TableReader` memory**, `kiwi_tile_xor1` still wins even
-   after heavy `seqdel`/`churn` fragmentation: present and absent queries are
-   **28%--42% faster** in memory (`1757 vs 2430 ns` and `906 vs 1558 ns` in
+   throughput **decreased by 7.7%--13.9%** with `kiwi_tile_xor_baseline` /
+   `kiwi_tile_xor_baseline_16bit` relative to `kiwi_page_bloom10` (`510k vs 574k
+   ops/s` in `seqdel`; `605k vs 656k ops/s` in `churn`). Constructing an XOR
+   filter requires building and peeling a 3-uniform hypergraph (~3.6--4.1x
+   slower filter build than Bloom in `examples/xor_filter_query_example`:
+   `14.43--16.40 ms` vs `3.99 ms`), and uncounted directory bytes inflated
+   `w_amp` (resolved in [tile_filter_optimizations.md](tile_filter_optimizations.md)).
+2. On **queries and `TableReader` memory**, `kiwi_tile_xor_baseline` still wins
+   even after heavy `seqdel`/`churn` fragmentation: present and absent queries
+   are **28%--42% faster** in memory (`1757 vs 2430 ns` and `906 vs 1558 ns` in
    `seqdel`; `1931 vs 2749 ns` and `1228 vs 2097 ns` in `churn`) and **14%--44%
    faster** with I/O, while pinning **~35% less `TableReader` memory**
    (`666 vs 1022 KB` in `seqdel`, `706 vs 1087 KB` in `churn`).

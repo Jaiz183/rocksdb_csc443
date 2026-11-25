@@ -52,15 +52,29 @@ need no change. The **directory** is one extra meta block (`rocksdb.kiwi.directo
 when the table is opened and pinned in the table reader (counted in
 `ApproximateMemoryUsage`), like the paper's in-memory fences and filters. KiWi
 files have no whole-file filter:
-- **Directory v1 (Bloom / Ribbon `filter_policy`)**: stores, per page, its block
-  handle, `[min_delete_key, max_delete_key]` delete fences, and a per-page
-  filter on the user key.
+- **Directory v1 (Bloom / Ribbon `filter_policy`, e.g. `kiwi_page_bloom10`)**:
+  stores, per page, its block handle, `[min_delete_key, max_delete_key]` delete
+  fences, and a per-page filter on the user key.
 - **Directory v2 (`NewXorFilterPolicy(...)` / `xorfilter:<bytes>`)**: stores,
-  per tile, one bit-packed XOR filter (`TileXorFilterBuilder` /
-  `TileXorFilterReader`) whose slots encode `[fingerprint || page_index]`
-  (`ceil(log2(num_pages))` page bits), plus per-page block handles and delete
-  fences. This assumes user keys are unique within a tile (keys do not span 2+
-  pages in the same tile). See [tile_filter.md](tile_filter.md).
+  per tile, one bit-packed 3-way XOR filter (`TileXorFilterBuilder` /
+  `TileXorFilterReader`):
+  - `kiwi_tile_xor_baseline` / `kiwi_tile_xor_baseline_16bit`: initial 8-bit and
+    16-bit `[fingerprint || page_index]` per-tile XOR filters
+    ([tile_filter.md](tile_filter.md)).
+  - `kiwi_tile_xor_tight` / `kiwi_tile_xor_tight_16bit`: tight-sized (`+4`
+    segment slack), compact-directory 8-bit and 16-bit per-tile XOR filters with
+    `base_page` zero-peel physical page reclamation
+    ([tile_filter_optimizations.md](tile_filter_optimizations.md)).
+  - `kiwi_tile_xor_delete_rank`: augments each per-tile XOR slot with sub-page
+    delete-key rank bits (`[fingerprint || rank_bucket || page_index]`,
+    `kiwi_delete_rank_bits`) to prune straddling edge-page reads after secondary
+    deletes ([tile_filter_optimizations.md](tile_filter_optimizations.md)).
+- **Directory v3 (`kiwi_file_filter=true`, `kiwi_sst_xor_index_free`)**: stores
+  one SST-wide 3-way XOR filter (`[fingerprint || tile_index || page_index]`)
+  probed before the SST index block so negative lookups avoid index-block I/O
+  and binary search (automatically falling back to v2 if a multi-version user
+  key spans a tile boundary; see
+  [tile_filter_optimizations.md](tile_filter_optimizations.md)).
 
 A file is a KiWi file if and only if it has the table property
 `rocksdb.kiwi.tile_pages` (also `.delete_key_offset`, `.min_delete_key`,
@@ -76,11 +90,17 @@ files.
     and merged in key order and fed to `GetContext`, so versions of one key
     spread over several pages or tiles resolve exactly as in an ordinary table.
     Expected cost: 1 + h x FPR page reads.
-  - *Per-tile XOR+page filter mode (v2)*: one XOR probe per tile returns either
-    a negative (0 page reads) or a single candidate `page_index` (no merging
-    within the tile; only that page is opened if `max_delete_key >= floor`).
-    Secondary deletes do **not** reconstruct the XOR filter: dropped pages are
-    filtered by checking `page_index`'s `max_delete_key < floor` in memory.
+  - *Per-tile XOR+page filter mode (v2, `kiwi_tile_xor_*`)*: one XOR probe per
+    tile returns either a negative (0 page reads) or a single candidate
+    `page_index` (no merging within the tile; only that page is opened if
+    `max_delete_key >= floor`, and `kiwi_tile_xor_delete_rank` further prunes
+    straddling edge pages via sub-page rank buckets). Secondary deletes do
+    **not** reconstruct the XOR filter: dropped pages are filtered in memory via
+    `max_delete_key < floor` (or physically reclaimed without peeling via
+    `RewriteKiWiTableDroppingPages`).
+  - *SST-wide index-free XOR filter mode (v3, `kiwi_sst_xor_index_free`)*: one
+    SST-wide XOR probe runs before `NewIndexIterator()`, rejecting absent keys
+    with 0 index-block and 0 data-block reads.
   - `MultiGet` is a loop of `Get`.
 - **Iteration**: `KiWiTableIterator` walks the index and merges the pages of the
   current tile (the paper's cost: a tile is always read whole). Both directions,

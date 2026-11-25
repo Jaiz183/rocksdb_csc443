@@ -12,9 +12,10 @@
 //        - plain_bloom10 (full compaction rewrite baseline)
 //        - kiwi_no_filter (no filters)
 //        - kiwi_page_bloom10 (original KiWi per-page Bloom filters)
-//        - kiwi_tile_xor1 / xor2 (lazy fp||page_idx floor invalidation)
-//        - kiwi_tile_xor1 eager reconstruction (re-reading surviving pages
-//          of affected tiles and re-peeling TileXorFilterBuilder)
+//        - kiwi_tile_xor_tight / kiwi_tile_xor_tight_16bit
+//        - kiwi_tile_xor_delete_rank (sub-page delete-rank bits)
+//        - kiwi_sst_xor_index_free (SST-wide v3 XOR skipping index block)
+//        - eager tile-XOR reconstruction vs zero-peel ShiftBasePage rewrite
 //   3. Delete-heavy LSM workloads from tombstone_bench:
 //        - seqdel (30% sequential point deletes + 70% puts)
 //        - churn  (90% delete/reinsert toggling of 20k hot keys + 10% puts)
@@ -693,7 +694,7 @@ void RunSuite1QueryHeavy(const std::string& root) {
 
   for (uint32_t h : {4U, 8U, 16U}) {
     std::cout << "\n--- Tile size h = " << h << " ---\n";
-    std::cout << std::left << std::setw(20) << "config" << std::right
+    std::cout << std::left << std::setw(26) << "config" << std::right
               << std::setw(10) << "flush_ms" << std::setw(10) << "mem_pres"
               << std::setw(10) << "mem_abs" << std::setw(10) << "mem_mix"
               << std::setw(10) << "io_pres" << std::setw(10) << "io_abs"
@@ -709,11 +710,14 @@ void RunSuite1QueryHeavy(const std::string& root) {
     configs.push_back({"kiwi_no_filter", h, ConfigSpec::FilterKind::kNone});
     configs.push_back(
         {"kiwi_page_bloom10", h, ConfigSpec::FilterKind::kBloom10});
-    configs.push_back({"kiwi_tile_xor1", h, ConfigSpec::FilterKind::kXor1});
     configs.push_back(
-        {"kiwi_tile_xor1_rk2", h, ConfigSpec::FilterKind::kXor1Rk2});
-    configs.push_back({"kiwi_sst_xor1_v3", h, ConfigSpec::FilterKind::kSstXor1});
-    configs.push_back({"kiwi_tile_xor2", h, ConfigSpec::FilterKind::kXor2});
+        {"kiwi_tile_xor_tight", h, ConfigSpec::FilterKind::kXor1});
+    configs.push_back(
+        {"kiwi_tile_xor_delete_rank", h, ConfigSpec::FilterKind::kXor1Rk2});
+    configs.push_back(
+        {"kiwi_sst_xor_index_free", h, ConfigSpec::FilterKind::kSstXor1});
+    configs.push_back(
+        {"kiwi_tile_xor_tight_16bit", h, ConfigSpec::FilterKind::kXor2});
 
     for (const auto& cfg : configs) {
       const std::string db_dir =
@@ -804,7 +808,7 @@ void RunSuite1QueryHeavy(const std::string& root) {
         SetPerfLevel(PerfLevel::kDisable);
       }
 
-      std::cout << std::left << std::setw(20) << cfg.name << std::right
+      std::cout << std::left << std::setw(26) << cfg.name << std::right
                 << std::fixed << std::setprecision(1) << std::setw(10)
                 << flush_ms << std::setw(10) << mp.mem_ns_per_op << std::setw(10)
                 << ma.mem_ns_per_op << std::setw(10) << mix_ns << std::setw(10)
@@ -841,10 +845,10 @@ void RunSuite2SecondaryDeleteAndReconstruction(const std::string& root) {
       {"plain_bloom10", 0, ConfigSpec::FilterKind::kBloom10},
       {"kiwi_no_filter", h, ConfigSpec::FilterKind::kNone},
       {"kiwi_page_bloom10", h, ConfigSpec::FilterKind::kBloom10},
-      {"kiwi_tile_xor1", h, ConfigSpec::FilterKind::kXor1},
-      {"kiwi_tile_xor1_rk2", h, ConfigSpec::FilterKind::kXor1Rk2},
-      {"kiwi_sst_xor1_v3", h, ConfigSpec::FilterKind::kSstXor1},
-      {"kiwi_tile_xor2", h, ConfigSpec::FilterKind::kXor2},
+      {"kiwi_tile_xor_tight", h, ConfigSpec::FilterKind::kXor1},
+      {"kiwi_tile_xor_delete_rank", h, ConfigSpec::FilterKind::kXor1Rk2},
+      {"kiwi_sst_xor_index_free", h, ConfigSpec::FilterKind::kSstXor1},
+      {"kiwi_tile_xor_tight_16bit", h, ConfigSpec::FilterKind::kXor2},
   };
 
   for (const auto& cfg : configs) {
@@ -1031,13 +1035,13 @@ void RunSuite2BWholeFileDrop(const std::string& root) {
   const std::vector<ConfigSpec> configs = {
       {"plain_bloom10", 0, ConfigSpec::FilterKind::kBloom10},
       {"kiwi_page_bloom10", h, ConfigSpec::FilterKind::kBloom10},
-      {"kiwi_tile_xor1", h, ConfigSpec::FilterKind::kXor1},
-      {"kiwi_sst_xor1_v3", h, ConfigSpec::FilterKind::kSstXor1},
+      {"kiwi_tile_xor_tight", h, ConfigSpec::FilterKind::kXor1},
+      {"kiwi_sst_xor_index_free", h, ConfigSpec::FilterKind::kSstXor1},
   };
 
   for (double frac : {0.50, 0.75}) {
     std::cout << "\n--- Drop oldest " << int(frac * 100) << "% SSTs ---\n";
-    std::cout << std::left << std::setw(20) << "config" << std::right
+    std::cout << std::left << std::setw(26) << "config" << std::right
               << std::setw(11) << "del_ms" << std::setw(8) << "w_amp"
               << std::setw(14) << "files(B->A)" << std::setw(16)
               << "tr(B->A KB)" << std::setw(16) << "sst(B->A MB)\n";
@@ -1114,7 +1118,7 @@ void RunSuite2BWholeFileDrop(const std::string& root) {
       snprintf(sst_buf, sizeof(sst_buf), "%.2f->%.2f",
                sp_before.sst_bytes / (1024.0 * 1024.0),
                sp_after.sst_bytes / (1024.0 * 1024.0));
-      std::cout << std::left << std::setw(20) << cfg.name << std::right
+      std::cout << std::left << std::setw(26) << cfg.name << std::right
                 << std::fixed << std::setprecision(2) << std::setw(11)
                 << del_ms << std::setw(8) << w_amp << std::setw(14) << f_buf
                 << std::setw(16) << tr_buf << std::setw(16) << sst_buf << '\n';
@@ -1138,16 +1142,16 @@ void RunSuite3TombstoneBenchWorkloads(const std::string& root) {
       {"plain_bloom10", 0, ConfigSpec::FilterKind::kBloom10},
       {"kiwi_no_filter", h, ConfigSpec::FilterKind::kNone},
       {"kiwi_page_bloom10", h, ConfigSpec::FilterKind::kBloom10},
-      {"kiwi_tile_xor1", h, ConfigSpec::FilterKind::kXor1},
-      {"kiwi_tile_xor1_rk2", h, ConfigSpec::FilterKind::kXor1Rk2},
-      {"kiwi_sst_xor1_v3", h, ConfigSpec::FilterKind::kSstXor1},
-      {"kiwi_tile_xor2", h, ConfigSpec::FilterKind::kXor2},
+      {"kiwi_tile_xor_tight", h, ConfigSpec::FilterKind::kXor1},
+      {"kiwi_tile_xor_delete_rank", h, ConfigSpec::FilterKind::kXor1Rk2},
+      {"kiwi_sst_xor_index_free", h, ConfigSpec::FilterKind::kSstXor1},
+      {"kiwi_tile_xor_tight_16bit", h, ConfigSpec::FilterKind::kXor2},
   };
 
   for (const char* wname : {"seqdel", "churn"}) {
     const bool is_churn = (std::string(wname) == "churn");
     std::cout << "\n--- Workload: " << wname << " ---\n";
-    std::cout << std::left << std::setw(20) << "config" << std::right
+    std::cout << std::left << std::setw(26) << "config" << std::right
               << std::setw(10) << "ops/s" << std::setw(9) << "del_us"
               << std::setw(8) << "w_amp" << std::setw(10) << "mem_pres"
               << std::setw(10) << "mem_abs" << std::setw(10) << "io_pres"
@@ -1306,7 +1310,7 @@ void RunSuite3TombstoneBenchWorkloads(const std::string& root) {
                sp_before.sst_bytes / (1024.0 * 1024.0),
                sp_after.sst_bytes / (1024.0 * 1024.0));
 
-      std::cout << std::left << std::setw(20) << cfg.name << std::right
+      std::cout << std::left << std::setw(26) << cfg.name << std::right
                 << std::fixed << std::setprecision(0) << std::setw(10)
                 << (kOps / elapsed_s) << std::setw(9) << std::setprecision(2)
                 << (elapsed_s * 1e6 / kOps) << std::setw(8) << write_amp
