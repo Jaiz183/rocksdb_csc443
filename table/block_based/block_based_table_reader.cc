@@ -1748,6 +1748,7 @@ Status BlockBasedTable::SetKiWiDeleteFloor(uint64_t floor) {
         "KiWi delete floor recorded for a file without KiWi tiles");
   }
   rep_->kiwi_delete_floor = floor;
+  rep_->kiwi_directory->ApplyDeleteFloor(floor);
   return Status::OK();
 }
 
@@ -1779,18 +1780,37 @@ Status BlockBasedTable::KiWiGet(const ReadOptions& read_options,
                                 bool skip_filters) {
   const kiwi::Directory& dir = *rep_->kiwi_directory;
   const Slice user_key = ExtractUserKey(key);
+  Statistics* stats = rep_->ioptions.stats;
+  uint32_t file_page_idx = 0;
+  uint32_t file_rank_bucket = 0;
+  bool have_file_match = false;
+  bool used_filter = false;
+  if (!skip_filters && dir.has_file_filter()) {
+    used_filter = true;
+    if (!dir.FileMayMatch(user_key, &file_page_idx, &file_rank_bucket)) {
+      RecordTick(stats, BLOOM_FILTER_USEFUL);
+      return Status::OK();
+    }
+    RecordTick(stats, BLOOM_FILTER_FULL_POSITIVE);
+    have_file_match = true;
+  }
+
   const Comparator* ucmp = rep_->internal_comparator.user_comparator();
   BlockCacheLookupContext lookup_context{
       TableReaderCaller::kUserGet, get_context->get_tracing_get_id(),
       /*get_from_user_specified_snapshot=*/read_options.snapshot != nullptr};
-  std::unique_ptr<InternalIteratorBase<IndexValue>> iiter(NewIndexIterator(
-      read_options, /*disable_prefix_seek=*/false, /*input_iter=*/nullptr,
-      get_context, &lookup_context));
-  Statistics* stats = rep_->ioptions.stats;
+  IndexBlockIter iiter_on_stack;
+  InternalIteratorBase<IndexValue>* iiter = NewIndexIterator(
+      read_options, /*disable_prefix_seek=*/false, &iiter_on_stack, get_context,
+      &lookup_context);
+  std::unique_ptr<InternalIteratorBase<IndexValue>> iiter_unique_ptr;
+  if (iiter != &iiter_on_stack) {
+    iiter_unique_ptr.reset(iiter);
+  }
   Status s;
   bool matched = false;
-  bool used_filter = false;
   bool done = false;
+  const uint64_t floor = rep_->kiwi_delete_floor;
   const auto scan_iter = [&](InternalIterator* iter) {
     for (iter->Seek(key); iter->Valid(); iter->Next()) {
       ParsedInternalKey parsed_key;
@@ -1825,22 +1845,53 @@ Status BlockBasedTable::KiWiGet(const ReadOptions& read_options,
       s = Status::Corruption("KiWi: index entry is not the start of a tile");
       break;
     }
+    if (dir.TileAllDeleted(tile_index, floor)) {
+      if (!done &&
+          ucmp->CompareWithoutTimestamp(iiter->user_key(), user_key) != 0) {
+        done = true;
+      }
+      continue;
+    }
     const kiwi::Directory::TileView tile = dir.tile(tile_index);
-    if (!skip_filters && dir.has_tile_filters()) {
+    if (have_file_match) {
+      if (file_page_idx < tile.num_pages) {
+        const kiwi::DirectoryPage& target_page = tile.pages[file_page_idx];
+        if (kiwi::DeleteRankMaySurviveFloor(
+                target_page.min_delete_key, target_page.max_delete_key,
+                dir.file_rank_bits(), file_rank_bucket, floor)) {
+          std::unique_ptr<InternalIterator> page(
+              KiWiTableIterator::NewPageIterator(
+                  this, read_options, target_page, get_context, &lookup_context,
+                  /*for_compaction=*/false));
+          if (page != nullptr) {
+            scan_iter(page.get());
+            if (!s.ok()) {
+              break;
+            }
+          }
+        }
+      }
+    } else if (!skip_filters && dir.has_tile_filters()) {
       used_filter = true;
       uint32_t page_idx = 0;
-      if (!dir.TileMayMatch(tile_index, user_key, &page_idx)) {
+      uint32_t rank_bucket = 0;
+      if (!dir.TileMayMatch(tile_index, user_key, &page_idx, &rank_bucket)) {
         RecordTick(stats, BLOOM_FILTER_USEFUL);
       } else {
         RecordTick(stats, BLOOM_FILTER_FULL_POSITIVE);
-        std::unique_ptr<InternalIterator> page(
-            KiWiTableIterator::NewPageIterator(
-                this, read_options, tile.pages[page_idx], get_context,
-                &lookup_context, /*for_compaction=*/false));
-        if (page != nullptr) {
-          scan_iter(page.get());
-          if (!s.ok()) {
-            break;
+        const kiwi::DirectoryPage& target_page = tile.pages[page_idx];
+        if (kiwi::DeleteRankMaySurviveFloor(
+                target_page.min_delete_key, target_page.max_delete_key,
+                dir.tile_rank_bits(tile_index), rank_bucket, floor)) {
+          std::unique_ptr<InternalIterator> page(
+              KiWiTableIterator::NewPageIterator(
+                  this, read_options, target_page, get_context, &lookup_context,
+                  /*for_compaction=*/false));
+          if (page != nullptr) {
+            scan_iter(page.get());
+            if (!s.ok()) {
+              break;
+            }
           }
         }
       }

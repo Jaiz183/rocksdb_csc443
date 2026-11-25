@@ -10,6 +10,7 @@ eager filter reconstruction.
   - [`BlockBasedTableBuilder::FlushTile()`](../../../table/block_based/block_based_table_builder.cc)
   - [`BlockBasedTable::KiWiGet()`](../../../table/block_based/block_based_table_reader.cc)
   - [`examples/kiwi_tile_filter_bench.cc`](../../../examples/kiwi_tile_filter_bench.cc)
+- Optimizations & augmentations (`tile-filter-opt`): [tile_filter_optimizations.md](tile_filter_optimizations.md)
 
 ## Design
 

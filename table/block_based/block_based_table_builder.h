@@ -30,6 +30,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+class BlockBasedTable;
 class BlockBuilder;
 class BlockHandle;
 class WritableFile;
@@ -60,6 +61,16 @@ class BlockBasedTableBuilder : public TableBuilder {
   // a single thread (e.g. sst_dump --command=recompress) call this between
   // files so each is measured without inheriting the previous file's estimate.
   static void ResetThreadLocalAutoSkipCarryover();
+
+  // Rewrites a KiWi v1/v2 SST table physically dropping all pages whose
+  // max_delete_key < `delete_key_floor`, copying surviving compressed data
+  // blocks without decompression and shifting surviving v2 tile XOR filters via
+  // ShiftBasePage with zero hypergraph re-peeling.
+  static Status RewriteKiWiTableDroppingPages(
+      const BlockBasedTableOptions& table_options,
+      const TableBuilderOptions& table_builder_options,
+      const ReadOptions& read_options, BlockBasedTable* source_table,
+      uint64_t delete_key_floor, WritableFileWriter* output_file);
 
   // Add key,value to the table being constructed.
   // REQUIRES: Unless key has type kTypeRangeDeletion, key is after any

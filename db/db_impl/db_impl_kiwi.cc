@@ -53,6 +53,7 @@ Status DBImpl::SecondaryDeleteBelow(ColumnFamilyHandle* column_family,
       return s;
     }
     std::set<uint64_t> targets;
+    std::set<uint64_t> fully_dead;
     for (const auto& file : props) {
       const auto& user_props = file.second->user_collected_properties;
       const auto min_delete_key = user_props.find(kiwi::kPropMinDeleteKey);
@@ -69,6 +70,14 @@ Status DBImpl::SecondaryDeleteBelow(ColumnFamilyHandle* column_family,
         return Status::Corruption("Invalid KiWi minimum delete key in " +
                                   file.first);
       }
+      uint64_t max_key = kiwi::kNoDeleteKey;
+      const auto max_delete_key = user_props.find(kiwi::kPropMaxDeleteKey);
+      if (max_delete_key != user_props.end()) {
+        if (!ParseDecimal(max_delete_key->second, &max_key)) {
+          return Status::Corruption("Invalid KiWi maximum delete key in " +
+                                    file.first);
+        }
+      }
       if (min_key < delete_key_floor) {
         const std::string::size_type slash = file.first.rfind('/');
         const std::string name = slash == std::string::npos
@@ -79,17 +88,23 @@ Status DBImpl::SecondaryDeleteBelow(ColumnFamilyHandle* column_family,
         if (!ParseFileName(name, &number, &type) || type != kTableFile) {
           return Status::Corruption("Unexpected table file name " + file.first);
         }
-        targets.insert(number);
+        if (max_key < delete_key_floor && file.second->num_entries > 0 &&
+            file.second->num_range_deletions == 0) {
+          fully_dead.insert(number);
+        } else {
+          targets.insert(number);
+        }
       }
     }
-    if (targets.empty()) {
+    if (targets.empty() && fully_dead.empty()) {
       return Status::OK();
     }
 
     // Record the floor of all of them at once, only if nothing changed since
     // the scan: files that appeared meanwhile could hold entries we did not
     // see, and deleting from some files only could let an older version of a
-    // key reappear.
+    // key reappear. Files whose entire delete-key range falls below the floor
+    // are dropped cleanly from the version with zero compaction write amp.
     VersionEdit edit;
     edit.MarkForegroundOperation();
     edit.SetColumnFamily(cfd->GetID());
@@ -106,16 +121,23 @@ Status DBImpl::SecondaryDeleteBelow(ColumnFamilyHandle* column_family,
         auto* vstorage = input_version->storage_info();
         for (int level = 0; level < vstorage->num_levels() && !busy; ++level) {
           for (FileMetaData* file : vstorage->LevelFiles(level)) {
-            if (targets.count(file->fd.GetNumber()) == 0 ||
-                file->kiwi_delete_floor >= delete_key_floor) {
+            const uint64_t fnum = file->fd.GetNumber();
+            const bool is_dead = fully_dead.count(fnum) > 0;
+            const bool is_partial = targets.count(fnum) > 0;
+            if (!is_dead && !is_partial) {
+              continue;
+            }
+            if (!is_dead && file->kiwi_delete_floor >= delete_key_floor) {
               continue;
             }
             if (file->being_compacted) {
               busy = true;  // its compaction would not know about the floor
               break;
             }
-            edit.DeleteFile(level, file->fd.GetNumber());
-            edit.AddFileWithKiWiDeleteFloor(level, *file, delete_key_floor);
+            edit.DeleteFile(level, fnum);
+            if (!is_dead) {
+              edit.AddFileWithKiWiDeleteFloor(level, *file, delete_key_floor);
+            }
             changed.push_back(file);
           }
         }

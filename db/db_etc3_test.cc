@@ -1699,6 +1699,75 @@ TEST_F(DBKiWiSecondaryDeleteTest,
   ASSERT_EQ(Get(KiWiKey(1)), Get(KiWiKey(1)));
 }
 
+TEST_F(DBKiWiSecondaryDeleteTest, WholeFileDropAndAugmentedTileXor) {
+  Random64 rnd(20261126);
+  // 1. Instant whole-file unlink when all delete keys in an SST are < floor.
+  {
+    Options options = KiWiOptions(4, /*delete_key_offset=*/0, /*xor_bytes=*/1);
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    Model model;
+    for (uint64_t i = 0; i < 200; ++i) {
+      const std::string v = TimestampedValue(100 + i, &rnd);
+      ASSERT_OK(Put(KiWiKey(i), v));
+      model[KiWiKey(i)] = v;
+    }
+    ASSERT_OK(Flush());
+    for (uint64_t i = 200; i < 400; ++i) {
+      const std::string v = TimestampedValue(1000 + i, &rnd);
+      ASSERT_OK(Put(KiWiKey(i), v));
+      model[KiWiKey(i)] = v;
+    }
+    ASSERT_OK(Flush());
+    ASSERT_EQ(CountKiWiFiles(), 2U);
+
+    // Deleting below 500 removes the first SST entirely from the version.
+    ASSERT_OK(DeleteBelow(500));
+    EraseBelow(&model, 500);
+    ASSERT_EQ(CountKiWiFiles(), 1U);
+    ASSERT_EQ(StoredEntries(), 200U);
+    VerifyModel(model);
+  }
+
+  // 2. Rank-tagged (rk=2) and SST-wide file-filter XOR policies end-to-end.
+  for (const std::string& cfg : {
+           std::string("{id=xorfilter:1;kiwi_delete_rank_bits=2}"),
+           std::string("{id=xorfilter:1;kiwi_file_filter=true}"),
+       }) {
+    SCOPED_TRACE(cfg);
+    Options options = KiWiOptions(4, 0, 1);
+    auto* bbto = options.table_factory->GetOptions<BlockBasedTableOptions>();
+    ASSERT_NE(bbto, nullptr);
+    BlockBasedTableOptions custom_bbto = *bbto;
+    ASSERT_OK(FilterPolicy::CreateFromString(ConfigOptions(), cfg,
+                                             &custom_bbto.filter_policy));
+    options.table_factory.reset(NewBlockBasedTableFactory(custom_bbto));
+    DestroyAndReopen(options);
+
+    Model model;
+    uint64_t clock = 100;
+    for (int round = 0; round < 3; ++round) {
+      for (uint64_t i = 0; i < kNumKeys; ++i) {
+        if ((i + round) % 3 == 0) {
+          const std::string val = TimestampedValue(clock++, &rnd);
+          ASSERT_OK(Put(KiWiKey(i), val));
+          model[KiWiKey(i)] = val;
+        }
+      }
+      ASSERT_OK(Flush());
+    }
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    VerifyModel(model);
+
+    const uint64_t floor = 100 + (clock - 100) / 2;
+    ASSERT_OK(DeleteBelow(floor));
+    EraseBelow(&model, floor);
+    VerifyModel(model);
+    Reopen(options);
+    VerifyModel(model);
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

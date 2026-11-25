@@ -367,6 +367,7 @@ class XorFilterPolicy : public BuiltinFilterPolicy {
 
   static const char* kClassName() { return "rocksdb.XorFilter"; }
   static const char* kNickName() { return "xorfilter"; }
+  static const char* kName() { return "XorFilterPolicy"; }
 
   const char* Name() const override { return kClassName(); }
   const char* NickName() const override { return kNickName(); }
@@ -380,13 +381,21 @@ class XorFilterPolicy : public BuiltinFilterPolicy {
     return std::string(Name()) + ":" + std::to_string(fingerprint_bytes_);
   }
 
+  Status PrepareOptions(const ConfigOptions& config_options) override;
+  Status ValidateOptions(const DBOptions& db_opts,
+                         const ColumnFamilyOptions& cf_opts) const override;
+
   FilterBitsBuilder* GetBuilderWithContext(
       const FilterBuildingContext& context) const override;
 
   uint8_t fingerprint_bytes() const { return fingerprint_bytes_; }
+  uint8_t kiwi_delete_rank_bits() const { return kiwi_delete_rank_bits_; }
+  bool kiwi_file_filter() const { return kiwi_file_filter_; }
 
  private:
   const uint8_t fingerprint_bytes_;
+  uint8_t kiwi_delete_rank_bits_ = 0;
+  bool kiwi_file_filter_ = false;
 };
 
 // For testing only, but always constructable with internal names

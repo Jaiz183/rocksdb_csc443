@@ -42,7 +42,9 @@
 #include <string>
 #include <vector>
 
+#include "db/dbformat.h"
 #include "file/random_access_file_reader.h"
+#include "file/writable_file_writer.h"
 #include "options/cf_options.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
@@ -56,9 +58,12 @@
 #include "rocksdb/table.h"
 #include "rocksdb/table_properties.h"
 #include "table/block_based/block.h"
+#include "table/block_based/block_based_table_builder.h"
 #include "table/block_based/block_based_table_factory.h"
+#include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/kiwi_tile.h"
 #include "table/meta_blocks.h"
+#include "table/table_builder.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
@@ -102,11 +107,20 @@ std::string MakeValue(uint64_t delete_key, uint32_t ver) {
 struct ConfigSpec {
   std::string name;
   uint32_t tile_pages;
-  enum class FilterKind { kNone, kBloom10, kXor1, kXor2 } filter_kind;
+  enum class FilterKind {
+    kNone,
+    kBloom10,
+    kXor1,
+    kXor2,
+    kXor1Rk2,
+    kSstXor1
+  } filter_kind;
 };
 
 std::shared_ptr<const FilterPolicy> MakeFilterPolicy(
     ConfigSpec::FilterKind kind) {
+  std::shared_ptr<const FilterPolicy> policy;
+  ConfigOptions cfg;
   switch (kind) {
     case ConfigSpec::FilterKind::kNone:
       return nullptr;
@@ -116,6 +130,24 @@ std::shared_ptr<const FilterPolicy> MakeFilterPolicy(
       return std::shared_ptr<const FilterPolicy>(NewXorFilterPolicy(1));
     case ConfigSpec::FilterKind::kXor2:
       return std::shared_ptr<const FilterPolicy>(NewXorFilterPolicy(2));
+    case ConfigSpec::FilterKind::kXor1Rk2: {
+      Status s = FilterPolicy::CreateFromString(
+          cfg, "{id=xorfilter:1;kiwi_delete_rank_bits=2}", &policy);
+      if (!s.ok()) {
+        fprintf(stderr, "CreateFromString failed: %s\n", s.ToString().c_str());
+        std::abort();
+      }
+      return policy;
+    }
+    case ConfigSpec::FilterKind::kSstXor1: {
+      Status s = FilterPolicy::CreateFromString(
+          cfg, "{id=xorfilter:1;kiwi_file_filter=true}", &policy);
+      if (!s.ok()) {
+        fprintf(stderr, "CreateFromString failed: %s\n", s.ToString().c_str());
+        std::abort();
+      }
+      return policy;
+    }
   }
   return nullptr;
 }
@@ -367,9 +399,113 @@ struct EagerReconstructStats {
   uint64_t rebuilt_dir_bytes = 0;
 };
 
+struct ZeroPeelReclaimStats {
+  double total_ms = 0;
+  uint64_t reclaimed_sst_bytes = 0;
+};
+
+ZeroPeelReclaimStats MeasureZeroPeelReclaim(const ConfigSpec& spec,
+                                            const std::string& db_dir,
+                                            uint64_t floor) {
+  ZeroPeelReclaimStats res;
+  if (spec.tile_pages < 2 ||
+      spec.filter_kind == ConfigSpec::FilterKind::kSstXor1) {
+    return res;
+  }
+  Env* env = Env::Default();
+  FileSystem* fs = env->GetFileSystem().get();
+  std::vector<std::string> entries;
+  if (!env->GetChildren(db_dir, &entries).ok()) {
+    std::abort();
+  }
+  Options opts;
+  opts.compression = kNoCompression;
+  BlockBasedTableOptions bbto;
+  bbto.block_size = 4096;
+  bbto.kiwi_tile_pages = spec.tile_pages;
+  bbto.kiwi_delete_key_offset = 0;
+  bbto.no_block_cache = true;
+  bbto.filter_policy = MakeFilterPolicy(spec.filter_kind);
+  BlockBasedTableFactory factory(bbto);
+  const ImmutableOptions iopts(opts);
+  const MutableCFOptions mopts(opts);
+  const InternalKeyComparator ikc(opts.comparator);
+  InternalTblPropCollFactories factories;
+  std::string cf_name;
+  const ReadOptions ro;
+  const WriteOptions wo;
+
+  const auto t0 = Clock::now();
+  for (const std::string& fname : entries) {
+    if (fname.size() < 4 || fname.substr(fname.size() - 4) != ".sst") {
+      continue;
+    }
+    const std::string path = db_dir + "/" + fname;
+    uint64_t fsize = 0;
+    if (!env->GetFileSize(path, &fsize).ok()) {
+      std::abort();
+    }
+    std::unique_ptr<FSRandomAccessFile> raf;
+    if (!fs->NewRandomAccessFile(path, FileOptions(), &raf, nullptr).ok()) {
+      std::abort();
+    }
+    std::unique_ptr<RandomAccessFileReader> rreader(
+        new RandomAccessFileReader(std::move(raf), path));
+    std::unique_ptr<TableReader> treader;
+    TableReaderOptions tro(iopts, mopts.prefix_extractor,
+                           mopts.compression_manager.get(), EnvOptions(), ikc,
+                           /*block_protection_bytes_per_key=*/0,
+                           /*skip_filters=*/false, /*immortal=*/false,
+                           /*force_direct_prefetch=*/false, /*level=*/-1,
+                           /*block_cache_tracer=*/nullptr,
+                           mopts.write_buffer_size, "",
+                           /*cur_file_num=*/1, kNullUniqueId64x2,
+                           /*largest_seqno=*/0);
+    if (!factory.NewTableReader(tro, std::move(rreader), fsize, &treader)
+             .ok()) {
+      std::abort();
+    }
+
+    const std::string out_path = db_dir + "/zero_peel.tmp";
+    std::unique_ptr<FSWritableFile> wf;
+    if (!fs->NewWritableFile(out_path, FileOptions(), &wf, nullptr).ok()) {
+      std::abort();
+    }
+    std::unique_ptr<WritableFileWriter> writer(
+        new WritableFileWriter(std::move(wf), out_path, FileOptions()));
+    Status rs = BlockBasedTableBuilder::RewriteKiWiTableDroppingPages(
+        bbto,
+        TableBuilderOptions(
+            iopts, mopts, ro, wo, ikc, &factories, kNoCompression,
+            opts.compression_opts,
+            TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
+            cf_name, /*level=*/-1, kUnknownNewestKeyTime),
+        ro, static_cast<BlockBasedTable*>(treader.get()), floor, writer.get());
+    if (!rs.ok()) {
+      fprintf(stderr, "RewriteKiWiTableDroppingPages failed: %s\n",
+              rs.ToString().c_str());
+      std::abort();
+    }
+    if (!writer->Flush(IOOptions()).ok() || !writer->Sync(IOOptions()).ok() ||
+        !writer->Close(IOOptions()).ok()) {
+      std::abort();
+    }
+    uint64_t out_sz = 0;
+    if (!env->GetFileSize(out_path, &out_sz).ok()) {
+      std::abort();
+    }
+    res.reclaimed_sst_bytes += out_sz;
+    if (!env->DeleteFile(out_path).ok()) {
+      std::abort();
+    }
+  }
+  res.total_ms = ElapsedMs(t0, Clock::now());
+  return res;
+}
+
 EagerReconstructStats SimulateEagerTileXorReconstruction(
     const std::string& db_dir, uint64_t floor, uint8_t fp_bytes,
-    uint32_t delete_key_offset) {
+    uint8_t rank_bits, uint32_t delete_key_offset) {
   EagerReconstructStats res;
   const auto total_t0 = Clock::now();
   Env* env = Env::Default();
@@ -419,7 +555,7 @@ EagerReconstructStats SimulateEagerTileXorReconstruction(
     }
 
     kiwi::DirectoryBuilder dir_builder;
-    kiwi::TileXorFilterBuilder xor_builder(fp_bytes);
+    kiwi::TileXorFilterBuilder xor_builder(fp_bytes, rank_bits);
     res.total_tiles += dir.num_tiles();
     for (size_t t = 0; t < dir.num_tiles(); ++t) {
       const kiwi::Directory::TileView tv = dir.tile(t);
@@ -574,6 +710,9 @@ void RunSuite1QueryHeavy(const std::string& root) {
     configs.push_back(
         {"kiwi_page_bloom10", h, ConfigSpec::FilterKind::kBloom10});
     configs.push_back({"kiwi_tile_xor1", h, ConfigSpec::FilterKind::kXor1});
+    configs.push_back(
+        {"kiwi_tile_xor1_rk2", h, ConfigSpec::FilterKind::kXor1Rk2});
+    configs.push_back({"kiwi_sst_xor1_v3", h, ConfigSpec::FilterKind::kSstXor1});
     configs.push_back({"kiwi_tile_xor2", h, ConfigSpec::FilterKind::kXor2});
 
     for (const auto& cfg : configs) {
@@ -703,6 +842,8 @@ void RunSuite2SecondaryDeleteAndReconstruction(const std::string& root) {
       {"kiwi_no_filter", h, ConfigSpec::FilterKind::kNone},
       {"kiwi_page_bloom10", h, ConfigSpec::FilterKind::kBloom10},
       {"kiwi_tile_xor1", h, ConfigSpec::FilterKind::kXor1},
+      {"kiwi_tile_xor1_rk2", h, ConfigSpec::FilterKind::kXor1Rk2},
+      {"kiwi_sst_xor1_v3", h, ConfigSpec::FilterKind::kSstXor1},
       {"kiwi_tile_xor2", h, ConfigSpec::FilterKind::kXor2},
   };
 
@@ -738,11 +879,16 @@ void RunSuite2SecondaryDeleteAndReconstruction(const std::string& root) {
           1 + static_cast<uint64_t>(frac * static_cast<double>(kNumKeys));
       EagerReconstructStats eager;
       if (cfg.filter_kind == ConfigSpec::FilterKind::kXor1 ||
+          cfg.filter_kind == ConfigSpec::FilterKind::kXor1Rk2 ||
           cfg.filter_kind == ConfigSpec::FilterKind::kXor2) {
-        eager = SimulateEagerTileXorReconstruction(
-            db_dir, floor,
-            cfg.filter_kind == ConfigSpec::FilterKind::kXor1 ? 1 : 2, 0);
+        const uint8_t fp_b =
+            cfg.filter_kind == ConfigSpec::FilterKind::kXor2 ? 2 : 1;
+        const uint8_t rk_b =
+            cfg.filter_kind == ConfigSpec::FilterKind::kXor1Rk2 ? 2 : 0;
+        eager = SimulateEagerTileXorReconstruction(db_dir, floor, fp_b, rk_b, 0);
       }
+      const ZeroPeelReclaimStats zero_peel =
+          MeasureZeroPeelReclaim(cfg, db_dir, floor);
 
       double delete_ms = 0;
       if (cfg.tile_pages == 0) {
@@ -818,31 +964,160 @@ void RunSuite2SecondaryDeleteAndReconstruction(const std::string& root) {
         sp_after_compact = MeasureSpace(cdb.get(), true);
       }
 
+      const double lazy_sp_amp =
+          sp_after_compact.sst_bytes == 0
+              ? 1.0
+              : static_cast<double>(sp_after_del.sst_bytes) /
+                    sp_after_compact.sst_bytes;
+      const double zp_sp_amp =
+          sp_after_compact.sst_bytes == 0 || zero_peel.reclaimed_sst_bytes == 0
+              ? 0.0
+              : static_cast<double>(zero_peel.reclaimed_sst_bytes) /
+                    sp_after_compact.sst_bytes;
+
       std::cout << "  drop=" << std::setw(2) << int(frac * 100) << "%"
                 << std::fixed << std::setprecision(2)
                 << " | lazy_del=" << delete_ms << "ms"
+                << " | zero_peel=" << zero_peel.total_ms << "ms("
+                << (zero_peel.reclaimed_sst_bytes / (1024.0 * 1024.0)) << "MB,"
+                << zp_sp_amp << "x)"
                 << " | eager_recon=" << eager.total_ms << "ms"
                 << " (io=" << eager.page_read_ms
                 << "ms, peel=" << eager.xor_peel_ms << "ms)"
                 << " | compact=" << compact_ms << "ms"
+                << " | sp_amp=" << lazy_sp_amp << "x"
                 << " | delQ(mem=" << std::setprecision(1) << q_del.mem_ns_per_op
                 << "ns, io=" << std::setprecision(2) << q_del.io_us_per_op
                 << "us, blk=" << q_del.io_blocks_per_op << ")"
                 << " | survQ(mem=" << std::setprecision(1)
                 << q_surv.mem_ns_per_op << "ns, io=" << std::setprecision(2)
                 << q_surv.io_us_per_op << "us)"
-                << " | flt(before/lazy/eager/comp)="
+                << " | flt(B/L/E/C)="
                 << (sp_before.filter_bytes / 1024.0) << "/"
                 << (sp_after_del.filter_bytes / 1024.0) << "/"
                 << (eager.rebuilt_filter_bytes / 1024.0) << "/"
                 << (sp_after_compact.filter_bytes / 1024.0) << "KB"
-                << " | sst(before/lazy/comp)="
+                << " | sst(B/L/C)="
                 << (sp_before.sst_bytes / (1024.0 * 1024.0)) << "/"
                 << (sp_after_del.sst_bytes / (1024.0 * 1024.0)) << "/"
                 << (sp_after_compact.sst_bytes / (1024.0 * 1024.0)) << "MB"
-                << " | tr_mem=" << (sp_before.table_readers_mem / 1024.0) << "->"
+                << " | tr_mem(B->L->C)="
+                << (sp_before.table_readers_mem / 1024.0) << "->"
+                << (sp_after_del.table_readers_mem / 1024.0) << "->"
                 << (sp_after_compact.table_readers_mem / 1024.0) << "KB\n";
 
+      std::filesystem::remove_all(db_dir);
+    }
+  }
+}
+
+void RunSuite2BWholeFileDrop(const std::string& root) {
+  PrintDivider(
+      "SUITE 2B: MULTI-SST WHOLE-FILE SECONDARY DELETE (8x25k = 200k, h=8)");
+  const size_t kNumBatches = 8;
+  const size_t kPerBatch = 25000;
+  const size_t kTotalKeys = kNumBatches * kPerBatch;
+  const uint32_t h = 8;
+  std::vector<std::string> keys;
+  keys.reserve(kTotalKeys);
+  std::vector<size_t> order(kTotalKeys);
+  for (size_t i = 0; i < kTotalKeys; ++i) {
+    keys.push_back(MakeKey(i));
+    order[i] = i;
+  }
+  std::mt19937_64 rng(9911);
+  std::shuffle(order.begin(), order.end(), rng);
+
+  const std::vector<ConfigSpec> configs = {
+      {"plain_bloom10", 0, ConfigSpec::FilterKind::kBloom10},
+      {"kiwi_page_bloom10", h, ConfigSpec::FilterKind::kBloom10},
+      {"kiwi_tile_xor1", h, ConfigSpec::FilterKind::kXor1},
+      {"kiwi_sst_xor1_v3", h, ConfigSpec::FilterKind::kSstXor1},
+  };
+
+  for (double frac : {0.50, 0.75}) {
+    std::cout << "\n--- Drop oldest " << int(frac * 100) << "% SSTs ---\n";
+    std::cout << std::left << std::setw(20) << "config" << std::right
+              << std::setw(11) << "del_ms" << std::setw(8) << "w_amp"
+              << std::setw(14) << "files(B->A)" << std::setw(16)
+              << "tr(B->A KB)" << std::setw(16) << "sst(B->A MB)\n";
+    const uint64_t floor =
+        1 + static_cast<uint64_t>(frac * static_cast<double>(kTotalKeys));
+    for (const auto& cfg : configs) {
+      const std::string db_dir =
+          root + "/s2b_" + cfg.name + "_" + std::to_string(int(frac * 100));
+      std::filesystem::remove_all(db_dir);
+      auto cache = NewLRUCache(kWarmCacheBytes);
+      auto stats = CreateDBStatistics();
+      Options opts = MakeBaseOptions(cfg, true, cache, stats, 64 << 20,
+                                     64 << 20, 64 << 20, 10.0);
+      opts.disable_auto_compactions = true;
+      std::unique_ptr<DB> db;
+      if (!DB::Open(opts, db_dir, &db).ok()) {
+        std::abort();
+      }
+      WriteOptions wo;
+      wo.disableWAL = true;
+      for (size_t b = 0; b < kNumBatches; ++b) {
+        for (size_t i = 0; i < kPerBatch; ++i) {
+          const size_t pos = b * kPerBatch + i;
+          if (!db->Put(wo, keys[order[pos]], MakeValue(pos + 1, 1)).ok()) {
+            std::abort();
+          }
+        }
+        if (!db->Flush(FlushOptions()).ok()) {
+          std::abort();
+        }
+      }
+      const SpaceStats sp_before = MeasureSpace(db.get(), cfg.tile_pages >= 2);
+      const uint64_t w0 = stats->getTickerCount(FLUSH_WRITE_BYTES) +
+                          stats->getTickerCount(COMPACT_WRITE_BYTES);
+      double del_ms = 0;
+      uint64_t del_user_bytes = 0;
+      if (cfg.tile_pages == 0) {
+        const auto t0 = Clock::now();
+        for (size_t pos = 0; pos + 1 < floor; ++pos) {
+          if (!db->Delete(wo, keys[order[pos]]).ok()) {
+            std::abort();
+          }
+          del_user_bytes += keys[order[pos]].size();
+        }
+        if (!db->Flush(FlushOptions()).ok()) {
+          std::abort();
+        }
+        CompactRangeOptions cro;
+        cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+        if (!db->CompactRange(cro, nullptr, nullptr).ok()) {
+          std::abort();
+        }
+        del_ms = ElapsedMs(t0, Clock::now());
+      } else {
+        const auto t0 = Clock::now();
+        if (!db->SecondaryDeleteBelow(floor).ok()) {
+          std::abort();
+        }
+        del_ms = ElapsedMs(t0, Clock::now());
+      }
+      const uint64_t w1 = stats->getTickerCount(FLUSH_WRITE_BYTES) +
+                          stats->getTickerCount(COMPACT_WRITE_BYTES);
+      const SpaceStats sp_after = MeasureSpace(db.get(), cfg.tile_pages >= 2);
+      const double w_amp = del_user_bytes == 0
+                               ? static_cast<double>(w1 - w0) / (1024.0 * 1024.0)
+                               : static_cast<double>(w1 - w0) / del_user_bytes;
+
+      char f_buf[32], tr_buf[32], sst_buf[32];
+      snprintf(f_buf, sizeof(f_buf), "%" PRIu64 "->%" PRIu64, sp_before.num_files,
+               sp_after.num_files);
+      snprintf(tr_buf, sizeof(tr_buf), "%.1f->%.1f",
+               sp_before.table_readers_mem / 1024.0,
+               sp_after.table_readers_mem / 1024.0);
+      snprintf(sst_buf, sizeof(sst_buf), "%.2f->%.2f",
+               sp_before.sst_bytes / (1024.0 * 1024.0),
+               sp_after.sst_bytes / (1024.0 * 1024.0));
+      std::cout << std::left << std::setw(20) << cfg.name << std::right
+                << std::fixed << std::setprecision(2) << std::setw(11)
+                << del_ms << std::setw(8) << w_amp << std::setw(14) << f_buf
+                << std::setw(16) << tr_buf << std::setw(16) << sst_buf << '\n';
       std::filesystem::remove_all(db_dir);
     }
   }
@@ -864,13 +1139,15 @@ void RunSuite3TombstoneBenchWorkloads(const std::string& root) {
       {"kiwi_no_filter", h, ConfigSpec::FilterKind::kNone},
       {"kiwi_page_bloom10", h, ConfigSpec::FilterKind::kBloom10},
       {"kiwi_tile_xor1", h, ConfigSpec::FilterKind::kXor1},
+      {"kiwi_tile_xor1_rk2", h, ConfigSpec::FilterKind::kXor1Rk2},
+      {"kiwi_sst_xor1_v3", h, ConfigSpec::FilterKind::kSstXor1},
       {"kiwi_tile_xor2", h, ConfigSpec::FilterKind::kXor2},
   };
 
   for (const char* wname : {"seqdel", "churn"}) {
     const bool is_churn = (std::string(wname) == "churn");
     std::cout << "\n--- Workload: " << wname << " ---\n";
-    std::cout << std::left << std::setw(18) << "config" << std::right
+    std::cout << std::left << std::setw(20) << "config" << std::right
               << std::setw(10) << "ops/s" << std::setw(9) << "del_us"
               << std::setw(8) << "w_amp" << std::setw(10) << "mem_pres"
               << std::setw(10) << "mem_abs" << std::setw(10) << "io_pres"
@@ -1029,7 +1306,7 @@ void RunSuite3TombstoneBenchWorkloads(const std::string& root) {
                sp_before.sst_bytes / (1024.0 * 1024.0),
                sp_after.sst_bytes / (1024.0 * 1024.0));
 
-      std::cout << std::left << std::setw(18) << cfg.name << std::right
+      std::cout << std::left << std::setw(20) << cfg.name << std::right
                 << std::fixed << std::setprecision(0) << std::setw(10)
                 << (kOps / elapsed_s) << std::setw(9) << std::setprecision(2)
                 << (elapsed_s * 1e6 / kOps) << std::setw(8) << write_amp
@@ -1057,6 +1334,7 @@ int main(int argc, char** argv) {
 
   ROCKSDB_NAMESPACE::RunSuite1QueryHeavy(root);
   ROCKSDB_NAMESPACE::RunSuite2SecondaryDeleteAndReconstruction(root);
+  ROCKSDB_NAMESPACE::RunSuite2BWholeFileDrop(root);
   ROCKSDB_NAMESPACE::RunSuite3TombstoneBenchWorkloads(root);
 
   std::filesystem::remove_all(root);

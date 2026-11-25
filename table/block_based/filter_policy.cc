@@ -1731,7 +1731,36 @@ Status XXPH3FilterBitsBuilder::MaybePostVerify(const Slice& filter_content) {
 }  // namespace
 
 XorFilterPolicy::XorFilterPolicy(int fingerprint_bytes)
-    : fingerprint_bytes_(NormalizeXorFingerprintBytes(fingerprint_bytes)) {}
+    : fingerprint_bytes_(NormalizeXorFingerprintBytes(fingerprint_bytes)) {
+  static const std::unordered_map<std::string, OptionTypeInfo> type_info = {
+      {"kiwi_delete_rank_bits",
+       {offsetof(class XorFilterPolicy, kiwi_delete_rank_bits_),
+        OptionType::kUInt8T, OptionVerificationType::kNormal,
+        OptionTypeFlags::kNone}},
+      {"kiwi_file_filter",
+       {offsetof(class XorFilterPolicy, kiwi_file_filter_),
+        OptionType::kBoolean, OptionVerificationType::kNormal,
+        OptionTypeFlags::kNone}},
+  };
+  RegisterOptions(this, &type_info);
+}
+
+Status XorFilterPolicy::PrepareOptions(const ConfigOptions& config_options) {
+  if (kiwi_delete_rank_bits_ > 4) {
+    return Status::InvalidArgument(
+        "XorFilterPolicy: kiwi_delete_rank_bits must be <= 4");
+  }
+  return BuiltinFilterPolicy::PrepareOptions(config_options);
+}
+
+Status XorFilterPolicy::ValidateOptions(
+    const DBOptions& db_opts, const ColumnFamilyOptions& cf_opts) const {
+  if (kiwi_delete_rank_bits_ > 4) {
+    return Status::InvalidArgument(
+        "XorFilterPolicy: kiwi_delete_rank_bits must be <= 4");
+  }
+  return BuiltinFilterPolicy::ValidateOptions(db_opts, cf_opts);
+}
 
 FilterBitsBuilder* XorFilterPolicy::GetBuilderWithContext(
     const FilterBuildingContext& context) const {

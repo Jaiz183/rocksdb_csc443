@@ -22,6 +22,7 @@ compaction picking), is not implemented here.
 | Secondary delete | `db/db_impl/db_impl_kiwi.cc` |
 | Per-file floor in the MANIFEST | `FileMetaData::kiwi_delete_floor`, `kKiWiDeleteFloor` in `db/version_edit.{h,cc}` |
 | Per-tile XOR filter design & benchmarks | [tile_filter.md](tile_filter.md) |
+| XOR filter optimizations & augmentations | [tile_filter_optimizations.md](tile_filter_optimizations.md) |
 | Tests | `table/block_based/kiwi_test.cc`, `DBKiWiTest` and `DBKiWiSecondaryDeleteTest` in `db/db_etc3_test.cc` |
 
 ## Layout

@@ -60,6 +60,7 @@
 #include "table/block_based/index_builder.h"
 #include "table/block_based/kiwi_tile.h"
 #include "table/block_based/partitioned_filter_block.h"
+#include "table/block_based/reader_common.h"
 #include "table/block_based/user_defined_index_wrapper.h"
 #include "table/format.h"
 #include "table/meta_blocks.h"
@@ -1324,10 +1325,30 @@ struct BlockBasedTableBuilder::Rep {
         : packer(delete_key_offset, tile_pages, page_size) {}
     kiwi::TilePacker packer;
     std::vector<kiwi::TilePage> pages;  // scratch, reused across tiles
-    // Builds one filter per page (v1), or one XOR+page filter per tile (v2).
-    // Both are null if the file has no filters.
+    // Builds one filter per page (v1), one XOR+page filter per tile (v2), or
+    // one SST-wide XOR+local-page filter (v3). All are null without filters.
     std::unique_ptr<FilterBitsBuilder> page_filter;
     std::unique_ptr<kiwi::TileXorFilterBuilder> tile_xor_filter;
+    std::unique_ptr<kiwi::TileXorFilterBuilder> file_xor_filter;
+    bool file_filter_cross_tile_dup = false;
+    uint8_t xor_fp_bytes = 0;
+    uint8_t xor_rank_bits = 0;
+    uint32_t global_order = 0;
+    size_t max_tile_pages = 1;
+    // Retained only when file_xor_filter is active in case a multi-version
+    // user key spans a tile boundary and falls back to v2 per-tile filters.
+    struct BufferedTileEntries {
+      struct KeyRec {
+        std::string user_key;
+        uint32_t page_index;
+        uint32_t order;
+        uint8_t rank_bucket;
+      };
+      std::vector<kiwi::DirectoryPage> pages;
+      std::vector<KeyRec> keys;
+    };
+    std::vector<BufferedTileEntries> buffered_file_tiles;
+    std::string prev_tile_last_user_key;
     // What the reader needs to skip pages and filter lookups, per tile.
     kiwi::DirectoryBuilder directory;
     std::vector<kiwi::DirectoryPage> directory_pages;  // scratch
@@ -1339,6 +1360,23 @@ struct BlockBasedTableBuilder::Rep {
     uint64_t directory_bytes = 0;
   };
   std::unique_ptr<KiWiState> kiwi;
+
+  uint64_t EstimateKiWiDirectoryBytes() const {
+    if (kiwi == nullptr) {
+      return 0;
+    }
+    uint64_t estimate = kiwi->directory.current_bytes() + kBlockTrailerSize;
+    // Account for buffered keys in packer and, in v3 mode, the unreleased
+    // SST-wide XOR filter buffered until Finish().
+    const size_t buffered_keys = kiwi->packer.num_entries();
+    estimate += static_cast<uint64_t>(buffered_keys) * 2;
+    if (kiwi->file_xor_filter != nullptr && !kiwi->file_xor_filter->empty()) {
+      const uint64_t bytes_per_slot = uint64_t{kiwi->xor_fp_bytes} + 1;
+      estimate +=
+          (props.num_entries * 5 / 4 + 32) * bytes_per_slot + 256;
+    }
+    return estimate;
+  }
 
   GrowableBuffer single_threaded_compressed_output;
   std::unique_ptr<FlushBlockPolicy> flush_block_policy;
@@ -2040,9 +2078,20 @@ struct BlockBasedTableBuilder::Rep {
             const auto* xor_policy =
                 static_cast_with_check<const XorFilterPolicy>(
                     table_options.filter_policy.get());
-            kiwi->tile_xor_filter =
-                std::make_unique<kiwi::TileXorFilterBuilder>(
-                    xor_policy->fingerprint_bytes());
+            kiwi->xor_fp_bytes = xor_policy->fingerprint_bytes();
+            kiwi->xor_rank_bits = xor_policy->kiwi_delete_rank_bits();
+            if (kiwi->xor_rank_bits > 4) {
+              SetStatus(Status::InvalidArgument(
+                  "XorFilterPolicy: kiwi_delete_rank_bits must be <= 4"));
+            } else if (xor_policy->kiwi_file_filter()) {
+              kiwi->file_xor_filter =
+                  std::make_unique<kiwi::TileXorFilterBuilder>(
+                      kiwi->xor_fp_bytes, kiwi->xor_rank_bits);
+            } else {
+              kiwi->tile_xor_filter =
+                  std::make_unique<kiwi::TileXorFilterBuilder>(
+                      kiwi->xor_fp_bytes, kiwi->xor_rank_bits);
+            }
           } else {
             kiwi->page_filter.reset(
                 BuiltinFilterPolicy::GetBuilderFromContext(filter_context));
@@ -2558,26 +2607,75 @@ void BlockBasedTableBuilder::FlushTile(const Slice* first_key_in_next_tile) {
   BlockHandle first_page;
   BlockHandle last_page;
   bool skip_delta_encoding = false;
+  const bool track_file_filter = r->kiwi->file_xor_filter != nullptr;
+  const uint8_t rank_bits = r->kiwi->xor_rank_bits;
   r->kiwi->directory_pages.clear();
-  r->kiwi->blooms.resize(pages.size());
+  if (r->kiwi->page_filter != nullptr) {
+    r->kiwi->blooms.resize(pages.size());
+  }
+  r->kiwi->max_tile_pages = std::max(r->kiwi->max_tile_pages, pages.size());
+  Rep::KiWiState::BufferedTileEntries buffered_tile;
+  if (track_file_filter) {
+    if (!r->kiwi->prev_tile_last_user_key.empty()) {
+      Slice first_ukey = ExtractUserKey(packer.key(0));
+      if (r->internal_comparator.user_comparator()->CompareWithoutTimestamp(
+              r->kiwi->prev_tile_last_user_key, first_ukey) == 0) {
+        r->kiwi->file_filter_cross_tile_dup = true;
+      }
+    }
+    const Slice last_ukey = ExtractUserKey(packer.last_key());
+    r->kiwi->prev_tile_last_user_key.assign(last_ukey.data(),
+                                            last_ukey.size());
+    buffered_tile.pages.reserve(pages.size());
+  }
   for (size_t p = 0; p < pages.size(); ++p) {
     Slice prev_key;
+    Slice prev_user_key;
+    const uint64_t page_min_d = pages[p].min_delete_key;
+    const uint64_t page_max_d = pages[p].max_delete_key;
     for (size_t pos : pages[p].entries) {
       const Slice key = packer.key(pos);
       r->data_block.AddWithLastKey(key, packer.value(pos), prev_key);
       const Slice user_key = ExtractUserKey(key);
       if (r->kiwi->tile_xor_filter != nullptr) {
         assert(p <= std::numeric_limits<uint32_t>::max());
-        r->kiwi->tile_xor_filter->AddKey(user_key, static_cast<uint32_t>(p));
+        if (rank_bits > 0 || prev_user_key.empty() ||
+            user_key != prev_user_key) {
+          const uint8_t rank_bucket = kiwi::ComputeDeleteRankBucket(
+              page_min_d, page_max_d, rank_bits, packer.delete_key(pos));
+          r->kiwi->tile_xor_filter->AddKey(
+              user_key, static_cast<uint32_t>(p),
+              r->kiwi->global_order + static_cast<uint32_t>(pos), rank_bucket);
+        }
+      } else if (r->kiwi->file_xor_filter != nullptr) {
+        assert(p <= std::numeric_limits<uint32_t>::max());
+        const uint8_t rank_bucket = kiwi::ComputeDeleteRankBucket(
+            page_min_d, page_max_d, rank_bits, packer.delete_key(pos));
+        const uint32_t entry_order =
+            r->kiwi->global_order + static_cast<uint32_t>(pos);
+        if (!r->kiwi->file_filter_cross_tile_dup &&
+            (rank_bits > 0 || prev_user_key.empty() ||
+             user_key != prev_user_key)) {
+          r->kiwi->file_xor_filter->AddKey(user_key, static_cast<uint32_t>(p),
+                                           entry_order, rank_bucket);
+        }
+        if (rank_bits > 0 || prev_user_key.empty() ||
+            user_key != prev_user_key) {
+          buffered_tile.keys.push_back(
+              Rep::KiWiState::BufferedTileEntries::KeyRec{
+                  user_key.ToString(), static_cast<uint32_t>(p), entry_order,
+                  rank_bucket});
+        }
       } else if (r->kiwi->page_filter != nullptr) {
         // Versions of a key are adjacent, so the filter deduplicates them.
         r->kiwi->page_filter->AddKey(user_key);
       }
       prev_key = key;
+      prev_user_key = user_key;
     }
-    std::string& bloom = r->kiwi->blooms[p];
-    bloom.clear();
     if (r->kiwi->page_filter != nullptr) {
+      std::string& bloom = r->kiwi->blooms[p];
+      bloom.clear();
       std::unique_ptr<const char[]> filter_buf;
       Status filter_status;
       const Slice filter =
@@ -2614,14 +2712,22 @@ void BlockBasedTableBuilder::FlushTile(const Slice* first_key_in_next_tile) {
     entry.handle = r->pending_handle;
     entry.min_delete_key = pages[p].min_delete_key;
     entry.max_delete_key = pages[p].max_delete_key;
-    entry.bloom = bloom;
+    if (r->kiwi->page_filter != nullptr) {
+      entry.bloom = r->kiwi->blooms[p];
+    }
     r->kiwi->directory_pages.push_back(entry);
+    if (track_file_filter) {
+      buffered_tile.pages.push_back(entry);
+    }
     r->kiwi->min_delete_key =
         std::min(r->kiwi->min_delete_key, pages[p].min_delete_key);
     r->kiwi->max_delete_key =
         std::max(r->kiwi->max_delete_key, pages[p].max_delete_key);
   }
-  if (r->kiwi->tile_xor_filter != nullptr) {
+  r->kiwi->global_order += static_cast<uint32_t>(packer.num_entries());
+  if (track_file_filter) {
+    r->kiwi->buffered_file_tiles.push_back(std::move(buffered_tile));
+  } else if (r->kiwi->tile_xor_filter != nullptr) {
     r->SetStatus(r->kiwi->tile_xor_filter->Finish(
         pages.size(), &r->kiwi->encoded_tile_filter));
     if (UNLIKELY(!ok())) {
@@ -3998,6 +4104,43 @@ void BlockBasedTableBuilder::WriteKiWiDirectoryBlock(
   if (rep_->kiwi == nullptr || UNLIKELY(!ok())) {
     return;
   }
+  if (rep_->kiwi->file_xor_filter != nullptr) {
+    if (!rep_->kiwi->file_filter_cross_tile_dup &&
+        !rep_->kiwi->file_xor_filter->empty()) {
+      std::string encoded_file_filter;
+      Status fs = rep_->kiwi->file_xor_filter->Finish(
+          rep_->kiwi->max_tile_pages, &encoded_file_filter);
+      if (!fs.ok()) {
+        rep_->SetStatus(fs);
+        return;
+      }
+      rep_->kiwi->directory.SetFileXorFilter(encoded_file_filter);
+      for (const Rep::KiWiState::BufferedTileEntries& bt :
+           rep_->kiwi->buffered_file_tiles) {
+        rep_->kiwi->directory.AddTileWithoutFilter(bt.pages);
+      }
+    } else if (!rep_->kiwi->buffered_file_tiles.empty()) {
+      // Cross-tile versions share the same user key: emit v2 per-tile filters.
+      rep_->kiwi->file_xor_filter->Clear();
+      kiwi::TileXorFilterBuilder tile_fb(rep_->kiwi->xor_fp_bytes,
+                                         rep_->kiwi->xor_rank_bits);
+      std::string encoded_tile_filter;
+      for (const Rep::KiWiState::BufferedTileEntries& bt :
+           rep_->kiwi->buffered_file_tiles) {
+        for (const Rep::KiWiState::BufferedTileEntries::KeyRec& kr : bt.keys) {
+          tile_fb.AddKey(kr.user_key, kr.page_index, kr.order, kr.rank_bucket);
+        }
+        Status ts = tile_fb.Finish(bt.pages.size(), &encoded_tile_filter);
+        if (!ts.ok()) {
+          rep_->SetStatus(ts);
+          return;
+        }
+        rep_->kiwi->directory.AddTileWithXorFilter(bt.pages,
+                                                   encoded_tile_filter);
+      }
+    }
+    rep_->kiwi->buffered_file_tiles.clear();
+  }
   std::string contents;
   rep_->kiwi->directory.Finish(&contents);
   rep_->kiwi->directory_bytes = contents.size();
@@ -4391,8 +4534,10 @@ uint64_t BlockBasedTableBuilder::EstimatedFileSize() const {
     // Use upper bound on "inflight" data size to estimate
     return FileSize() + rep_->pc_rep->estimated_inflight_size.LoadRelaxed();
   } else if (rep_->kiwi != nullptr) {
-    // Entries of the tile being assembled are not written yet.
-    return FileSize() + rep_->kiwi->packer.buffered_bytes();
+    // Entries of the tile being assembled are not written yet, and the KiWi
+    // directory / XOR filters grow proportionally to emitted data blocks.
+    return FileSize() + rep_->kiwi->packer.buffered_bytes() +
+           rep_->EstimateKiWiDirectoryBytes();
   } else {
     return FileSize();
   }
@@ -4437,7 +4582,242 @@ uint64_t BlockBasedTableBuilder::EstimatedTailSize() const {
   // 7. Add footer size
   estimated_tail_size += Footer::kMaxEncodedLength;
 
+  // 8. Add KiWi directory block (uncompressed meta block written in Finish)
+  if (rep_->kiwi != nullptr) {
+    estimated_tail_size += rep_->EstimateKiWiDirectoryBytes();
+  }
+
   return estimated_tail_size;
+}
+
+Status BlockBasedTableBuilder::RewriteKiWiTableDroppingPages(
+    const BlockBasedTableOptions& table_options,
+    const TableBuilderOptions& table_builder_options,
+    const ReadOptions& read_options, BlockBasedTable* source_table,
+    uint64_t delete_key_floor, WritableFileWriter* output_file) {
+  if (source_table == nullptr || output_file == nullptr) {
+    return Status::InvalidArgument("RewriteKiWiTableDroppingPages: null arg");
+  }
+  const kiwi::Directory* src_dir = source_table->TEST_GetKiWiDirectory();
+  if (src_dir == nullptr) {
+    return Status::NotSupported(
+        "RewriteKiWiTableDroppingPages requires a KiWi table");
+  }
+  if (src_dir->has_file_filter()) {
+    return Status::NotSupported(
+        "RewriteKiWiTableDroppingPages requires per-tile v1 or v2 filters");
+  }
+
+  BlockBasedTableOptions sanitized_opts = table_options;
+  if (sanitized_opts.flush_block_policy_factory == nullptr) {
+    sanitized_opts.flush_block_policy_factory =
+        std::make_shared<FlushBlockBySizePolicyFactory>();
+  }
+  auto& overrides = sanitized_opts.cache_usage_options.options_overrides;
+  const CacheEntryRoleOptions default_role_opts =
+      sanitized_opts.cache_usage_options.options;
+  for (uint32_t i = 0; i < kNumCacheEntryRoles; ++i) {
+    const CacheEntryRole role = static_cast<CacheEntryRole>(i);
+    if (overrides.find(role) == overrides.end()) {
+      overrides.insert({role, default_role_opts});
+    }
+  }
+  BlockBasedTableBuilder dst(sanitized_opts, table_builder_options, output_file);
+  if (!dst.ok()) {
+    Status s = dst.status();
+    dst.Abandon();
+    return s;
+  }
+  Rep* dst_rep = dst.rep_.get();
+  if (dst_rep->kiwi == nullptr) {
+    dst.Abandon();
+    return Status::InvalidArgument(
+        "RewriteKiWiTableDroppingPages requires kiwi_tile_pages >= 2");
+  }
+
+  const BlockBasedTable::Rep* src_rep = source_table->get_rep();
+  IndexBlockIter iiter_on_stack;
+  BlockCacheLookupContext lookup_context{TableReaderCaller::kCompaction};
+  InternalIteratorBase<IndexValue>* iiter = source_table->NewIndexIterator(
+      read_options, /*disable_prefix_seek=*/false, &iiter_on_stack,
+      /*get_context=*/nullptr, &lookup_context);
+  std::unique_ptr<InternalIteratorBase<IndexValue>> iiter_unique_ptr;
+  if (iiter != &iiter_on_stack) {
+    iiter_unique_ptr.reset(iiter);
+  }
+  if (!iiter->status().ok()) {
+    Status s = iiter->status();
+    dst.Abandon();
+    return s;
+  }
+
+  IOOptions io_opts;
+  IODebugContext dbg;
+  IOStatus io_s = src_rep->file->PrepareIOOptions(read_options, io_opts, &dbg);
+  if (!io_s.ok()) {
+    dst.Abandon();
+    return io_s;
+  }
+
+  size_t total_src_pages = 0;
+  size_t surviving_src_pages = 0;
+  std::string raw_page_buf;
+  std::string shifted_filter;
+  std::vector<kiwi::DirectoryPage> surviving_dir_pages;
+  std::string index_ikey_scratch;
+
+  iiter->SeekToFirst();
+  for (size_t t = 0; t < src_dir->num_tiles() && iiter->Valid();
+       ++t, iiter->Next()) {
+    const kiwi::Directory::TileView tv = src_dir->tile(t);
+    total_src_pages += tv.num_pages;
+    uint32_t dead_prefix = 0;
+    while (dead_prefix < tv.num_pages &&
+           tv.pages[dead_prefix].max_delete_key < delete_key_floor) {
+      ++dead_prefix;
+    }
+    if (dead_prefix == tv.num_pages) {
+      continue;
+    }
+
+    surviving_dir_pages.clear();
+    BlockHandle first_page;
+    BlockHandle last_page;
+    bool skip_delta_encoding = false;
+
+    for (size_t p = dead_prefix; p < tv.num_pages; ++p) {
+      const kiwi::DirectoryPage& sp = tv.pages[p];
+      const size_t block_size = static_cast<size_t>(sp.handle.size());
+      const size_t read_bytes = block_size + kBlockTrailerSize;
+      raw_page_buf.resize(read_bytes);
+      Slice read_slice;
+      io_s = src_rep->file->Read(sp.handle.offset(), read_bytes, io_opts,
+                                 &read_slice, raw_page_buf.data(), &dbg);
+      if (!io_s.ok() || read_slice.size() != read_bytes) {
+        dst.Abandon();
+        return io_s.ok()
+                   ? Status::Corruption(
+                         "RewriteKiWiTableDroppingPages: truncated page")
+                   : Status(io_s);
+      }
+      if (read_options.verify_checksums) {
+        Status cs = VerifyBlockChecksum(
+            src_rep->footer, read_slice.data(), block_size,
+            src_rep->file->file_name(), sp.handle.offset(), BlockType::kData);
+        if (!cs.ok()) {
+          dst.Abandon();
+          return cs;
+        }
+      }
+      const CompressionType block_comp =
+          static_cast<CompressionType>(read_slice.data()[block_size]);
+      const Slice raw_payload(read_slice.data(), block_size);
+      if (block_comp != kNoCompression && dst_rep->warm_cache_config.enabled) {
+        dst.Abandon();
+        return Status::NotSupported(
+            "RewriteKiWiTableDroppingPages with cache warming requires "
+            "uncompressed data blocks");
+      }
+
+      ++dst_rep->props.num_data_blocks;
+      ++surviving_src_pages;
+      bool page_skip_delta_encoding = false;
+      dst.WriteMaybeCompressedBlock(raw_payload, block_comp,
+                                    &dst_rep->pending_handle, BlockType::kData,
+                                    &raw_payload, &page_skip_delta_encoding);
+      if (!dst.ok()) {
+        Status s = dst.status();
+        dst.Abandon();
+        return s;
+      }
+      dst_rep->props.data_size = dst_rep->get_offset();
+      if (surviving_dir_pages.empty()) {
+        first_page = dst_rep->pending_handle;
+        skip_delta_encoding = page_skip_delta_encoding;
+      }
+      last_page = dst_rep->pending_handle;
+
+      kiwi::DirectoryPage new_dp;
+      new_dp.handle = dst_rep->pending_handle;
+      new_dp.min_delete_key = sp.min_delete_key;
+      new_dp.max_delete_key = sp.max_delete_key;
+      new_dp.bloom = sp.bloom;
+      surviving_dir_pages.push_back(new_dp);
+      dst_rep->kiwi->min_delete_key =
+          std::min(dst_rep->kiwi->min_delete_key, sp.min_delete_key);
+      dst_rep->kiwi->max_delete_key =
+          std::max(dst_rep->kiwi->max_delete_key, sp.max_delete_key);
+    }
+
+    if (src_dir->has_tile_filters()) {
+      Status shift_s = kiwi::TileXorFilterBuilder::ShiftBasePage(
+          src_dir->raw_tile_filter(t), dead_prefix, surviving_dir_pages.size(),
+          &shifted_filter);
+      if (!shift_s.ok()) {
+        dst.Abandon();
+        return shift_s;
+      }
+      dst_rep->kiwi->directory.AddTileWithXorFilter(surviving_dir_pages,
+                                                  shifted_filter);
+    } else {
+      dst_rep->kiwi->directory.AddTile(surviving_dir_pages);
+    }
+
+    dst_rep->pending_handle = BlockHandle(
+        first_page.offset(),
+        last_page.offset() + last_page.size() - first_page.offset());
+    Slice sep_ikey;
+    if (src_rep->index_key_includes_seq) {
+      sep_ikey = iiter->key();
+    } else {
+      const Slice uk = iiter->user_key();
+      index_ikey_scratch.assign(uk.data(), uk.size());
+      PutFixed64(&index_ikey_scratch,
+                 PackSequenceAndType(0, kTypeValue));
+      sep_ikey = index_ikey_scratch;
+    }
+    dst_rep->ForwardAddIndexEntryToAll(sep_ikey, /*first_key_next=*/nullptr,
+                                        dst_rep->pending_handle,
+                                        skip_delta_encoding);
+    if (!dst.ok()) {
+      Status s = dst.status();
+      dst.Abandon();
+      return s;
+    }
+  }
+  if (!iiter->status().ok()) {
+    Status s = iiter->status();
+    dst.Abandon();
+    return s;
+  }
+
+  if (src_rep->fragmented_range_dels != nullptr) {
+    std::unique_ptr<FragmentedRangeTombstoneIterator> rdel_iter(
+        source_table->NewRangeTombstoneIterator(read_options));
+    if (rdel_iter != nullptr) {
+      for (rdel_iter->SeekToFirst(); rdel_iter->Valid(); rdel_iter->Next()) {
+        dst_rep->range_del_block.Add(rdel_iter->key(), rdel_iter->value());
+      }
+    }
+  }
+
+  if (surviving_src_pages > 0 && total_src_pages > 0) {
+    const uint64_t src_entries = src_rep->table_properties->num_entries;
+    dst_rep->props.num_entries = std::max<uint64_t>(
+        1, (src_entries * surviving_src_pages + total_src_pages - 1) /
+               total_src_pages);
+    dst_rep->props.raw_key_size =
+        (src_rep->table_properties->raw_key_size * surviving_src_pages) /
+        total_src_pages;
+    dst_rep->props.raw_value_size =
+        (src_rep->table_properties->raw_value_size * surviving_src_pages) /
+        total_src_pages;
+    dst_rep->props.key_largest_seqno =
+        src_rep->table_properties->key_largest_seqno == UINT64_MAX
+            ? 0
+            : src_rep->table_properties->key_largest_seqno;
+  }
+  return dst.Finish();
 }
 
 uint64_t BlockBasedTableBuilder::GetTailSize() const { return rep_->tail_size; }
