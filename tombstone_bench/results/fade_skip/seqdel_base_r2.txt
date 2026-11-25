@@ -1,0 +1,13 @@
+== seqdel_base_r2 load={ 4.35 19.39 32.44 }
+cf_opts="" run_s=60.0 ops=1200000 (puts=839529 dels=360471 rdels=0) ops/s=20000
+write_amp=9.225  (compaction 797.8 MB + flush 99.2 MB) / user 97.2 MB
+avg_upper_tombstones=10783  peak_tomb_age_ub=53s  avg_sst_MB=83.87
+true_tomb_age: peak=6.3s avg=2.3s samples_over_10s=0/59
+end_of_run: sst_MB=85.26 upper_tombs=2828 total_tombs=2828 levels_KB=780/0/0/489/2721/13405/69913
+drained:    sst_MB=84.26 upper_tombs=5577 total_tombs=5577 levels_KB=0/0/0/0/2066/13905/70314 space_amp=1.174
+compactions by reason: LevelL0FilesNum=65(136.3MB) LevelMaxLevelSize=329(661.4MB)
+compactions by shape:  L0->L3=65(136.3MB) L3->L4=118(158.3MB) L4->L5=118(269.7MB) L5->L6=93(233.4MB)
+skip-level shapes:     
+L0 compactions:         LevelL0FilesNum=65(avg_l0_files=2.00,avg_in=2.1MB)
+verify: live_keys=654673 mismatches=0 bg_errors=0 -> PASS
+exit=0
