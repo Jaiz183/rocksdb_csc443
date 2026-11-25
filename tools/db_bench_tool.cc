@@ -952,6 +952,10 @@ DEFINE_int32(bloom_bits, -1,
 
 DEFINE_bool(use_ribbon_filter, false, "Use Ribbon instead of Bloom filter");
 
+DEFINE_int32(xor_filter_bytes, 0,
+             "If > 0, use NewXorFilterPolicy(xor_filter_bytes) instead of "
+             "Bloom or Ribbon filter.");
+
 DEFINE_double(memtable_bloom_size_ratio, 0,
               "Ratio of memtable size used for bloom filter. 0 means no bloom "
               "filter.");
@@ -6631,7 +6635,10 @@ class Benchmark {
         table_options->block_cache = cache_;
       }
       if (table_options->filter_policy == nullptr) {
-        if (FLAGS_bloom_bits < 0) {
+        if (FLAGS_xor_filter_bytes > 0) {
+          table_options->filter_policy.reset(
+              NewXorFilterPolicy(FLAGS_xor_filter_bytes));
+        } else if (FLAGS_bloom_bits < 0) {
           table_options->filter_policy = BlockBasedTableOptions().filter_policy;
         } else if (FLAGS_bloom_bits == 0) {
           table_options->filter_policy.reset();

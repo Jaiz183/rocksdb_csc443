@@ -221,6 +221,10 @@ FilterPolicy* NewRibbonFilterPolicy(double bloom_equivalent_bits_per_key,
                                     int bloom_before_level = 0);
 
 // Return a filter policy that uses XOR filters for block-based tables.
+// When combined with BlockBasedTableOptions::kiwi_tile_pages >= 2, each delete
+// tile receives a single XOR filter encoding [fingerprint || page_index]
+// instead of per-page filters (assuming user keys are unique within a tile and
+// do not span 2+ pages).
 // fingerprint_bytes must be an integer from 1 to 8.
 // Throws std::invalid_argument for an out-of-range value.
 // Older RocksDB versions treat filters written with this policy as may-match.

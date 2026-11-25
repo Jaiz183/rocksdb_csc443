@@ -364,53 +364,6 @@ class XXPH3FilterBitsBuilder : public FilterBitsBuilder {
   HashEntriesInfo hash_entries_info_;
 };
 
-struct XorFilterHash {
-  struct XorSlots {
-    uint32_t idx[3];
-    uint64_t fp;
-  };
-
-  // Mix the input hash with the seed before deriving its slots.
-  static inline uint64_t Remix(uint64_t h, uint8_t seed) {
-    h ^= (uint64_t{seed} + 1) * 0x9E3779B97F4A7C15ULL;
-    h ^= h >> 32;
-    h *= 0x9E3779B97F4A7C15ULL;
-    h ^= h >> 29;
-    return h;
-  }
-
-  // Map a 32-bit value to [0, n) using Lemire's fastrange.
-  static inline uint32_t FastRange32(uint32_t x, uint32_t n) {
-    return static_cast<uint32_t>((uint64_t{x} * n) >> 32);
-  }
-
-  // Rotate a 64-bit hash.
-  static inline uint64_t Rotl64(uint64_t x, int r) {
-    return (x << r) | (x >> (64 - r));
-  }
-
-  // Split a hash into three slot indices and a fingerprint.
-  static inline XorSlots Derive(uint64_t h, uint32_t seg_len) {
-    XorSlots s;
-    // Each index lands in its own segment, so the three slots are distinct.
-    s.idx[0] = FastRange32(static_cast<uint32_t>(h), seg_len);
-    s.idx[1] =
-        FastRange32(static_cast<uint32_t>(Rotl64(h, 21)), seg_len) + seg_len;
-    s.idx[2] = FastRange32(static_cast<uint32_t>(Rotl64(h, 42)), seg_len) +
-               2 * seg_len;
-    s.fp = h;
-    return s;
-  }
-
-  // Apply the seed-dependent mix before deriving the slots and fingerprint.
-  static inline XorSlots SeededDerive(uint64_t h, uint32_t seg_len,
-                                      uint8_t seed) {
-    XorSlots slots = Derive(Remix(h, seed), seg_len);
-    slots.fp = Remix(h ^ 0xD6E8FEB86659FD93ULL, seed);
-    return slots;
-  }
-};
-
 uint8_t NormalizeXorFingerprintBytes(int fingerprint_bytes) {
   if (fingerprint_bytes < 1 || fingerprint_bytes > 8) {
     throw std::invalid_argument(
@@ -717,25 +670,7 @@ class XorFilterBitsReader : public BuiltinFilterBitsReader {
   uint64_t fingerprint_mask_;
 };
 
-// ---- Policy ----
-class XorFilterPolicy : public BuiltinFilterPolicy {
- public:
-  explicit XorFilterPolicy(int fingerprint_bytes)
-      : fingerprint_bytes_(NormalizeXorFingerprintBytes(fingerprint_bytes)) {}
-
-  const char* Name() const override { return "rocksdb.XorFilter"; }
-  std::string GetId() const override {
-    return std::string(Name()) + ":" + std::to_string(fingerprint_bytes_);
-  }
-
-  FilterBitsBuilder* GetBuilderWithContext(
-      const FilterBuildingContext& context) const override {
-    return GetXorFilterBuilderWithContext(context, fingerprint_bytes_);
-  }
-
- private:
-  const uint8_t fingerprint_bytes_;
-};
+// ---- Policy (out-of-line methods moved below anonymous namespace) ----
 
 // #################### FastLocalBloom implementation ################## //
 // ############## also known as format_version=5 Bloom filter ########## //
@@ -1795,6 +1730,14 @@ Status XXPH3FilterBitsBuilder::MaybePostVerify(const Slice& filter_content) {
 }
 }  // namespace
 
+XorFilterPolicy::XorFilterPolicy(int fingerprint_bytes)
+    : fingerprint_bytes_(NormalizeXorFingerprintBytes(fingerprint_bytes)) {}
+
+FilterBitsBuilder* XorFilterPolicy::GetBuilderWithContext(
+    const FilterBuildingContext& context) const {
+  return GetXorFilterBuilderWithContext(context, fingerprint_bytes_);
+}
+
 const FilterPolicy* NewXorFilterPolicy(int fingerprint_bytes) {
   return new XorFilterPolicy(fingerprint_bytes);
 }
@@ -2451,6 +2394,10 @@ static int RegisterBuiltinFilterPolicies(ObjectLibrary& library,
       [](const std::string& uri, std::unique_ptr<const FilterPolicy>* guard,
          std::string* /* errmsg */) {
         const std::vector<std::string> vals = StringSplit(uri, ':');
+        if (vals.size() != 2) {
+          throw std::invalid_argument(
+              "XOR filter URI must be xorfilter:<fingerprint_bytes>");
+        }
         size_t parsed_chars;
         const int fingerprint_bytes = std::stoi(vals[1], &parsed_chars);
         if (parsed_chars != vals[1].size()) {

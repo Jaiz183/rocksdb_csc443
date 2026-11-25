@@ -128,10 +128,98 @@ constexpr char kPropTilePages[] = "rocksdb.kiwi.tile_pages";
 constexpr char kPropDeleteKeyOffset[] = "rocksdb.kiwi.delete_key_offset";
 constexpr char kPropMinDeleteKey[] = "rocksdb.kiwi.min_delete_key";
 constexpr char kPropMaxDeleteKey[] = "rocksdb.kiwi.max_delete_key";
+constexpr char kPropDirectoryBytes[] = "rocksdb.kiwi.directory_bytes";
+constexpr char kPropFilterBytes[] = "rocksdb.kiwi.filter_bytes";
+
+// Returns ceil(log2(n)) for n >= 1, or 0 for n <= 1.
+uint8_t CeilLog2(size_t n);
+
+// Builds a single XOR filter for all keys in one delete tile, encoding
+// [fingerprint || page_index] in every slot so a single filter lookup locates
+// the sole candidate page in the tile (assuming user keys are unique within a
+// tile and do not span multiple pages). Buffers are reused across tiles.
+class TileXorFilterBuilder {
+ public:
+  static constexpr char kFormatVersion = 1;
+  static constexpr size_t kHeaderBytes = 8;
+
+  explicit TileXorFilterBuilder(uint8_t fingerprint_bytes)
+      : fingerprint_bytes_(fingerprint_bytes) {}
+
+  TileXorFilterBuilder(const TileXorFilterBuilder&) = delete;
+  TileXorFilterBuilder& operator=(const TileXorFilterBuilder&) = delete;
+
+  // Records `user_key` as residing on `page_index` (0 <= page_index <
+  // num_pages) of the current tile. Entries should be added in tile order.
+  void AddKey(const Slice& user_key, uint32_t page_index);
+
+  bool empty() const { return entries_.empty(); }
+
+  // Builds the bit-packed XOR+page filter for a tile with `num_pages` pages
+  // and resets buffered entries for the next tile.
+  Status Finish(size_t num_pages, std::string* out);
+
+  void Clear() {
+    entries_.clear();
+    next_order_ = 0;
+  }
+
+ private:
+  struct Entry {
+    uint64_t hash;
+    uint64_t order;
+    uint32_t page_index;
+  };
+  struct PeelStep {
+    uint32_t edge_idx;
+    uint32_t vertex;
+  };
+
+  const uint8_t fingerprint_bytes_;
+  uint64_t next_order_ = 0;
+  std::vector<Entry> entries_;
+  std::vector<uint32_t> degree_;
+  std::vector<uint32_t> xor_edge_;
+  std::vector<uint32_t> queue_;
+  std::vector<PeelStep> peel_stack_;
+  std::vector<uint64_t> slots_;
+};
+
+// Lightweight non-owning reader for a serialized TileXorFilter (points into
+// Directory's pinned contents buffer).
+class TileXorFilterReader {
+ public:
+  Status Init(const Slice& encoded, size_t num_pages);
+
+  // True if `user_key` may exist in the tile, setting `*page_index` to the
+  // single candidate page in [0, num_pages). Returns false on fingerprint
+  // mismatch or out-of-range page index (true/false negative).
+  bool MayMatchPage(const Slice& user_key, uint32_t* page_index) const;
+
+  uint32_t seg_len() const { return seg_len_; }
+  uint8_t fp_bits() const { return fp_bits_; }
+  uint8_t page_bits() const { return page_bits_; }
+  uint8_t slot_bits() const { return slot_bits_; }
+
+ private:
+  uint64_t ReadSlot(uint32_t slot) const;
+
+  const char* payload_ = nullptr;
+  size_t payload_size_ = 0;
+  uint32_t seg_len_ = 0;
+  uint32_t num_pages_ = 0;
+  uint8_t seed_ = 0;
+  uint8_t fp_bits_ = 0;
+  uint8_t page_bits_ = 0;
+  uint8_t slot_bits_ = 0;
+  uint64_t fp_mask_ = 0;
+  uint64_t page_mask_ = 0;
+  uint64_t slot_mask_ = 0;
+};
 
 // What the directory records about one page: where it is, the range of delete
 // keys it holds (the paper's delete fence pointers) and its Bloom filter on
-// the sort key.
+// the sort key (empty in v2 tile-filter mode).
 struct DirectoryPage {
   BlockHandle handle;
   uint64_t min_delete_key = 0;
@@ -141,27 +229,38 @@ struct DirectoryPage {
 };
 
 // Encodes the KiWi directory meta block, one tile at a time in file order.
-//   directory := version(1 byte) varint32(num_tiles) tile*
-//   tile      := varint64(num_pages) page+
-//   page      := BlockHandle fixed64(min_d) fixed64(max_d) lp-bloom
-// where lp-bloom is a varint32 length followed by that many filter bytes.
+//   v1: directory := 1(1B) varint32(num_tiles) tile_v1*
+//       tile_v1   := varint64(num_pages) (BlockHandle fixed64(min_d)
+//                    fixed64(max_d) lp-bloom)+
+//   v2: directory := 2(1B) varint32(num_tiles) tile_v2*
+//       tile_v2   := varint64(num_pages) lp-tile_xor_filter
+//                    (BlockHandle fixed64(min_d) fixed64(max_d))+
 class DirectoryBuilder {
  public:
   static constexpr char kFormatVersion = 1;
+  static constexpr char kFormatVersionTileFilter = 2;
 
-  // Appends a tile; `pages` must be non-empty and in file order.
+  // Appends a tile with per-page filters (v1); `pages` must be non-empty and
+  // in file order.
   void AddTile(const std::vector<DirectoryPage>& pages);
+  // Appends a tile with a single per-tile XOR+page filter (v2); `pages` and
+  // `tile_xor_filter` must be non-empty.
+  void AddTileWithXorFilter(const std::vector<DirectoryPage>& pages,
+                            const Slice& tile_xor_filter);
   uint32_t num_tiles() const { return num_tiles_; }
+  size_t filter_bytes() const { return filter_bytes_; }
   // Produces the full block contents.
   void Finish(std::string* out) const;
 
  private:
   std::string body_;
   uint32_t num_tiles_ = 0;
+  size_t filter_bytes_ = 0;
+  bool use_tile_filters_ = false;
 };
 
 // The decoded directory of a KiWi file, held in memory for the life of the
-// table reader. Page filters point into the owned buffer, so the object is
+// table reader. Page/tile filters point into the owned buffer, so the object is
 // neither copyable nor movable.
 class Directory {
  public:
@@ -186,10 +285,19 @@ class Directory {
   // offset stored in the index entry of the tile), or num_tiles() if none.
   size_t FindTile(uint64_t first_page_offset) const;
 
+  bool has_tile_filters() const { return !tile_filters_.empty(); }
+
+  // Queries the per-tile XOR+page filter for tile `tile_index`. Requires
+  // has_tile_filters().
+  bool TileMayMatch(size_t tile_index, const Slice& user_key,
+                    uint32_t* page_index) const;
+
   // False only if the page filter proves that the page holds no entry with this
   // user key. `page` must point into this directory (see tile()).
   bool PageMayMatch(const DirectoryPage* page, const Slice& user_key) const;
 
+  size_t directory_bytes() const { return contents_.size(); }
+  size_t filter_bytes() const { return filter_bytes_; }
   size_t ApproximateMemoryUsage() const;
 
  private:
@@ -197,8 +305,11 @@ class Directory {
   std::vector<DirectoryPage> pages_;
   // Position in pages_ of the first page of each tile.
   std::vector<size_t> tile_first_page_;
-  // One reader per page, parallel to pages_; null for a page without filter.
+  // One reader per page (v1), parallel to pages_; empty when v2 is used.
   std::vector<std::unique_ptr<FilterBitsReader>> filters_;
+  // One reader per tile (v2), parallel to tile_first_page_; empty in v1.
+  std::vector<TileXorFilterReader> tile_filters_;
+  size_t filter_bytes_ = 0;
 };
 
 }  // namespace kiwi

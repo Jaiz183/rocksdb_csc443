@@ -862,13 +862,19 @@ struct BlockBasedTableOptions {
   // `kiwi_tile_pages` consecutive data blocks ("pages") into a delete tile.
   // Tiles remain ordered by key; inside a tile, pages are ordered by a
   // secondary "delete key" D, and entries inside each page stay ordered by key.
-  // Each page gets its own Bloom filter (built from `filter_policy`), and the
-  // per-page filters and D ranges are kept in memory, so a secondary range
-  // delete can skip whole pages without reading them.
+  // By default (Bloom/Ribbon `filter_policy`), each page gets its own filter;
+  // when `filter_policy` is NewXorFilterPolicy(...) ("xorfilter:<bytes>"),
+  // each tile gets a single XOR filter storing [fingerprint || page_index]
+  // (ceil(log2(num_pages)) page bits), so a point lookup probes one filter per
+  // tile and opens only the single candidate page. Per-tile XOR filters assume
+  // user keys are unique within each tile (a key does not span 2+ pages of a
+  // tile). Secondary deletes (DB::SecondaryDeleteBelow) do not reconstruct the
+  // filter when pages are dropped, because `page_index` identifies dropped
+  // pages (`max_delete_key < floor`) in the pinned directory.
   //
-  // Larger values make secondary deletes cheaper but make point lookups probe
-  // more page filters and short range scans read more pages per tile. 0 or 1
-  // disables KiWi (the default); only newly written files are affected.
+  // Larger values make secondary deletes cheaper, increase short-scan reads,
+  // and (with per-page filters) probe more filters per lookup. 0 or 1 disables
+  // KiWi (the default); only newly written files are affected.
   //
   // KiWi files have no whole-file filter, are always compressed by one thread
   // (CompressionOptions::parallel_threads is ignored for them), and cannot be

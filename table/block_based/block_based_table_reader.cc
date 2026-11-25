@@ -1791,65 +1791,88 @@ Status BlockBasedTable::KiWiGet(const ReadOptions& read_options,
   bool matched = false;
   bool used_filter = false;
   bool done = false;
+  const auto scan_iter = [&](InternalIterator* iter) {
+    for (iter->Seek(key); iter->Valid(); iter->Next()) {
+      ParsedInternalKey parsed_key;
+      s = ParseInternalKey(iter->key(), &parsed_key,
+                           /*log_err_key=*/false);
+      if (!s.ok()) {
+        break;
+      }
+      Status read_status;
+      const bool more = get_context->SaveValue(parsed_key, iter->value(),
+                                               &matched, &read_status);
+      if (!read_status.ok()) {
+        s = read_status;
+        break;
+      }
+      if (!more) {
+        done = true;
+        break;
+      }
+    }
+    if (s.ok()) {
+      s = iter->status();
+    }
+    if (s.IsIncomplete() && read_options.read_tier == kBlockCacheTier) {
+      // A page is not in the block cache: the key may exist.
+      get_context->MarkKeyMayExist();
+    }
+  };
   for (iiter->Seek(key); iiter->Valid() && !done; iiter->Next()) {
     const size_t tile_index = dir.FindTile(iiter->value().handle.offset());
     if (tile_index == dir.num_tiles()) {
       s = Status::Corruption("KiWi: index entry is not the start of a tile");
       break;
     }
-    // Only pages whose filter matches can hold the key.
     const kiwi::Directory::TileView tile = dir.tile(tile_index);
-    std::vector<InternalIterator*> pages;
-    for (size_t i = 0; i < tile.num_pages; ++i) {
-      if (!skip_filters && tile.pages[i].bloom.size() > 0) {
-        used_filter = true;
-        if (!dir.PageMayMatch(&tile.pages[i], user_key)) {
-          RecordTick(stats, BLOOM_FILTER_USEFUL);
-          continue;
-        }
+    if (!skip_filters && dir.has_tile_filters()) {
+      used_filter = true;
+      uint32_t page_idx = 0;
+      if (!dir.TileMayMatch(tile_index, user_key, &page_idx)) {
+        RecordTick(stats, BLOOM_FILTER_USEFUL);
+      } else {
         RecordTick(stats, BLOOM_FILTER_FULL_POSITIVE);
+        std::unique_ptr<InternalIterator> page(
+            KiWiTableIterator::NewPageIterator(
+                this, read_options, tile.pages[page_idx], get_context,
+                &lookup_context, /*for_compaction=*/false));
+        if (page != nullptr) {
+          scan_iter(page.get());
+          if (!s.ok()) {
+            break;
+          }
+        }
       }
-      InternalIterator* page = KiWiTableIterator::NewPageIterator(
-          this, read_options, tile.pages[i], get_context, &lookup_context,
-          /*for_compaction=*/false);
-      if (page != nullptr) {
-        pages.push_back(page);
+    } else {
+      // Only pages whose filter matches can hold the key.
+      std::vector<InternalIterator*> pages;
+      for (size_t i = 0; i < tile.num_pages; ++i) {
+        if (!skip_filters && tile.pages[i].bloom.size() > 0) {
+          used_filter = true;
+          if (!dir.PageMayMatch(&tile.pages[i], user_key)) {
+            RecordTick(stats, BLOOM_FILTER_USEFUL);
+            continue;
+          }
+          RecordTick(stats, BLOOM_FILTER_FULL_POSITIVE);
+        }
+        InternalIterator* page = KiWiTableIterator::NewPageIterator(
+            this, read_options, tile.pages[i], get_context, &lookup_context,
+            /*for_compaction=*/false);
+        if (page != nullptr) {
+          pages.push_back(page);
+        }
       }
-    }
-    if (!pages.empty()) {
-      // Versions of one key can sit on different pages, so merge them and let
-      // the context see them newest first, as for any other table.
-      std::unique_ptr<InternalIterator> merged(NewMergingIterator(
-          &rep_->internal_comparator, pages.data(),
-          static_cast<int>(pages.size())));
-      for (merged->Seek(key); merged->Valid(); merged->Next()) {
-        ParsedInternalKey parsed_key;
-        s = ParseInternalKey(merged->key(), &parsed_key,
-                             /*log_err_key=*/false);
+      if (!pages.empty()) {
+        // Versions of one key can sit on different pages, so merge them and let
+        // the context see them newest first, as for any other table.
+        std::unique_ptr<InternalIterator> merged(NewMergingIterator(
+            &rep_->internal_comparator, pages.data(),
+            static_cast<int>(pages.size())));
+        scan_iter(merged.get());
         if (!s.ok()) {
           break;
         }
-        Status read_status;
-        const bool more = get_context->SaveValue(parsed_key, merged->value(),
-                                                 &matched, &read_status);
-        if (!read_status.ok()) {
-          s = read_status;
-          break;
-        }
-        if (!more) {
-          done = true;
-          break;
-        }
-      }
-      if (s.ok()) {
-        s = merged->status();
-      }
-      if (s.IsIncomplete() && read_options.read_tier == kBlockCacheTier) {
-        // A page is not in the block cache: the key may exist.
-        get_context->MarkKeyMayExist();
-      }
-      if (!s.ok()) {
-        break;
       }
     }
     // Later tiles only hold larger keys: stop unless this tile ends in the

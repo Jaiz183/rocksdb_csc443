@@ -437,6 +437,181 @@ TEST(KiWiDirectoryTest, RejectsMalformedDirectories) {
   ASSERT_OK(DecodeDirectory(good.encoded, &dir));
 }
 
+TEST(KiWiDirectoryTest, V2TileFilterRoundTripAndCorruption) {
+  Random64 rnd(4242);
+  DirectoryBuilder builder;
+  std::vector<std::string> raw_filters;
+  std::vector<std::vector<DirectoryPage>> expected_pages;
+  uint64_t offset = 0;
+  for (size_t t = 0; t < 8; ++t) {
+    const size_t num_pages = 1 + rnd.Uniform(8);
+    TileXorFilterBuilder fb(/*fingerprint_bytes=*/1 + static_cast<uint8_t>(t % 2));
+    std::vector<DirectoryPage> pages(num_pages);
+    for (size_t p = 0; p < num_pages; ++p) {
+      pages[p].handle = BlockHandle(offset, 64 + rnd.Uniform(200));
+      offset += pages[p].handle.size() + 5;
+      pages[p].min_delete_key = p * 100;
+      pages[p].max_delete_key = p * 100 + 99;
+      for (size_t k = 0; k < 20; ++k) {
+        fb.AddKey("tile" + std::to_string(t) + "_p" + std::to_string(p) +
+                      "_k" + std::to_string(k),
+                  static_cast<uint32_t>(p));
+      }
+    }
+    std::string encoded_filter;
+    ASSERT_OK(fb.Finish(num_pages, &encoded_filter));
+    builder.AddTileWithXorFilter(pages, encoded_filter);
+    raw_filters.push_back(std::move(encoded_filter));
+    expected_pages.push_back(std::move(pages));
+  }
+  std::string encoded_dir;
+  builder.Finish(&encoded_dir);
+
+  Directory dir;
+  ASSERT_OK(DecodeDirectory(encoded_dir, &dir));
+  ASSERT_TRUE(dir.has_tile_filters());
+  ASSERT_EQ(dir.num_tiles(), 8U);
+  ASSERT_EQ(dir.directory_bytes(), encoded_dir.size());
+  ASSERT_EQ(dir.filter_bytes(), builder.filter_bytes());
+  for (size_t t = 0; t < 8; ++t) {
+    const Directory::TileView tv = dir.tile(t);
+    ASSERT_EQ(tv.num_pages, expected_pages[t].size());
+    for (size_t p = 0; p < tv.num_pages; ++p) {
+      ASSERT_EQ(tv.pages[p].handle, expected_pages[t][p].handle);
+      ASSERT_EQ(tv.pages[p].min_delete_key, expected_pages[t][p].min_delete_key);
+      ASSERT_EQ(tv.pages[p].max_delete_key, expected_pages[t][p].max_delete_key);
+      uint32_t got_page = 9999;
+      ASSERT_TRUE(dir.TileMayMatch(
+          t,
+          "tile" + std::to_string(t) + "_p" + std::to_string(p) + "_k5",
+          &got_page));
+      ASSERT_EQ(got_page, p);
+    }
+  }
+
+  for (size_t len = 0; len < encoded_dir.size(); ++len) {
+    Directory bad_dir;
+    ASSERT_EQ(DecodeDirectory(encoded_dir.substr(0, len), &bad_dir).code(),
+              Status::kCorruption)
+        << "len=" << len;
+  }
+  for (int iter = 0; iter < 1000; ++iter) {
+    std::string bad = encoded_dir;
+    bad[rnd.Uniform(bad.size())] ^= static_cast<char>(1 + rnd.Uniform(255));
+    Directory bad_dir;
+    Status s = DecodeDirectory(bad, &bad_dir);
+    if (!s.ok()) {
+      ASSERT_EQ(s.code(), Status::kCorruption);
+      ASSERT_EQ(bad_dir.num_tiles(), 0U);
+    }
+  }
+}
+
+TEST(TileXorFilterTest, RoundTripAndPageLookup) {
+  for (uint8_t fp_bytes : {uint8_t{1}, uint8_t{2}, uint8_t{3}, uint8_t{4},
+                           uint8_t{8}}) {
+    for (size_t num_pages : {size_t{1}, size_t{2}, size_t{3}, size_t{4},
+                             size_t{5}, size_t{8}, size_t{16}}) {
+      TileXorFilterBuilder builder(fp_bytes);
+      const size_t keys_per_page = 64;
+      for (size_t p = 0; p < num_pages; ++p) {
+        for (size_t k = 0; k < keys_per_page; ++k) {
+          builder.AddKey("p" + std::to_string(p) + "_k" + std::to_string(k),
+                         static_cast<uint32_t>(p));
+        }
+      }
+      std::string encoded;
+      ASSERT_OK(builder.Finish(num_pages, &encoded));
+      ASSERT_TRUE(builder.empty());
+
+      TileXorFilterReader reader;
+      ASSERT_OK(reader.Init(encoded, num_pages));
+      const uint8_t expected_page_bits = CeilLog2(num_pages);
+      const uint8_t expected_fp_bits = static_cast<uint8_t>(
+          std::min<uint32_t>(uint32_t{fp_bytes} * 8U, 64U - expected_page_bits));
+      ASSERT_EQ(reader.page_bits(), expected_page_bits);
+      ASSERT_EQ(reader.fp_bits(), expected_fp_bits);
+      ASSERT_EQ(reader.slot_bits(), expected_fp_bits + expected_page_bits);
+
+      for (size_t p = 0; p < num_pages; ++p) {
+        for (size_t k = 0; k < keys_per_page; ++k) {
+          uint32_t got_page = 9999;
+          ASSERT_TRUE(reader.MayMatchPage(
+              "p" + std::to_string(p) + "_k" + std::to_string(k), &got_page));
+          ASSERT_EQ(got_page, p);
+        }
+      }
+
+      // Check false positive rate on absent keys.
+      size_t false_positives = 0;
+      const size_t num_absent = 4000;
+      for (size_t k = 0; k < num_absent; ++k) {
+        uint32_t got_page = 9999;
+        if (reader.MayMatchPage("absent_" + std::to_string(k), &got_page)) {
+          ASSERT_LT(got_page, num_pages);
+          ++false_positives;
+        }
+      }
+      if (fp_bytes >= 2) {
+        ASSERT_LE(false_positives, 10U);
+      } else {
+        // 8-bit fingerprint -> ~1/256 (~15-16 out of 4000).
+        ASSERT_LT(false_positives, 60U);
+      }
+    }
+  }
+}
+
+TEST(TileXorFilterTest, DuplicateKeyKeepsFirstPosition) {
+  TileXorFilterBuilder builder(2);
+  builder.AddKey("dup", 1);
+  builder.AddKey("dup", 5);
+  builder.AddKey("other", 3);
+  std::string encoded;
+  ASSERT_OK(builder.Finish(8, &encoded));
+  TileXorFilterReader reader;
+  ASSERT_OK(reader.Init(encoded, 8));
+  uint32_t page = 99;
+  ASSERT_TRUE(reader.MayMatchPage("dup", &page));
+  ASSERT_EQ(page, 1U);
+  ASSERT_TRUE(reader.MayMatchPage("other", &page));
+  ASSERT_EQ(page, 3U);
+}
+
+TEST(TileXorFilterTest, RejectsMalformedAndTruncatedFilters) {
+  TileXorFilterBuilder builder(1);
+  for (size_t i = 0; i < 40; ++i) {
+    builder.AddKey("k" + std::to_string(i), static_cast<uint32_t>(i % 5));
+  }
+  std::string encoded;
+  ASSERT_OK(builder.Finish(5, &encoded));
+
+  TileXorFilterReader reader;
+  for (size_t len = 0; len < encoded.size(); ++len) {
+    ASSERT_EQ(reader.Init(encoded.substr(0, len), 5).code(),
+              Status::kCorruption)
+        << "len=" << len;
+  }
+  ASSERT_EQ(reader.Init(encoded + "x", 5).code(), Status::kCorruption);
+  ASSERT_EQ(reader.Init(encoded, 4).code(), Status::kCorruption);
+
+  std::string bad = encoded;
+  bad[0] = 99;  // unknown version
+  ASSERT_EQ(reader.Init(bad, 5).code(), Status::kCorruption);
+
+  bad = encoded;
+  bad[2] = 0;  // fp_bits == 0
+  ASSERT_EQ(reader.Init(bad, 5).code(), Status::kCorruption);
+
+  bad = encoded;
+  bad[2] = 63;  // fp_bits + page_bits > 64 (63 + 3 = 66)
+  ASSERT_EQ(reader.Init(bad, 5).code(), Status::kCorruption);
+
+  bad = encoded;
+  bad[4] = bad[5] = bad[6] = bad[7] = 0;  // seg_len == 0
+  ASSERT_EQ(reader.Init(bad, 5).code(), Status::kCorruption);
+}
+
 // Corrupted bytes must never crash the decoder, and whatever it accepts must
 // still be internally consistent.
 TEST(KiWiDirectoryTest, RandomCorruptionIsSafe) {
@@ -494,7 +669,8 @@ struct BuildParams {
   uint32_t delete_key_offset = 0;
   CompressionType compression = kNoCompression;
   uint32_t parallel_threads = 1;
-  bool filters = true;  // per-page Bloom filters
+  bool filters = true;  // per-page Bloom filters (or tile XOR if > 0 below)
+  int xor_filter_bytes = 0;
   const Comparator* comparator = BytewiseComparator();
 };
 
@@ -514,7 +690,11 @@ void BuildKiWiTable(const std::vector<Entry>& entries, const BuildParams& bp,
   bbto.block_size = bp.block_size;
   bbto.kiwi_delete_key_offset = bp.delete_key_offset;
   if (bp.filters) {
-    bbto.filter_policy.reset(NewBloomFilterPolicy(10));
+    if (bp.xor_filter_bytes > 0) {
+      bbto.filter_policy.reset(NewXorFilterPolicy(bp.xor_filter_bytes));
+    } else {
+      bbto.filter_policy.reset(NewBloomFilterPolicy(10));
+    }
   } else {
     bbto.filter_policy = nullptr;
   }
@@ -610,7 +790,11 @@ Status OpenTable(const std::string& contents, const BuildParams& bp,
   BlockBasedTableOptions bbto;
   bbto.block_size = bp.block_size;
   if (bp.filters) {
-    bbto.filter_policy.reset(NewBloomFilterPolicy(10));
+    if (bp.xor_filter_bytes > 0) {
+      bbto.filter_policy.reset(NewXorFilterPolicy(bp.xor_filter_bytes));
+    } else {
+      bbto.filter_policy.reset(NewBloomFilterPolicy(10));
+    }
   }
   out->factory = std::make_unique<BlockBasedTableFactory>(bbto);
   std::unique_ptr<FSRandomAccessFile> source(
@@ -1871,6 +2055,146 @@ TEST(KiWiDeleteFloorTest, FullyDeletedPagesAreNotRead) {
   ASSERT_OK(OpenTable(half.kiwi_table.contents, bp, &untouched));
   ASSERT_EQ(scan(&untouched), entries.size());
   ASSERT_LT(data_block_reads(half.kiwi), data_block_reads(untouched));
+}
+
+TEST(KiWiTileXorTableTest, ReadsMatchPlainFileAndProbeSinglePage) {
+  Random64 rnd(2026);
+  for (int fp_bytes : {1, 2}) {
+    for (uint32_t tile_pages : {2U, 4U, 8U}) {
+      SCOPED_TRACE("fp_bytes=" + std::to_string(fp_bytes) +
+                   " tile_pages=" + std::to_string(tile_pages));
+      BuildParams bp;
+      bp.tile_pages = tile_pages;
+      bp.block_size = 256;
+      bp.filters = true;
+      bp.xor_filter_bytes = fp_bytes;
+
+      // Unique user keys (required for per-tile XOR+page filters).
+      const size_t num_keys = 300;
+      std::vector<Entry> entries;
+      entries.reserve(num_keys);
+      for (size_t k = 0; k < num_keys; ++k) {
+        Entry e;
+        e.ikey = MakeInternalKey(k, 1000, kTypeValue);
+        e.value = MakeValue(100 + (k % 100), 0, 32 + rnd.Uniform(24));
+        entries.push_back(std::move(e));
+      }
+
+      BuiltTable kiwi_table;
+      BuildKiWiTable(entries, bp, &kiwi_table);
+      ASSERT_EQ(kiwi_table.props->filter_size, 0U);
+      const auto& up = kiwi_table.props->user_collected_properties;
+      ASSERT_EQ(up.at(kPropDirectoryBytes),
+                std::to_string(kiwi_table.directory.size()));
+      ASSERT_GT(std::stoull(up.at(kPropFilterBytes)), 0U);
+
+      OpenedTable kiwi;
+      ASSERT_OK(OpenTable(kiwi_table.contents, bp, &kiwi));
+      const Directory* dir =
+          static_cast<const BlockBasedTable*>(kiwi.reader.get())
+              ->TEST_GetKiWiDirectory();
+      ASSERT_NE(dir, nullptr);
+      ASSERT_TRUE(dir->has_tile_filters());
+
+      BuildParams plain_bp = bp;
+      plain_bp.tile_pages = 1;
+      plain_bp.xor_filter_bytes = 0;
+      BuiltTable plain_table;
+      BuildKiWiTable(entries, plain_bp, &plain_table);
+      OpenedTable plain;
+      ASSERT_OK(OpenTable(plain_table.contents, plain_bp, &plain));
+
+      // Forward & backward scans match plain file.
+      std::unique_ptr<InternalIterator> expected(NewIter(plain.reader.get()));
+      std::unique_ptr<InternalIterator> actual(NewIter(kiwi.reader.get()));
+      for (expected->SeekToFirst(), actual->SeekToFirst(); expected->Valid();
+           expected->Next(), actual->Next()) {
+        ExpectSameIterator(expected.get(), actual.get());
+      }
+      ExpectSameIterator(expected.get(), actual.get());
+      for (expected->SeekToLast(), actual->SeekToLast(); expected->Valid();
+           expected->Prev(), actual->Prev()) {
+        ExpectSameIterator(expected.get(), actual.get());
+      }
+      ExpectSameIterator(expected.get(), actual.get());
+
+      // VerifyChecksum and DumpTable work on v2 directories too.
+      ASSERT_OK(kiwi.reader->VerifyChecksum(ReadOptions(),
+                                            TableReaderCaller::kUserVerifyChecksum));
+
+      // Present-key Gets probe exactly 1 filter and read at most 1 data block.
+      Statistics* stats = kiwi.options.statistics.get();
+      for (size_t k = 0; k < num_keys; k += 7) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "key%08" PRIu64, static_cast<uint64_t>(k));
+        const uint64_t checks_before =
+            stats->getTickerCount(BLOOM_FILTER_USEFUL) +
+            stats->getTickerCount(BLOOM_FILTER_FULL_POSITIVE);
+        const uint64_t reads_before =
+            stats->getTickerCount(BLOCK_CACHE_DATA_HIT) +
+            stats->getTickerCount(BLOCK_CACHE_DATA_MISS);
+        GetResult want;
+        GetResult got;
+        ASSERT_OK(DoGet(plain, buf, kMaxSequenceNumber, &want));
+        ASSERT_OK(DoGet(kiwi, buf, kMaxSequenceNumber, &got));
+        ASSERT_EQ(got.state, want.state);
+        ASSERT_EQ(got.value, want.value);
+        const uint64_t checks_after =
+            stats->getTickerCount(BLOOM_FILTER_USEFUL) +
+            stats->getTickerCount(BLOOM_FILTER_FULL_POSITIVE);
+        const uint64_t reads_after =
+            stats->getTickerCount(BLOCK_CACHE_DATA_HIT) +
+            stats->getTickerCount(BLOCK_CACHE_DATA_MISS);
+        ASSERT_EQ(checks_after - checks_before, 1U);
+        ASSERT_LE(reads_after - reads_before, 1U);
+      }
+
+      // Absent keys probe 1 filter per Get and skip data reads on negatives.
+      uint64_t useful = 0;
+      for (size_t k = 0; k < 100; ++k) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "key00000100_absent_%04zu", k);
+        const uint64_t useful_before =
+            stats->getTickerCount(BLOOM_FILTER_USEFUL);
+        const uint64_t reads_before =
+            stats->getTickerCount(BLOCK_CACHE_DATA_HIT) +
+            stats->getTickerCount(BLOCK_CACHE_DATA_MISS);
+        GetResult got;
+        ASSERT_OK(DoGet(kiwi, buf, kMaxSequenceNumber, &got));
+        ASSERT_EQ(got.state, GetContext::kNotFound);
+        const uint64_t useful_delta =
+            stats->getTickerCount(BLOOM_FILTER_USEFUL) - useful_before;
+        const uint64_t reads_delta =
+            stats->getTickerCount(BLOCK_CACHE_DATA_HIT) +
+            stats->getTickerCount(BLOCK_CACHE_DATA_MISS) - reads_before;
+        if (useful_delta == 1U) {
+          ASSERT_EQ(reads_delta, 0U);
+          ++useful;
+        }
+      }
+      ASSERT_GT(useful, 90U);
+
+      // Delete floor drops pages without reconstructing the XOR filter.
+      const uint64_t floor = 150;
+      OpenedTable floored;
+      ASSERT_OK(OpenTable(kiwi_table.contents, bp, &floored, floor));
+      const std::vector<Entry> survivors =
+          SurvivingEntries(entries, bp.delete_key_offset, floor);
+      BuildKiWiTable(survivors, plain_bp, &plain_table);
+      OpenedTable plain_floored;
+      ASSERT_OK(OpenTable(plain_table.contents, plain_bp, &plain_floored));
+      for (size_t k = 0; k < num_keys; k += 5) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "key%08" PRIu64, static_cast<uint64_t>(k));
+        GetResult want;
+        GetResult got;
+        ASSERT_OK(DoGet(plain_floored, buf, kMaxSequenceNumber, &want));
+        ASSERT_OK(DoGet(floored, buf, kMaxSequenceNumber, &got));
+        ASSERT_EQ(got.state, want.state) << buf;
+        ASSERT_EQ(got.value, want.value) << buf;
+      }
+    }
+  }
 }
 
 #endif  // !NDEBUG

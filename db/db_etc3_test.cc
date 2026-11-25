@@ -1137,7 +1137,8 @@ class DBKiWiTest : public DBEtc3Test {
 
   // Small files and memtables so that flushes and leveled compactions, with
   // several output files each, happen within a few thousand writes.
-  Options KiWiOptions(uint32_t tile_pages, uint32_t delete_key_offset = 0) {
+  Options KiWiOptions(uint32_t tile_pages, uint32_t delete_key_offset = 0,
+                      int xor_filter_bytes = 0) {
     Options options = CurrentOptions();
     options.create_if_missing = true;
     options.write_buffer_size = 32 << 10;
@@ -1149,7 +1150,11 @@ class DBKiWiTest : public DBEtc3Test {
     table_options.block_size = 512;
     table_options.kiwi_tile_pages = tile_pages;
     table_options.kiwi_delete_key_offset = delete_key_offset;
-    table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+    if (xor_filter_bytes > 0) {
+      table_options.filter_policy.reset(NewXorFilterPolicy(xor_filter_bytes));
+    } else {
+      table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+    }
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
     return options;
   }
@@ -1627,6 +1632,71 @@ TEST_F(DBKiWiSecondaryDeleteTest, StackableDBForwardsTheCall) {
       stackable.SecondaryDeleteBelow(stackable.DefaultColumnFamily(), 40));
   EraseBelow(&model, 40);
   VerifyModel(model);
+}
+
+TEST_F(DBKiWiSecondaryDeleteTest,
+       TileXorFilterLifecycleAndSecondaryDeletes) {
+  Random64 rnd(20261125);
+  for (int xor_bytes : {1, 2}) {
+    for (uint32_t tile_pages : {4U, 8U}) {
+      SCOPED_TRACE("xor_bytes=" + std::to_string(xor_bytes) +
+                   " tile_pages=" + std::to_string(tile_pages));
+      Options options =
+          KiWiOptions(tile_pages, /*delete_key_offset=*/0, xor_bytes);
+      DestroyAndReopen(options);
+      Model model;
+      uint64_t clock = 100;
+      for (uint64_t round = 0; round < 3; ++round) {
+        for (uint64_t i = 0; i < kNumKeys; ++i) {
+          if ((i + round) % 3 == 0) {
+            const std::string value = TimestampedValue(clock++, &rnd);
+            ASSERT_OK(Put(KiWiKey(i), value));
+            model[KiWiKey(i)] = value;
+          }
+        }
+        ASSERT_OK(Flush());
+      }
+      ASSERT_OK(dbfull()->TEST_WaitForCompact());
+      ASSERT_GT(CountKiWiFiles(), 0U);
+      VerifyModel(model);
+
+      // Delete the oldest half without filter reconstruction, verify reads,
+      // absent-key lookups, reopen persistence, and full compaction cleanup.
+      const uint64_t floor = 100 + (clock - 100) / 2;
+      ASSERT_OK(DeleteBelow(floor));
+      EraseBelow(&model, floor);
+      VerifyModel(model);
+      for (uint64_t k = kNumKeys + 50; k < kNumKeys + 100; ++k) {
+        std::string val;
+        ASSERT_TRUE(db_->Get(ReadOptions(), KiWiKey(k), &val).IsNotFound());
+      }
+
+      Reopen(options);
+      VerifyModel(model);
+
+      CompactRangeOptions rewrite_all;
+      rewrite_all.bottommost_level_compaction =
+          BottommostLevelCompaction::kForce;
+      ASSERT_OK(db_->CompactRange(rewrite_all, nullptr, nullptr));
+      VerifyModel(model);
+      ASSERT_EQ(StoredEntries(), model.size());
+    }
+  }
+
+  // Also check FilterPolicy::CreateFromString("xorfilter:2") with KiWi.
+  std::shared_ptr<const FilterPolicy> parsed;
+  ASSERT_OK(
+      FilterPolicy::CreateFromString(ConfigOptions(), "xorfilter:2", &parsed));
+  Options uri_opts = KiWiOptions(4, 0, 2);
+  auto* bbto = uri_opts.table_factory->GetOptions<BlockBasedTableOptions>();
+  ASSERT_NE(bbto, nullptr);
+  BlockBasedTableOptions custom_bbto = *bbto;
+  custom_bbto.filter_policy = parsed;
+  uri_opts.table_factory.reset(NewBlockBasedTableFactory(custom_bbto));
+  DestroyAndReopen(uri_opts);
+  ASSERT_OK(Put(KiWiKey(1), TimestampedValue(50, &rnd)));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get(KiWiKey(1)), Get(KiWiKey(1)));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

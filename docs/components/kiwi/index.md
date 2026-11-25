@@ -15,11 +15,13 @@ compaction picking), is not implemented here.
 |------|------|
 | Options | `BlockBasedTableOptions::kiwi_tile_pages`, `kiwi_delete_key_offset` in [`include/rocksdb/table.h`](../../../include/rocksdb/table.h) |
 | Public API | `DB::SecondaryDeleteBelow()` in [`include/rocksdb/db.h`](../../../include/rocksdb/db.h) |
-| Tile packing, directory format | `table/block_based/kiwi_tile.{h,cc}` |
+| XOR filter policy | `NewXorFilterPolicy()` in [`include/rocksdb/filter_policy.h`](../../../include/rocksdb/filter_policy.h) |
+| Tile packing, XOR+page filter, directory format | `table/block_based/kiwi_tile.{h,cc}` |
 | Writer | `BlockBasedTableBuilder::FlushTile()` in `table/block_based/block_based_table_builder.cc` |
 | Reader (iterator, floor) | `table/block_based/kiwi_table_iterator.{h,cc}`, `BlockBasedTable::KiWiGet()` |
 | Secondary delete | `db/db_impl/db_impl_kiwi.cc` |
 | Per-file floor in the MANIFEST | `FileMetaData::kiwi_delete_floor`, `kKiWiDeleteFloor` in `db/version_edit.{h,cc}` |
+| Per-tile XOR filter design & benchmarks | [tile_filter.md](tile_filter.md) |
 | Tests | `table/block_based/kiwi_test.cc`, `DBKiWiTest` and `DBKiWiSecondaryDeleteTest` in `db/db_etc3_test.cc` |
 
 ## Layout
@@ -45,25 +47,40 @@ in key. Inside a file, KiWi adds one layer, the **delete tile**:
 Pages are ordinary data blocks (compression, checksums and block cache keys are
 unchanged). The standard index has **one entry per tile**; its handle spans the
 tile's pages, and its key is the usual separator, so index builders and readers
-need no change. The **directory** is one extra meta block
-(`rocksdb.kiwi.directory`) with, for every page, its block handle, its minimum
-and maximum D (the paper's delete fence pointers) and its Bloom filter on the
-key. It is read once when the table is opened and pinned in the table reader
-(counted in `ApproximateMemoryUsage`), like the paper's in-memory fences and
-filters. KiWi files have no whole-file filter.
+need no change. The **directory** is one extra meta block (`rocksdb.kiwi.directory`) read once
+when the table is opened and pinned in the table reader (counted in
+`ApproximateMemoryUsage`), like the paper's in-memory fences and filters. KiWi
+files have no whole-file filter:
+- **Directory v1 (Bloom / Ribbon `filter_policy`)**: stores, per page, its block
+  handle, `[min_delete_key, max_delete_key]` delete fences, and a per-page
+  filter on the user key.
+- **Directory v2 (`NewXorFilterPolicy(...)` / `xorfilter:<bytes>`)**: stores,
+  per tile, one bit-packed XOR filter (`TileXorFilterBuilder` /
+  `TileXorFilterReader`) whose slots encode `[fingerprint || page_index]`
+  (`ceil(log2(num_pages))` page bits), plus per-page block handles and delete
+  fences. This assumes user keys are unique within a tile (keys do not span 2+
+  pages in the same tile). See [tile_filter.md](tile_filter.md).
 
 A file is a KiWi file if and only if it has the table property
 `rocksdb.kiwi.tile_pages` (also `.delete_key_offset`, `.min_delete_key`,
-`.max_delete_key`). There is no `format_version` bump, so older binaries cannot
-tell and must not read KiWi files.
+`.max_delete_key`, `.directory_bytes`, `.filter_bytes`). There is no
+`format_version` bump, so older binaries cannot tell and must not read KiWi
+files.
 
 ## Reading
 
-- **Point lookup**: the index finds the tile; the filters of its pages are
-  probed (one hash per page, the paper's CPU cost); only matching pages are read
-  and merged in key order and fed to `GetContext`, so versions of one key spread
-  over several pages or tiles resolve exactly as in an ordinary table. Expected
-  cost: 1 + h x FPR page reads. `MultiGet` is a loop of `Get`.
+- **Point lookup**: the index finds the tile.
+  - *Per-page filter mode (v1)*: the filter of each page in the tile is probed
+    (one hash per page, the paper's CPU cost); matching surviving pages are read
+    and merged in key order and fed to `GetContext`, so versions of one key
+    spread over several pages or tiles resolve exactly as in an ordinary table.
+    Expected cost: 1 + h x FPR page reads.
+  - *Per-tile XOR+page filter mode (v2)*: one XOR probe per tile returns either
+    a negative (0 page reads) or a single candidate `page_index` (no merging
+    within the tile; only that page is opened if `max_delete_key >= floor`).
+    Secondary deletes do **not** reconstruct the XOR filter: dropped pages are
+    filtered by checking `page_index`'s `max_delete_key < floor` in memory.
+  - `MultiGet` is a loop of `Get`.
 - **Iteration**: `KiWiTableIterator` walks the index and merges the pages of the
   current tile (the paper's cost: a tile is always read whole). Both directions,
   `Seek` and `SeekForPrev` are supported, and it implements the pinning that

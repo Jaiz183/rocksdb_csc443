@@ -43,6 +43,13 @@ add_executable(xor_filter_query_example
 target_link_libraries(xor_filter_query_example
   ${ROCKSDB_LIB})
 
+add_executable(kiwi_tile_filter_bench
+  kiwi_tile_filter_bench.cc)
+target_include_directories(kiwi_tile_filter_bench PRIVATE
+  ${CMAKE_SOURCE_DIR})
+target_link_libraries(kiwi_tile_filter_bench
+  ${ROCKSDB_LIB})
+
 add_executable(multi_processes_example
   EXCLUDE_FROM_ALL
   multi_processes_example.cc)

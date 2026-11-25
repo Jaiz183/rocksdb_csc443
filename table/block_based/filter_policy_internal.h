@@ -311,6 +311,84 @@ class RibbonFilterPolicy : public BloomLikeFilterPolicy {
   std::atomic<int> bloom_before_level_;
 };
 
+// Shared hash/slot derivation for XOR filters (used by both whole-file/block
+// XOR filters and KiWi per-tile XOR+page filters).
+struct XorFilterHash {
+  struct XorSlots {
+    uint32_t idx[3];
+    uint64_t fp;
+  };
+
+  // Mix the input hash with the seed before deriving its slots.
+  static inline uint64_t Remix(uint64_t h, uint8_t seed) {
+    h ^= (uint64_t{seed} + 1) * 0x9E3779B97F4A7C15ULL;
+    h ^= h >> 32;
+    h *= 0x9E3779B97F4A7C15ULL;
+    h ^= h >> 29;
+    return h;
+  }
+
+  // Map a 32-bit value to [0, n) using Lemire's fastrange.
+  static inline uint32_t FastRange32(uint32_t x, uint32_t n) {
+    return static_cast<uint32_t>((uint64_t{x} * n) >> 32);
+  }
+
+  // Rotate a 64-bit hash.
+  static inline uint64_t Rotl64(uint64_t x, int r) {
+    return (x << r) | (x >> (64 - r));
+  }
+
+  // Split a hash into three slot indices and a fingerprint.
+  static inline XorSlots Derive(uint64_t h, uint32_t seg_len) {
+    XorSlots s;
+    // Each index lands in its own segment, so the three slots are distinct.
+    s.idx[0] = FastRange32(static_cast<uint32_t>(h), seg_len);
+    s.idx[1] =
+        FastRange32(static_cast<uint32_t>(Rotl64(h, 21)), seg_len) + seg_len;
+    s.idx[2] = FastRange32(static_cast<uint32_t>(Rotl64(h, 42)), seg_len) +
+               2 * seg_len;
+    s.fp = h;
+    return s;
+  }
+
+  // Apply the seed-dependent mix before deriving the slots and fingerprint.
+  static inline XorSlots SeededDerive(uint64_t h, uint32_t seg_len,
+                                      uint8_t seed) {
+    XorSlots slots = Derive(Remix(h, seed), seg_len);
+    slots.fp = Remix(h ^ 0xD6E8FEB86659FD93ULL, seed);
+    return slots;
+  }
+};
+
+// User-facing XOR filter policy (see NewXorFilterPolicy).
+class XorFilterPolicy : public BuiltinFilterPolicy {
+ public:
+  explicit XorFilterPolicy(int fingerprint_bytes);
+
+  static const char* kClassName() { return "rocksdb.XorFilter"; }
+  static const char* kNickName() { return "xorfilter"; }
+
+  const char* Name() const override { return kClassName(); }
+  const char* NickName() const override { return kNickName(); }
+  bool IsInstanceOf(const std::string& id) const override {
+    if (id == kClassName() || id == kNickName()) {
+      return true;
+    }
+    return BuiltinFilterPolicy::IsInstanceOf(id);
+  }
+  std::string GetId() const override {
+    return std::string(Name()) + ":" + std::to_string(fingerprint_bytes_);
+  }
+
+  FilterBitsBuilder* GetBuilderWithContext(
+      const FilterBuildingContext& context) const override;
+
+  uint8_t fingerprint_bytes() const { return fingerprint_bytes_; }
+
+ private:
+  const uint8_t fingerprint_bytes_;
+};
+
 // For testing only, but always constructable with internal names
 namespace test {
 
