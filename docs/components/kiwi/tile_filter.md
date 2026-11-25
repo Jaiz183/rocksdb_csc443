@@ -1,220 +1,276 @@
-# KiWi Per-Tile XOR+Page Filter (`tile-filter`)
+# KiWi Tile- and SST-Granular XOR Filters
 
-This note documents the baseline per-tile XOR+page filter implementations
-(`kiwi_tile_xor_baseline` and `kiwi_tile_xor_baseline_16bit`) introduced on the
-`tile-filter` branch and benchmarked against both pre-XOR baselines and eager
-filter reconstruction.
+This note documents the KiWi `Directory` filter formats in
+`rocksdb.kiwi.directory`:
+- **Directory v1**: Per-page Bloom/Ribbon filters (`BloomFilterPolicy` /
+  `RibbonFilterPolicy`).
+- **Directory v2 (`kiwi_tile_xor_baseline`)**: Tile-granular 3-way XOR+page
+  filters (`NewXorFilterPolicy(fingerprint_bytes)` or `"xorfilter:<bytes>"`).
+- **Directory v3 (`kiwi_sst_xor_baseline`)**: SST-granular 3-way XOR+page
+  filters (`{id=xorfilter:<bytes>;kiwi_file_filter=true}`), with automatic
+  fallback to Directory v2 if a multi-version user key crosses a tile boundary.
 
-- Implementation:
-  - [`XorFilterHash` / `XorFilterPolicy`](../../../table/block_based/filter_policy_internal.h)
-  - [`TileXorFilterBuilder`, `TileXorFilterReader`, `Directory` v2](../../../table/block_based/kiwi_tile.h)
-  - [`BlockBasedTableBuilder::FlushTile()`](../../../table/block_based/block_based_table_builder.cc)
-  - [`BlockBasedTable::KiWiGet()`](../../../table/block_based/block_based_table_reader.cc)
-  - [`examples/kiwi_tile_filter_bench.cc`](../../../examples/kiwi_tile_filter_bench.cc)
-- Optimizations & augmentations (`tile-filter-opt`): [tile_filter_optimizations.md](tile_filter_optimizations.md)
+Implementation paths:
+- [`XorFilterHash` / `XorFilterPolicy`](../../../table/block_based/filter_policy_internal.h)
+- [`TileXorFilterBuilder`, `TileXorFilterReader`, `DirectoryBuilder`, `Directory`](../../../table/block_based/kiwi_tile.h)
+- [`BlockBasedTableBuilder::FlushTile()` & `WriteKiWiDirectoryBlock()`](../../../table/block_based/block_based_table_builder.cc)
+- [`BlockBasedTable::KiWiGet()`](../../../table/block_based/block_based_table_reader.cc)
 
-## Design
+## 1. `TileXorFilter` Slot Encoding and Construction
 
-When `BlockBasedTableOptions::kiwi_tile_pages >= 2` is paired with
-`NewXorFilterPolicy(fingerprint_bytes)` (or `"xorfilter:<bytes>"`), KiWi writes
-**Directory v2** (`DirectoryBuilder::kFormatVersionTileFilter = 2`): instead of
-`h` separate Bloom filters per tile, each tile carries one serialized
-`TileXorFilter` in `rocksdb.kiwi.directory`.
+Both Directory v2 (per-tile) and Directory v3 (per-SST) use
+`TileXorFilterBuilder` and `TileXorFilterReader`.
 
-### 1. Slot Encoding (`[fingerprint || page_index]`)
+### Slot Layout (`[fingerprint || page_index]`)
 
-For a tile with `num_pages` pages (`1 <= num_pages <= kiwi_tile_pages`), let:
+Given a page bound `num_pages` (`1 <= num_pages <= kiwi_tile_pages`), let:
 - `page_bits = ceil(log2(num_pages))` (`0` when `num_pages == 1`)
 - `fp_bits = min(8 * fingerprint_bytes, 64 - page_bits)`
 - `slot_bits = fp_bits + page_bits` (`1 <= slot_bits <= 64`)
 
-Every key added to the tile is mapped via `XorFilterHash::SeededDerive(hash,
-seg_len, seed)` to three distinct segment slots `idx[0], idx[1], idx[2]` and a
-`fp_bits`-bit fingerprint `fp`. During hypergraph peeling and assignment, the
-target value solved for each key `(user_key, page_index)` is:
+Each key hash is mapped via `XorFilterHash::SeededDerive(hash, seg_len, seed)` to
+three distinct segment indices `idx[0], idx[1], idx[2]` across `3 * seg_len`
+slots and an `fp_bits`-bit fingerprint `fp`. During hypergraph peeling and
+reverse assignment, the target value solved for `(user_key, page_index)` is:
 
 ```
-target = (fp << page_bits) | page_index
+target = page_bits == 0 ? fp : ((fp << page_bits) | page_index)
 ```
 
-Slots are bit-packed little-endian into `(3 * seg_len * slot_bits + 7) / 8`
-bytes after an 8-byte header (`version=1, seed, fp_bits, page_bits, seg_len`).
+### Tight Sizing, Peeling, and Bit-Packing
 
-On lookup (`BlockBasedTable::KiWiGet` -> `Directory::TileMayMatch`):
-1. One `GetSliceHash64(user_key)` and 3 XOR slot reads produce `combined`.
-2. **True / false negative**: if `(combined >> page_bits) != fp` or
-   `(combined & page_mask) >= num_pages`, the tile cannot contain `user_key`
-   (`BLOOM_FILTER_USEFUL` incremented, `0` pages opened).
-3. **True / false positive**: `BLOOM_FILTER_FULL_POSITIVE` is incremented and
-   **only `tile.pages[page_index]`** is passed to
-   `KiWiTableIterator::NewPageIterator()`.
+- **Tight segment sizing**: `TileXorFilterBuilder::Finish()` starts at
+  `base_unrounded = floor(1.23 * num_keys) + 4` (`seg_len = max(2,
+  ceil(base_unrounded / 3))`). If 8 consecutive seeds fail to peel, `seg_len`
+  steps upward by `max(1, seg_len / 64)` until peeling succeeds (up to 256
+  attempts).
+- **Single-derive degree/XOR peeler**: Per seed attempt, slot indices and
+  fingerprints are derived once into `derived_` while maintaining flat
+  `degree_[]` and `xor_edge_[]` arrays, avoiding pointer-based sets or repeated
+  hash derivations during peeling and reverse assignment.
+- **Serialized format**: An 8-byte header
+  `[version=1, seed, fp_bits, page_bits, fixed32(seg_len)]` followed by
+  `ceil(3 * seg_len * slot_bits / 8)` bytes packed via a 64-bit little-endian
+  streaming accumulator (`TileXorFilterReader::ReadSlot` decodes each slot with
+  an unaligned 64-bit load and shift on the fast path).
 
-### 2. Unique-Sort-Key Assumption
+### Unique-Sort-Key Assumption
 
-Because a 3-way XOR filter solves one fixed-width value per distinct key hash
-(duplicate 3-edges make hypergraph peeling impossible), per-tile XOR+page
-filters assume **sort keys (`user_key`) are unique within each tile** and **do
-not span 2 or more pages in the same tile**. As a safety guard,
-`TileXorFilterBuilder::Finish()` deduplicates equal 64-bit hashes keeping the
-earliest insertion position (newest internal key), so peeling never fails if an
-internal-key version ever collides, but multi-page version resolution within one
-tile is not supported in v2 tile-filter mode. Use Bloom/Ribbon per-page filters
-(v1) when multiple versions of the same user key can coexist across pages of one
-tile.
+Because a 3-way XOR filter maps each distinct key hash to a single fixed-width
+value, `TileXorFilter` assumes a `user_key` does not need to resolve versions
+across multiple pages of the same tile. As a safety guard against hash or
+same-tile version collisions, `TileXorFilterBuilder::Finish()` sorts entries by
+`(hash, order)` and deduplicates equal hashes keeping the earliest insertion
+order (the newest internal key), so hypergraph peeling never fails on duplicate
+hashes. Workloads that require merging multiple versions of the same user key
+across pages within a single tile should use Directory v1 per-page Bloom/Ribbon
+filters.
 
-### 3. Avoiding Filter Reconstruction on Page Drops
+## 2. Directory Formats (`v1`, `v2`, `v3`)
 
-In a 3-way XOR filter, overwriting the peeled pivot slot `B[v]` of a key on a
-dropped page **is unsafe**: during peeling, keys on surviving pages often
-assigned their own pivot vertices after an edge on the dropped page was removed,
-so their reverse-assignment values `B[pivot']` depend algebraically on `B[v]`.
-Mutating `B[v]` in-place would corrupt surviving keys on other pages unless the
-entire peel dependency DAG were retained and re-propagated.
+`DirectoryBuilder` encodes `rocksdb.kiwi.directory` in one of three versions:
 
-Instead, KiWi avoids filter reconstruction completely with **zero cost and zero
-false negatives**:
-- `DB::SecondaryDeleteBelow(floor)` records `kiwi_delete_floor = floor` in the
-  MANIFEST (`O(files)` metadata only) without touching the XOR filter.
-- On a lookup, `TileMayMatch` returns the single `page_index` for any matching
-  or false-positive key.
-- `KiWiTableIterator::NewPageIterator()` immediately checks
-  `tile.pages[page_index].max_delete_key < floor` in the pinned directory and
-  returns `nullptr` without reading the page from disk.
-- Physical shrinkage of both the SST pages and the tile XOR filters occurs when
-  compaction rewrites the file.
+```
+v1: 1(1B) varint32(num_tiles)
+      [varint64(num_pages) (BlockHandle fixed64(min_d) fixed64(max_d) lp-bloom)+]*
 
----
+v2: 2(1B) varint32(num_tiles)
+      [varint64(num_pages) lp-tile_xor_filter (BlockHandle fixed64(min_d) fixed64(max_d))+]*
 
-## Benchmark Results
+v3: 3(1B) varint32(num_tiles) lp-file_xor_filter
+      [varint64(num_pages) (BlockHandle fixed64(min_d) fixed64(max_d))+]*
+```
 
-Measured in release mode (`DEBUG_LEVEL=0`, `-DNDEBUG -fno-rtti -O2`) on a
-48-core Linux host with `examples/kiwi_tile_filter_bench` (4 KB data blocks,
-uncompressed, 100-byte values carrying an 8-byte big-endian delete key `D`,
-`write_buffer_size = 64 MB` for Suites 1--2 and `1 MB` / `L1 = 1 MB` /
-multiplier `5` for Suite 3).
+On table open, `Directory::Decode()`:
+1. Validates all tile counts, page counts, monotonic tile start offsets,
+   non-inverted `[min_delete_key, max_delete_key]` ranges, and `TileXorFilter`
+   headers/payload lengths.
+2. Stores contiguous `tile_offsets_` (`uint64_t` per tile) for cache-friendly
+   binary search in `Directory::FindTile()` and `tile_max_delete_key_` for
+   O(1) `TileAllDeleted(tile_index, floor)` checks.
+3. In v2 and v3 modes, discards the already-decoded page records and filter
+   headers from `contents_`, shrinking `contents_` to hold only the raw packed
+   XOR slot payloads referenced by `TileXorFilterReader`.
 
-Pre-XOR baselines included in every benchmark:
-- `plain_bloom10`: Stock RocksDB (`kiwi_tile_pages = 0`, `NewBloomFilterPolicy(10)`)
-- `kiwi_no_filter`: KiWi without any filter (`filter_policy = nullptr`)
-- `kiwi_page_bloom10`: Original KiWi per-page 10-bit Bloom filters (v1)
+`BlockBasedTableBuilder::EstimatedFileSize()` and `EstimatedTailSize()` include
+`EstimateKiWiDirectoryBytes()` (accounting for buffered `TilePacker` entries and
+the growing KiWi directory / pending v3 file filter) so compaction file cuts
+respect `target_file_size_base`.
 
-Baseline per-tile XOR configurations (`kiwi_{granularity}_xor_{description}`):
-- `kiwi_tile_xor_baseline`: Per-tile XOR+page filter with 1-byte (8-bit) fingerprint (`8 + ceil(log2(h))` bits/slot, `+32` segment slack)
-- `kiwi_tile_xor_baseline_16bit`: Per-tile XOR+page filter with 2-byte (16-bit) fingerprint (`16 + ceil(log2(h))` bits/slot, `+32` segment slack)
+## 3. Directory v2: Tile-Granular XOR (`kiwi_tile_xor_baseline`)
 
-Query metrics are split into:
-- **Memory-access time** (`mem_*`): 512 MB `LRUCache` pre-warmed by full scan,
-  `ReadOptions::read_tier = kBlockCacheTier`, asserting
-  `PerfContext::block_read_count == 0`.
-- **I/O-inclusive time** (`io_*`): `no_block_cache = true`, measuring wall time
-  and `PerfContext::block_read_count` per query.
+Configured via `NewXorFilterPolicy(fingerprint_bytes)` or `"xorfilter:<bytes>"`
+with `kiwi_tile_pages >= 2`:
+- `BlockBasedTableBuilder::FlushTile()` builds one `TileXorFilter` per tile over
+  that tile's `pages.size()` pages.
+- On `BlockBasedTable::KiWiGet()`, the SST index locates the candidate tile via
+  a stack-allocated `IndexBlockIter`. `Directory::TileMayMatch()` performs one
+  hash and three slot reads:
+  - **Negative** (fingerprint mismatch, `page_index >= num_pages`, or
+    `page_index < min_live_page_`): increments `BLOOM_FILTER_USEFUL` and opens 0
+    data blocks.
+  - **Positive**: increments `BLOOM_FILTER_FULL_POSITIVE` and opens only
+    `tile.pages[page_index]` via `KiWiTableIterator::NewPageIterator()`.
 
-### Suite 1: Query-Heavy Workload (200k unique keys, 300k queries each)
+### Secondary Deletes Without Filter Reconstruction
 
-| `h` | Config | Flush (ms) | Mem Present (ns/op) | Mem Absent (ns/op) | Mem 95%Get/5%Put (ns/op) | IO Present (us/op) | IO Absent (us/op) | Absent FP (%) | Filter Checks/Get | Filter (bits/key) | Dir (bits/key) | TableReader Mem (KB) | SST (MB) |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | `plain_bloom10` | 133.7 | 1850.0 | 444.5 | 1602.2 | 3.85 | 0.44 | 0.885% | 1.00 | 10.16 | 0.00 | 402.7 | 22.11 |
-| 4 | `kiwi_no_filter` | 121.1 | 4718.4 | 4440.7 | 4579.3 | 13.35 | 12.54 | 0.000% | 0.00 | 0.00 | 5.53 | 889.1 | 21.94 |
-| 4 | `kiwi_page_bloom10` | 125.9 | 2539.1 | 983.9 | 1748.7 | 4.22 | 0.99 | 0.069% | 4.00 | 16.48 | 22.01 | 1291.5 | 22.33 |
-| 4 | `kiwi_tile_xor_baseline` | 111.8 | 1654.5 | 915.4 | 1594.5 | 3.82 | 0.91 | 0.402% | 1.00 | 15.28 | 20.70 | 921.2 | 22.30 |
-| 4 | `kiwi_tile_xor_baseline_16bit` | 109.8 | 1660.7 | 871.9 | 1587.2 | 3.65 | 0.88 | 0.003% | 1.00 | 27.11 | 32.52 | 1209.8 | 22.58 |
-| 8 | `kiwi_no_filter` | 106.0 | 5160.0 | 5267.7 | 6058.2 | 20.98 | 21.22 | 0.000% | 0.00 | 0.00 | 5.52 | 869.7 | 21.98 |
-| 8 | `kiwi_page_bloom10` | 111.8 | 1917.2 | 1033.1 | 1735.3 | 3.94 | 1.03 | 0.072% | 8.00 | 16.54 | 22.06 | 1273.5 | 22.37 |
-| 8 | `kiwi_tile_xor_baseline` | 122.8 | 1642.7 | 848.4 | 1564.4 | 3.73 | 0.91 | 0.398% | 1.00 | 15.07 | 20.41 | 852.9 | 22.33 |
-| 8 | `kiwi_tile_xor_baseline_16bit` | 121.4 | 1698.4 | 847.6 | 1627.2 | 3.72 | 0.86 | 0.001% | 1.00 | 25.86 | 31.20 | 1116.3 | 22.59 |
-| 16 | `kiwi_no_filter` | 99.2 | 9738.4 | 9309.7 | 9361.0 | 41.80 | 41.45 | 0.000% | 0.00 | 0.00 | 5.52 | 855.9 | 22.02 |
-| 16 | `kiwi_page_bloom10` | 119.6 | 1893.3 | 1127.8 | 1835.7 | 4.21 | 1.17 | 0.073% | 15.99 | 16.57 | 22.09 | 1260.5 | 22.42 |
-| 16 | `kiwi_tile_xor_baseline` | 125.3 | 1531.3 | 799.2 | 1479.4 | 3.63 | 0.81 | 0.381% | 1.00 | 15.59 | 20.90 | 830.0 | 22.39 |
-| 16 | `kiwi_tile_xor_baseline_16bit` | 120.7 | 1512.6 | 799.5 | 1521.3 | 3.60 | 0.80 | 0.003% | 1.00 | 25.91 | 31.21 | 1081.7 | 22.63 |
+Mutating peeled XOR filter slots in-place when pages are dropped is
+algebraically unsafe because surviving keys whose pivot slots were assigned
+later in reverse peeling order depend on the slot values of earlier keys.
+Instead, KiWi handles secondary deletes without touching or re-peeling any XOR
+filter:
+- `DB::SecondaryDeleteBelow(floor)` unlinks whole SSTs whose
+  `max_delete_key < floor` directly in the `VersionEdit` and records
+  `kiwi_delete_floor = floor` on partially expired SSTs.
+- When opening or updating a floored reader, `Directory::ApplyDeleteFloor(floor)`
+  computes each tile's dead prefix `min_live_page_` (`pages[p].max_delete_key <
+  floor`) so `TileXorFilterReader::MayMatchPage()` rejects dropped prefix pages
+  immediately, and compacts `contents_` to free the XOR filter payloads of any
+  100%-deleted tiles from memory.
+- Physical reclamation of partially deleted tiles happens during normal
+  compaction.
 
-Key observations:
-- **1 filter probe vs `h` probes**: `kiwi_tile_xor_baseline` and
-  `kiwi_tile_xor_baseline_16bit` stay at `1.00` filter check per lookup
-  regardless of `h`, while `kiwi_page_bloom10` probes `4`, `8`, and `16` Bloom
-  filters per lookup.
-- **Query latency**: At `h = 16`, `kiwi_tile_xor_baseline` improves memory-access
-  query time by **19.1%** on present keys (`1531 vs 1893 ns`) and **29.1%** on
-  absent keys (`799 vs 1128 ns`), and improves I/O-inclusive query time by
-  **13.8%** on present keys (`3.63 vs 4.21 us`) and **30.8%** on absent keys
-  (`0.81 vs 1.17 us`).
-- **Space & pinned memory**: Because `FastLocalBloom` enforces a minimum of one
-  64-byte (512-bit) cache line per page, `kiwi_page_bloom10` actually uses
-  `16.5 bits/key` on 4 KB pages (~31 keys/page), plus `h` `FilterBitsReader`
-  objects per tile (`1260--1292 KB` `TableReader` memory). `kiwi_tile_xor_baseline`
-  pools the entire tile into one filter (`15.1--15.6 bits/key`) and cuts
-  `TableReader` memory by **28.7%--34.2%** (`830--921 KB`).
+## 4. Directory v3: SST-Granular XOR (`kiwi_sst_xor_baseline`)
 
-### Suite 2: Flush + Secondary Delete & Filter Reconstruction (`h = 8`, 200k keys)
+Configured via `{id=xorfilter:<bytes>;kiwi_file_filter=true}` with
+`kiwi_tile_pages >= 2`:
+- Because tiles partition the key space into disjoint sort-key intervals, the
+  SST index already identifies which tile holds a present key; the filter only
+  needs to reject absent keys and identify the **tile-local** `page_index` in
+  `[0, max_tile_pages)` (`ceil(log2(max_tile_pages))` bits per slot, independent
+  of the number of tiles in the SST).
+- On `BlockBasedTable::KiWiGet()`, `Directory::FileMayMatch(user_key,
+  &local_page_index)` runs **before** `NewIndexIterator()`:
+  - **Negative**: increments `BLOOM_FILTER_USEFUL` and returns immediately with
+    0 index-block and 0 data-block lookups.
+  - **Positive**: increments `BLOOM_FILTER_FULL_POSITIVE`, seeks the SST index
+    to locate the tile, and opens only `tile.pages[local_page_index]` (skipping
+    it without I/O if `max_delete_key < floor`).
+- **Automatic cross-tile fallback**: If a multi-version user key spans a tile
+  boundary (`prev_tile_last_user_key == first_ukey` in `FlushTile()`), a single
+  SST-wide XOR entry cannot represent two different tile-local page indices for
+  the same user key. `BlockBasedTableBuilder::WriteKiWiDirectoryBlock()` detects
+  this during build and automatically emits Directory v2 per-tile XOR filters
+  for that SST so multi-tile version resolution remains exact.
 
-Comparing `plain_bloom10` (Delete + Flush + `CompactRange(kForce)`),
-`kiwi_no_filter`, `kiwi_page_bloom10`, **eager tile-XOR reconstruction**
-(reading surviving pages of affected tiles and re-peeling `TileXorFilterBuilder`),
-and **lazy `fp || page_idx` floor invalidation** (`DB::SecondaryDeleteBelow`):
+## 5. Mixed Secondary-Delete + Point-Query Benchmark Results
 
-| Drop | Config | Delete / Recon Time (ms) | Compact Reclaim (ms) | Deleted Key Q (mem ns / io us / io_blk) | Surviving Key Q (mem ns / io us) | Filter KB (Before -> Lazy -> Eager -> Comp) | TableReader KB (Before -> Comp) | SST MB (Before -> Lazy -> Comp) |
-|---|---|---|---|---|---|---|---|---|
-| 10% | `plain_bloom10` (full rewrite) | 258.78 | -- | 395.6 / 0.42 / 0.01 | 1536.2 / 3.89 | 247.9 -> 223.9 -> -- -> 223.9 | 402.7 -> 362.7 | 22.11 -> 19.91 -> 19.91 |
-| 10% | `kiwi_no_filter` | 0.67 | 130.69 | 5299.6 / 21.37 / 7.92 | 5556.6 / 21.79 | 0.0 -> 0.0 -> -- -> 0.0 | 869.7 -> 781.4 | 21.98 -> 21.98 -> 19.79 |
-| 10% | `kiwi_page_bloom10` | 0.93 | 132.51 | 1759.5 / 3.66 / 0.91 | 1864.0 / 4.01 | 403.8 -> 403.8 -> -- -> 363.5 | 1273.5 -> 1144.9 | 22.37 -> 22.37 -> 20.14 |
-| 10% | `kiwi_tile_xor_baseline` (**eager recon**) | **31.58** (11.73 io + 18.18 peel) | -- | -- | -- | 368.0 -> -- -> **336.2** -> -- | -- | 22.33 -> 22.33 -> -- |
-| 10% | `kiwi_tile_xor_baseline` (**lazy floor**) | **1.05** | 145.88 | 1617.3 / 3.48 / 0.90 | 1682.8 / 3.77 | 368.0 -> 368.0 -> -- -> 331.2 | 852.9 -> 766.3 | 22.33 -> 22.33 -> 20.11 |
-| 10% | `kiwi_tile_xor_baseline_16bit` (**lazy floor**) | **0.82** (eager: 32.62) | 144.39 | 1612.8 / 3.49 / 0.90 | 1689.2 / 3.70 | 631.4 -> 631.4 -> 576.2 -> 568.2 | 1116.3 -> 1003.3 | 22.59 -> 22.59 -> 20.34 |
-| 50% | `plain_bloom10` (full rewrite) | 294.46 | -- | 398.9 / 0.43 / 0.01 | 1584.1 / 3.53 | 247.9 -> 119.9 -> -- -> 119.9 | 402.7 -> 202.7 | 22.11 -> 11.06 -> 11.06 |
-| 50% | `kiwi_no_filter` | 0.52 | 77.73 | 3626.1 / 12.78 / 4.62 | 3641.3 / 12.99 | 0.0 -> 0.0 -> -- -> 0.0 | 869.7 -> 436.0 | 21.98 -> 21.98 -> 11.01 |
-| 50% | `kiwi_page_bloom10` | 1.27 | 81.16 | 1167.4 / 1.51 / 0.14 | 1816.4 / 3.91 | 403.8 -> 403.8 -> -- -> 202.0 | 1273.5 -> 638.0 | 22.37 -> 22.37 -> 11.21 |
-| 50% | `kiwi_tile_xor_baseline` (**eager recon**) | **19.49** (7.08 io + 11.19 peel) | -- | -- | -- | 368.0 -> -- -> **197.7** -> -- | -- | 22.33 -> 22.33 -> -- |
-| 50% | `kiwi_tile_xor_baseline` (**lazy floor**) | **0.79** | 86.63 | 1016.1 / 1.34 / 0.14 | 1681.8 / 3.61 | 368.0 -> 368.0 -> -- -> 184.0 | 852.9 -> 427.6 | 22.33 -> 22.33 -> 11.19 |
-| 50% | `kiwi_tile_xor_baseline_16bit` (**lazy floor**) | **1.01** (eager: 18.66) | 87.57 | 1016.2 / 1.33 / 0.14 | 1839.3 / 3.69 | 631.4 -> 631.4 -> 341.5 -> 315.7 | 1116.3 -> 559.3 | 22.59 -> 22.59 -> 11.32 |
-| 75% | `plain_bloom10` (full rewrite) | 321.51 | -- | 395.1 / 0.42 / 0.01 | 1417.2 / 3.48 | 247.9 -> 63.9 -> -- -> 63.9 | 402.7 -> 106.7 | 22.11 -> 5.54 -> 5.54 |
-| 75% | `kiwi_page_bloom10` | 1.80 | 46.93 | 1146.8 / 1.39 / 0.10 | 1770.7 / 3.87 | 403.8 -> 403.8 -> -- -> 101.0 | 1273.5 -> 320.2 | 22.37 -> 22.37 -> 5.62 |
-| 75% | `kiwi_tile_xor_baseline` (**lazy floor**) | **0.87** (eager: 10.44) | 50.02 | 976.8 / 1.19 / 0.09 | 1599.7 / 3.60 | 368.0 -> 368.0 -> 107.7 -> 92.0 | 852.9 -> 215.0 | 22.33 -> 22.33 -> 5.61 |
+Release-mode (`DEBUG_LEVEL=0`, `-O2 -DNDEBUG -fno-rtti`) raw measurements from
+[`examples/kiwi_tile_filter_bench.cc`](../../../examples/kiwi_tile_filter_bench.cc)
+(percentage improvements summarized in
+[`benchmark_summary.md`](benchmark_summary.md)):
 
-Key observations:
-- **Avoiding reconstruction cuts delete latency by 12x--30x**: Lazy
-  `SecondaryDeleteBelow` finishes in **0.79--1.09 ms** across all drop
-  fractions, versus **10.44--32.62 ms** for eager tile-XOR filter
-  reconstruction (`3.91--11.73 ms` reading surviving pages + `5.50--19.45 ms`
-  re-peeling `TileXorFilterBuilder`), and **258.8--321.5 ms** for `plain_bloom10`
-  full-tree compaction.
-- **Lazy deleted-key queries skip dropped pages with 0 I/O**: At 10% drop, edge
-  pages still hold surviving keys so `io_blk = 0.90`; at 25% / 50% / 75% drop,
-  `TileMayMatch` routes deleted keys to pages whose `max_delete_key < floor`,
-  cutting `io_blk` to `0.26 -> 0.14 -> 0.09` (`977 ns` mem / `1.19 us` I/O at
-  75%).
+- **Dataset / LSM**: `N = 120,000` shuffled keys (`15 B` keys, `100 B` values
+  with 8-byte big-endian `D in [1 .. 120,000]` at offset `0`), `4 KB`
+  uncompressed blocks, `write_buffer_size = 2 MB`,
+  `target_file_size_base = 2 MB`, `max_bytes_for_level_base = 4 MB`,
+  `max_bytes_for_level_multiplier = 4.0` (~6--8 multi-level SSTs, `~13.4 MB`
+  after `Flush` + `WaitForCompact`).
+- **Mixed workload (`100,000` key-equivalent ops per split)**: 5 splits
+  (`0-100`, `25-75`, `50-50`, `75-25`, `100-0`) interleaving `del_pct`
+  secondary range deletes (`1,000` keys per delete, advancing `floor` up to
+  `1 + 1000 * del_pct`, leaving `>= 20,000` live keys at `100-0`) with
+  `1000 * query_pct` point `Get` queries (50% existing keys across `[0 .. N-1]`
+  including deleted and surviving keys, 50% absent keys, all verified against
+  `D >= current_floor`).
+- **Candidates**:
+  - `plain_bloom10`: non-KiWi (`h = 0`) + `NewBloomFilterPolicy(10)` (executes
+    secondary deletes via iterator scan + `WriteBatch` `Delete` + `Flush`;
+    independent of `h`, run once per split and repeated for reference).
+  - `kiwi_page_bloom10`: KiWi (`kiwi_tile_pages = h`) +
+    `NewBloomFilterPolicy(10)` (Directory v1).
+  - `kiwi_tile_xor_baseline`: KiWi (`kiwi_tile_pages = h`) +
+    `NewXorFilterPolicy(1)` (8-bit tile-granular XOR, Directory v2).
+  - `kiwi_sst_xor_baseline`: KiWi (`kiwi_tile_pages = h`) +
+    `{id=xorfilter:1;kiwi_file_filter=true}` (8-bit SST-granular XOR, Directory
+    v3).
+- **Columns**:
+  - `Wall (ms)`, `Total (kops/s)` (`(deleted_keys + num_queries) / wall_s`),
+    `Raw (kops/s)` (`(num_range_dels + num_queries) / wall_s`),
+    `Del (k keys/s)`, `Range Del (/s, ms)`, and `IO Get (kqps, us, blk)` come
+    from the uncached I/O-inclusive pass (`no_block_cache = true`).
+  - `Mem Get (kqps, ns)` comes from the warmed `512 MB LRUCache` pass
+    (`ReadTier::kBlockCacheTier`, asserting `PerfContext::block_read_count == 0`).
+  - `w_amp (wl_MB)` reports total `(FLUSH_WRITE_BYTES + COMPACT_WRITE_BYTES) /
+    (preload_user_bytes + workload_tombstone_user_bytes)` and workload-only
+    write MB after `WaitForCompact`.
+  - `sp_amp` reports `live_sst_bytes_after_workload /
+    live_sst_bytes_after_forced_bottommost_CompactRange`.
+  - `flt_bpk / dir_bpk`, `tr_KB (B->A)` (pinned `TableReader` RAM before ->
+    after workload), and `sst_MB (B->A / C)` (live SST MB before -> after
+    workload, plus compacted MB `C`) capture memory and disk footprint.
 
-### Suite 3: Delete-Heavy LSM Workloads (`seqdel` and `churn`, `h = 8`)
+### Tile Size `h = 4`
 
-Modeled on `tombstone_bench` (`1 MB` write buffer/target file/L1 base,
-multiplier `5`, `200k` preloaded keys + `200k` ops, verified against an exact
-in-memory model):
-- `seqdel`: `30%` sequential point deletes sweeping the key space + `70%` puts.
-- `churn`: `90%` delete/reinsert toggling of `20k` hot keys + `10%` puts.
+| `h` | Split | Candidate | Wall (ms) | Total (kops/s) | Raw (kops/s) | Del (k keys/s) | Range Del (/s, ms) | IO Get (kqps, us, blk) | Mem Get (kqps, ns) | `w_amp` (`wl_MB`) | `sp_amp` | `flt_bpk` / `dir_bpk` | `tr_KB` (`B->A`) | `sst_MB` (`B->A` / `C`) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | `0-100` | `plain_bloom10` | 212.8 | 469.8 | 469.8 | N/A | N/A | 469.8 (2.13, 0.51) | 730.2 (1369.5) | 3.10 (0.00) | 1.00x | 10.08 / 0.00 | 266.6->266.6 | 13.28->13.28 (13.27) |
+| 4 | `0-100` | `kiwi_page_bloom10` | 258.8 | 386.4 | 386.4 | N/A | N/A | 386.4 (2.59, 0.50) | 686.5 (1456.6) | 2.99 (0.00) | 1.00x | 16.49 / 21.84 | 802.9->802.9 | 13.42->13.42 (13.41) |
+| 4 | `0-100` | `kiwi_tile_xor_baseline` | 244.2 | 409.5 | 409.5 | N/A | N/A | 409.5 (2.44, 0.50) | 756.8 (1321.3) | 3.13 (0.00) | 1.00x | 13.02 / 18.22 | 439.2->439.2 | 13.36->13.36 (13.35) |
+| 4 | `0-100` | `kiwi_sst_xor_baseline` | 213.7 | 468.0 | 468.0 | N/A | N/A | 468.0 (2.14, 0.50) | 951.1 (1051.4) | 2.98 (0.00) | 1.00x | 12.31 / 17.41 | 411.2->411.2 | 13.35->13.35 (13.34) |
+| 0 | `25-75` | `plain_bloom10` | 892.4 | 112.1 | 84.1 | 37.7 | 37.7 (26.539) | 327.6 (3.05, 0.53) | 800.2 (1249.7) | 4.13 (29.13) | 1.18x | 10.43 / 0.00 | 278.1->279.7 | 13.31->12.44 (10.51) |
+| 4 | `25-75` | `kiwi_page_bloom10` | 216.4 | 462.1 | 346.7 | 1360.9 | 1360.9 (0.735) | 378.7 (2.64, 0.49) | 685.0 (1459.9) | 2.99 (0.00) | 1.26x | 16.49 / 21.84 | 802.9->802.9 | 13.42->13.42 (10.62) |
+| 4 | `25-75` | `kiwi_tile_xor_baseline` | 209.6 | 477.1 | 357.9 | 1323.0 | 1323.0 (0.756) | 393.3 (2.54, 0.50) | 740.6 (1350.2) | 3.13 (0.00) | 1.26x | 13.02 / 18.22 | 439.0->439.0 | 13.36->13.36 (10.58) |
+| 4 | `25-75` | `kiwi_sst_xor_baseline` | 200.2 | 499.4 | 374.7 | 1267.8 | 1267.8 (0.789) | 415.5 (2.41, 0.50) | 1000.8 (999.2) | 3.12 (0.00) | 1.26x | 12.31 / 17.39 | 414.4->414.4 | 13.35->13.35 (10.57) |
+| 0 | `50-50` | `plain_bloom10` | 1506.6 | 66.4 | 33.2 | 38.0 | 38.0 (26.347) | 264.3 (3.78, 0.48) | 804.8 (1242.5) | 4.85 (26.55) | 1.29x | 10.08 / 0.00 | 266.6->229.5 | 13.28->10.00 (7.75) |
+| 4 | `50-50` | `kiwi_page_bloom10` | 170.0 | 588.4 | 294.5 | 1302.1 | 1302.1 (0.768) | 380.1 (2.63, 0.44) | 711.2 (1406.0) | 3.14 (0.00) | 1.71x | 16.50 / 21.82 | 806.1->806.1 | 13.42->13.42 (7.83) |
+| 4 | `50-50` | `kiwi_tile_xor_baseline` | 157.5 | 634.8 | 317.7 | 1566.3 | 1566.3 (0.638) | 398.1 (2.51, 0.45) | 757.6 (1319.9) | 3.13 (0.00) | 1.71x | 13.02 / 18.22 | 439.1->439.1 | 13.36->13.36 (7.80) |
+| 4 | `50-50` | `kiwi_sst_xor_baseline` | 134.8 | 741.7 | 371.2 | 1606.7 | 1606.7 (0.622) | 482.2 (2.07, 0.44) | 1014.9 (985.3) | 2.98 (0.00) | 1.46x | 12.31 / 17.41 | 411.2->349.4 | 13.35->11.35 (7.79) |
+| 0 | `75-25` | `plain_bloom10` | 1775.8 | 56.3 | 14.1 | 44.5 | 44.5 (22.454) | 272.6 (3.67, 0.43) | 813.7 (1229.0) | 5.32 (49.01) | 1.45x | 9.98 / 0.00 | 271.6->173.9 | 13.31->7.24 (4.98) |
+| 4 | `75-25` | `kiwi_page_bloom10` | 131.7 | 759.6 | 190.5 | 1257.9 | 1257.9 (0.795) | 347.2 (2.88, 0.39) | 695.9 (1437.1) | 2.99 (0.00) | 2.26x | 16.49 / 21.83 | 802.7->682.6 | 13.41->11.41 (5.04) |
+| 4 | `75-25` | `kiwi_tile_xor_baseline` | 117.6 | 850.6 | 213.3 | 1421.8 | 1421.8 (0.703) | 385.8 (2.59, 0.39) | 762.2 (1312.0) | 3.13 (0.00) | 2.66x | 13.02 / 18.22 | 439.1->439.1 | 13.36->13.36 (5.02) |
+| 4 | `75-25` | `kiwi_sst_xor_baseline` | 112.7 | 887.1 | 222.4 | 1372.5 | 1372.5 (0.729) | 430.5 (2.32, 0.39) | 1019.2 (981.2) | 3.12 (0.00) | 2.66x | 12.31 / 17.39 | 414.5->414.5 | 13.35->13.35 (5.02) |
+| 0 | `100-0` | `plain_bloom10` | 2088.8 | 47.9 | 0.05 | 47.9 | 47.9 (20.888) | N/A | N/A | 5.60 (54.98) | 2.07x | 10.22 / 0.00 | 275.1->128.7 | 13.31->4.61 (2.22) |
+| 4 | `100-0` | `kiwi_page_bloom10` | 63.9 | 1565.2 | 1.57 | 1565.3 | 1565.3 (0.639) | N/A | N/A | 3.14 (0.00) | 4.19x | 16.50 / 21.82 | 806.1->565.2 | 13.42->9.41 (2.25) |
+| 4 | `100-0` | `kiwi_tile_xor_baseline` | 59.1 | 1692.3 | 1.69 | 1692.6 | 1692.6 (0.591) | N/A | N/A | 3.13 (0.00) | 4.18x | 13.02 / 18.22 | 439.1->307.5 | 13.36->9.36 (2.24) |
+| 4 | `100-0` | `kiwi_sst_xor_baseline` | 57.0 | 1753.8 | 1.75 | 1754.1 | 1754.1 (0.570) | N/A | N/A | 3.12 (0.00) | 4.18x | 12.31 / 17.39 | 414.4->290.5 | 13.35->9.36 (2.24) |
 
-| Workload | Config | Ops/s | Avg Op (us) | Write Amp | Mem Pres (ns) | Mem Abs (ns) | IO Pres (us) | IO Abs (us) | IO Blk/Abs | Filter KB (Before -> After) | TableReader KB (Before -> After) | SST MB (Before -> After) |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `seqdel` | `plain_bloom10` | 591,253 | 1.69 | 5.13 | 1659.0 | 494.3 | 3.71 | 0.52 | 0.01 | 172 -> 186 | 341 -> 367 | 15.3 -> 16.4 |
-| `seqdel` | `kiwi_no_filter` | 589,626 | 1.70 | 4.74 | 7540.2 | 6598.9 | 32.56 | 28.14 | 10.80 | 0 -> 0 | 636 -> 755 | 15.0 -> 17.7 |
-| `seqdel` | `kiwi_page_bloom10` | 574,392 | 1.74 | 4.59 | 2430.4 | 1558.2 | 4.89 | 1.69 | 0.05 | 270 -> 309 | 885 -> 1022 | 15.0 -> 17.0 |
-| `seqdel` | `kiwi_tile_xor_baseline` | **509,503** | **1.96** | 5.35 | **1757.2** | **906.4** | **3.87** | **0.95** | **0.00** | 254 -> 269 | **623 -> 666** | 15.4 -> 16.4 |
-| `seqdel` | `kiwi_tile_xor_baseline_16bit` | 530,756 | 1.88 | 5.59 | 1678.2 | 1153.5 | 3.79 | 1.51 | 0.17 | 442 -> 506 | 824 -> 919 | 15.8 -> 17.1 |
-| `churn` | `plain_bloom10` | 738,824 | 1.35 | 3.14 | 1809.2 | 847.3 | 3.92 | 1.17 | 0.15 | 167 -> 215 | 334 -> 403 | 15.0 -> 17.6 |
-| `churn` | `kiwi_no_filter` | 718,712 | 1.39 | 2.59 | 15730.9 | 15374.5 | 67.11 | 67.52 | 26.13 | 0 -> 0 | 623 -> 774 | 14.8 -> 18.2 |
-| `churn` | `kiwi_page_bloom10` | 655,965 | 1.52 | 2.73 | 2748.6 | 2096.8 | 4.92 | 2.43 | 0.16 | 274 -> 339 | 912 -> 1087 | 15.2 -> 17.9 |
-| `churn` | `kiwi_tile_xor_baseline` | **605,403** | **1.65** | 3.00 | **1930.5** | **1227.9** | **4.21** | **1.47** | **0.10** | 248 -> 290 | **616 -> 706** | 15.1 -> 16.8 |
-| `churn` | `kiwi_tile_xor_baseline_16bit` | 564,964 | 1.77 | 3.13 | 2011.1 | 1312.1 | 4.13 | 1.54 | 0.10 | 426 -> 507 | 791 -> 931 | 15.3 -> 17.2 |
+### Tile Size `h = 8`
 
-**Does performance necessarily go up?** **No** (prior to `tile-filter-opt`):
-1. On **write/delete-heavy LSM churn** (`seqdel` and `churn`), overall op
-   throughput **decreased by 7.7%--13.9%** with `kiwi_tile_xor_baseline` /
-   `kiwi_tile_xor_baseline_16bit` relative to `kiwi_page_bloom10` (`510k vs 574k
-   ops/s` in `seqdel`; `605k vs 656k ops/s` in `churn`). Constructing an XOR
-   filter requires building and peeling a 3-uniform hypergraph (~3.6--4.1x
-   slower filter build than Bloom in `examples/xor_filter_query_example`:
-   `14.43--16.40 ms` vs `3.99 ms`), and uncounted directory bytes inflated
-   `w_amp` (resolved in [tile_filter_optimizations.md](tile_filter_optimizations.md)).
-2. On **queries and `TableReader` memory**, `kiwi_tile_xor_baseline` still wins
-   even after heavy `seqdel`/`churn` fragmentation: present and absent queries
-   are **28%--42% faster** in memory (`1757 vs 2430 ns` and `906 vs 1558 ns` in
-   `seqdel`; `1931 vs 2749 ns` and `1228 vs 2097 ns` in `churn`) and **14%--44%
-   faster** with I/O, while pinning **~35% less `TableReader` memory**
-   (`666 vs 1022 KB` in `seqdel`, `706 vs 1087 KB` in `churn`).
+| `h` | Split | Candidate | Wall (ms) | Total (kops/s) | Raw (kops/s) | Del (k keys/s) | Range Del (/s, ms) | IO Get (kqps, us, blk) | Mem Get (kqps, ns) | `w_amp` (`wl_MB`) | `sp_amp` | `flt_bpk` / `dir_bpk` | `tr_KB` (`B->A`) | `sst_MB` (`B->A` / `C`) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | `0-100` | `plain_bloom10` | 212.8 | 469.8 | 469.8 | N/A | N/A | 469.8 (2.13, 0.51) | 730.2 (1369.5) | 3.10 (0.00) | 1.00x | 10.08 / 0.00 | 266.6->266.6 | 13.28->13.28 (13.27) |
+| 8 | `0-100` | `kiwi_page_bloom10` | 264.1 | 378.7 | 378.7 | N/A | N/A | 378.7 (2.64, 0.51) | 661.7 (1511.2) | 3.15 (0.00) | 1.00x | 16.56 / 21.86 | 787.7->787.7 | 13.44->13.44 (13.43) |
+| 8 | `0-100` | `kiwi_tile_xor_baseline` | 241.0 | 414.9 | 414.9 | N/A | N/A | 414.9 (2.41, 0.50) | 754.0 (1326.2) | 3.14 (0.00) | 1.00x | 13.96 / 19.09 | 423.3->423.3 | 13.40->13.40 (13.39) |
+| 8 | `0-100` | `kiwi_sst_xor_baseline` | 206.8 | 483.6 | 483.6 | N/A | N/A | 483.6 (2.07, 0.50) | 1013.8 (986.4) | 3.14 (0.00) | 1.00x | 13.54 / 18.61 | 412.8->412.8 | 13.40->13.40 (13.38) |
+| 0 | `25-75` | `plain_bloom10` | 892.4 | 112.1 | 84.1 | 37.7 | 37.7 (26.539) | 327.6 (3.05, 0.53) | 800.2 (1249.7) | 4.13 (29.13) | 1.18x | 10.43 / 0.00 | 278.1->279.7 | 13.31->12.44 (10.51) |
+| 8 | `25-75` | `kiwi_page_bloom10` | 213.3 | 468.7 | 351.7 | 1344.9 | 1344.9 (0.744) | 385.1 (2.60, 0.47) | 666.0 (1501.6) | 3.00 (0.00) | 1.26x | 16.55 / 21.88 | 785.7->785.7 | 13.44->13.44 (10.64) |
+| 8 | `25-75` | `kiwi_tile_xor_baseline` | 201.3 | 496.8 | 372.7 | 1333.8 | 1333.8 (0.750) | 410.8 (2.43, 0.47) | 794.1 (1259.2) | 2.99 (0.00) | 1.26x | 13.96 / 19.12 | 421.0->421.0 | 13.40->13.40 (10.61) |
+| 8 | `25-75` | `kiwi_sst_xor_baseline` | 181.6 | 550.7 | 413.2 | 1335.7 | 1335.7 (0.749) | 460.5 (2.17, 0.47) | 1013.7 (986.4) | 3.14 (0.00) | 1.26x | 13.54 / 18.61 | 412.7->412.7 | 13.40->13.40 (10.60) |
+| 0 | `50-50` | `plain_bloom10` | 1506.6 | 66.4 | 33.2 | 38.0 | 38.0 (26.347) | 264.3 (3.78, 0.48) | 804.8 (1242.5) | 4.85 (26.55) | 1.29x | 10.08 / 0.00 | 266.6->229.5 | 13.28->10.00 (7.75) |
+| 8 | `50-50` | `kiwi_page_bloom10` | 169.0 | 591.8 | 296.2 | 1413.6 | 1413.6 (0.707) | 374.3 (2.67, 0.42) | 644.5 (1551.7) | 3.00 (0.00) | 1.46x | 16.55 / 21.88 | 785.7->669.1 | 13.44->11.44 (7.85) |
+| 8 | `50-50` | `kiwi_tile_xor_baseline` | 162.5 | 615.5 | 308.0 | 1367.8 | 1367.8 (0.731) | 397.1 (2.52, 0.42) | 814.1 (1228.4) | 3.14 (0.00) | 1.71x | 13.96 / 19.09 | 423.4->423.4 | 13.40->13.40 (7.82) |
+| 8 | `50-50` | `kiwi_sst_xor_baseline` | 140.2 | 713.0 | 356.9 | 1377.4 | 1377.3 (0.726) | 481.1 (2.08, 0.42) | 1047.5 (954.7) | 2.99 (0.00) | 1.46x | 13.54 / 18.63 | 410.5->349.6 | 13.40->11.40 (7.82) |
+| 0 | `75-25` | `plain_bloom10` | 1775.8 | 56.3 | 14.1 | 44.5 | 44.5 (22.454) | 272.6 (3.67, 0.43) | 813.7 (1229.0) | 5.32 (49.01) | 1.45x | 9.98 / 0.00 | 271.6->173.9 | 13.31->7.24 (4.98) |
+| 8 | `75-25` | `kiwi_page_bloom10` | 131.0 | 763.1 | 191.3 | 1292.3 | 1292.3 (0.774) | 342.5 (2.92, 0.37) | 726.0 (1377.4) | 3.15 (0.00) | 2.66x | 16.56 / 21.86 | 787.7->787.7 | 13.44->13.44 (5.05) |
+| 8 | `75-25` | `kiwi_tile_xor_baseline` | 109.8 | 910.9 | 228.4 | 1574.5 | 1574.5 (0.635) | 402.4 (2.49, 0.37) | 802.7 (1245.9) | 2.99 (0.00) | 2.26x | 13.96 / 19.12 | 420.7->358.0 | 13.40->11.40 (5.04) |
+| 8 | `75-25` | `kiwi_sst_xor_baseline` | 117.4 | 851.9 | 213.6 | 1245.0 | 1245.0 (0.803) | 437.7 (2.28, 0.37) | 1059.9 (943.5) | 3.14 (0.00) | 2.66x | 13.54 / 18.61 | 412.7->412.7 | 13.40->13.40 (5.03) |
+| 0 | `100-0` | `plain_bloom10` | 2088.8 | 47.9 | 0.05 | 47.9 | 47.9 (20.888) | N/A | N/A | 5.60 (54.98) | 2.07x | 10.22 / 0.00 | 275.1->128.7 | 13.31->4.61 (2.22) |
+| 8 | `100-0` | `kiwi_page_bloom10` | 71.0 | 1407.5 | 1.41 | 1407.7 | 1407.7 (0.710) | N/A | N/A | 3.00 (0.00) | 5.08x | 16.55 / 21.88 | 785.7->669.1 | 13.44->11.44 (2.25) |
+| 8 | `100-0` | `kiwi_tile_xor_baseline` | 69.6 | 1437.4 | 1.44 | 1437.5 | 1437.5 (0.696) | N/A | N/A | 3.14 (0.00) | 4.18x | 13.96 / 19.09 | 423.4->297.0 | 13.40->9.40 (2.25) |
+| 8 | `100-0` | `kiwi_sst_xor_baseline` | 71.8 | 1393.0 | 1.39 | 1393.1 | 1393.2 (0.718) | N/A | N/A | 2.99 (0.00) | 5.08x | 13.54 / 18.63 | 410.5->349.6 | 13.40->11.40 (2.24) |
+
+### Tile Size `h = 16`
+
+| `h` | Split | Candidate | Wall (ms) | Total (kops/s) | Raw (kops/s) | Del (k keys/s) | Range Del (/s, ms) | IO Get (kqps, us, blk) | Mem Get (kqps, ns) | `w_amp` (`wl_MB`) | `sp_amp` | `flt_bpk` / `dir_bpk` | `tr_KB` (`B->A`) | `sst_MB` (`B->A` / `C`) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | `0-100` | `plain_bloom10` | 212.8 | 469.8 | 469.8 | N/A | N/A | 469.8 (2.13, 0.51) | 730.2 (1369.5) | 3.10 (0.00) | 1.00x | 10.08 / 0.00 | 266.6->266.6 | 13.28->13.28 (13.27) |
+| 16 | `0-100` | `kiwi_page_bloom10` | 282.4 | 354.1 | 354.1 | N/A | N/A | 354.1 (2.82, 0.52) | 579.1 (1726.7) | 3.15 (0.00) | 1.00x | 16.59 / 21.89 | 777.1->777.1 | 13.47->13.47 (13.46) |
+| 16 | `0-100` | `kiwi_tile_xor_baseline` | 234.3 | 426.7 | 426.7 | N/A | N/A | 426.7 (2.34, 0.50) | 813.0 (1230.0) | 3.00 (0.00) | 1.00x | 14.98 / 20.10 | 423.2->423.2 | 13.44->13.44 (13.43) |
+| 16 | `0-100` | `kiwi_sst_xor_baseline` | 210.2 | 475.8 | 475.8 | N/A | N/A | 475.8 (2.10, 0.50) | 1021.3 (979.2) | 3.15 (0.00) | 1.00x | 14.77 / 19.83 | 419.2->419.2 | 13.44->13.44 (13.43) |
+| 0 | `25-75` | `plain_bloom10` | 892.4 | 112.1 | 84.1 | 37.7 | 37.7 (26.539) | 327.6 (3.05, 0.53) | 800.2 (1249.7) | 4.13 (29.13) | 1.18x | 10.43 / 0.00 | 278.1->279.7 | 13.31->12.44 (10.51) |
+| 16 | `25-75` | `kiwi_page_bloom10` | 229.8 | 435.2 | 326.5 | 1059.3 | 1059.3 (0.944) | 363.8 (2.75, 0.47) | 607.7 (1645.5) | 3.15 (0.00) | 1.26x | 16.59 / 21.90 | 777.3->777.3 | 13.47->13.47 (10.66) |
+| 16 | `25-75` | `kiwi_tile_xor_baseline` | 192.4 | 519.9 | 390.0 | 1446.5 | 1446.5 (0.691) | 428.4 (2.33, 0.46) | 822.1 (1216.4) | 3.15 (0.00) | 1.26x | 14.98 / 20.07 | 425.9->425.9 | 13.44->13.44 (10.64) |
+| 16 | `25-75` | `kiwi_sst_xor_baseline` | 176.3 | 567.4 | 425.7 | 1501.1 | 1501.1 (0.666) | 469.9 (2.13, 0.46) | 1050.1 (952.3) | 3.15 (0.00) | 1.26x | 14.77 / 19.83 | 419.2->419.2 | 13.44->13.44 (10.64) |
+| 0 | `50-50` | `plain_bloom10` | 1506.6 | 66.4 | 33.2 | 38.0 | 38.0 (26.347) | 264.3 (3.78, 0.48) | 804.8 (1242.5) | 4.85 (26.55) | 1.29x | 10.08 / 0.00 | 266.6->229.5 | 13.28->10.00 (7.75) |
+| 16 | `50-50` | `kiwi_page_bloom10` | 182.9 | 546.9 | 273.7 | 1442.0 | 1442.0 (0.694) | 337.4 (2.96, 0.42) | 617.0 (1620.7) | 3.15 (0.00) | 1.71x | 16.60 / 21.90 | 777.5->777.5 | 13.47->13.47 (7.86) |
+| 16 | `50-50` | `kiwi_tile_xor_baseline` | 152.7 | 655.0 | 327.8 | 1430.6 | 1430.5 (0.699) | 424.8 (2.35, 0.41) | 857.1 (1166.7) | 3.00 (0.00) | 1.46x | 14.98 / 20.10 | 423.1->360.4 | 13.44->11.44 (7.85) |
+| 16 | `50-50` | `kiwi_sst_xor_baseline` | 133.1 | 751.5 | 376.1 | 1618.4 | 1618.4 (0.618) | 489.4 (2.04, 0.41) | 1074.1 (931.0) | 3.00 (0.00) | 1.46x | 14.77 / 19.86 | 416.5->354.8 | 13.44->11.44 (7.84) |
+| 0 | `75-25` | `plain_bloom10` | 1775.8 | 56.3 | 14.1 | 44.5 | 44.5 (22.454) | 272.6 (3.67, 0.43) | 813.7 (1229.0) | 5.32 (49.01) | 1.45x | 9.98 / 0.00 | 271.6->173.9 | 13.31->7.24 (4.98) |
+| 16 | `75-25` | `kiwi_page_bloom10` | 119.7 | 835.4 | 209.5 | 1497.9 | 1497.9 (0.668) | 359.1 (2.78, 0.36) | 604.2 (1655.1) | 3.01 (0.00) | 2.27x | 16.59 / 21.92 | 774.8->660.2 | 13.47->11.47 (5.06) |
+| 16 | `75-25` | `kiwi_tile_xor_baseline` | 108.6 | 920.8 | 230.9 | 1535.2 | 1535.2 (0.651) | 418.6 (2.39, 0.36) | 841.9 (1187.8) | 3.00 (0.00) | 2.26x | 14.98 / 20.10 | 423.1->360.4 | 13.44->11.44 (5.05) |
+| 16 | `75-25` | `kiwi_sst_xor_baseline` | 104.8 | 954.5 | 239.3 | 1500.6 | 1500.6 (0.666) | 456.5 (2.19, 0.35) | 1142.5 (875.3) | 3.00 (0.00) | 2.26x | 14.77 / 19.86 | 416.5->354.8 | 13.44->11.44 (5.05) |
+| 0 | `100-0` | `plain_bloom10` | 2088.8 | 47.9 | 0.05 | 47.9 | 47.9 (20.888) | N/A | N/A | 5.60 (54.98) | 2.07x | 10.22 / 0.00 | 275.1->128.7 | 13.31->4.61 (2.22) |
+| 16 | `100-0` | `kiwi_page_bloom10` | 66.4 | 1506.9 | 1.51 | 1507.1 | 1507.0 (0.663) | N/A | N/A | 3.15 (0.00) | 4.19x | 16.59 / 21.90 | 777.3->547.3 | 13.47->9.47 (2.26) |
+| 16 | `100-0` | `kiwi_tile_xor_baseline` | 61.1 | 1635.4 | 1.64 | 1635.6 | 1635.6 (0.611) | N/A | N/A | 3.15 (0.00) | 4.19x | 14.98 / 20.07 | 425.9->300.2 | 13.44->9.44 (2.25) |
+| 16 | `100-0` | `kiwi_sst_xor_baseline` | 69.4 | 1440.4 | 1.44 | 1440.6 | 1440.6 (0.694) | N/A | N/A | 3.15 (0.00) | 4.19x | 14.77 / 19.83 | 419.2->295.6 | 13.44->9.44 (2.25) |

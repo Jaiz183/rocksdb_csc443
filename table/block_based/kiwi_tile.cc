@@ -115,73 +115,16 @@ uint8_t CeilLog2(size_t n) {
   return bits;
 }
 
-uint64_t DeleteRankUpperBound(uint64_t min_d, uint64_t max_d,
-                              uint8_t rank_bits, uint32_t bucket) {
-  if (rank_bits == 0 || min_d >= max_d) {
-    return max_d;
-  }
-  const uint32_t num_buckets = uint32_t{1} << rank_bits;
-  if (bucket + 1 >= num_buckets) {
-    return max_d;
-  }
-  const uint64_t span = max_d - min_d;
-  const uint64_t step = (span >> rank_bits) + 1;
-  const uint64_t hi_delta = uint64_t{bucket + 1} * step - 1;
-  if (hi_delta >= span) {
-    return max_d;
-  }
-  return min_d + hi_delta;
-}
-
-uint8_t ComputeDeleteRankBucket(uint64_t min_d, uint64_t max_d,
-                                uint8_t rank_bits, uint64_t delete_key) {
-  if (rank_bits == 0 || min_d >= max_d) {
-    return 0;
-  }
-  if (delete_key <= min_d) {
-    return 0;
-  }
-  const uint32_t max_bucket = (uint32_t{1} << rank_bits) - 1;
-  if (delete_key >= max_d) {
-    return static_cast<uint8_t>(max_bucket);
-  }
-  const uint64_t span = max_d - min_d;
-  const uint64_t step = (span >> rank_bits) + 1;
-  const uint64_t delta = delete_key - min_d;
-  return static_cast<uint8_t>(std::min<uint64_t>(max_bucket, delta / step));
-}
-
-bool DeleteRankMaySurviveFloor(uint64_t min_d, uint64_t max_d,
-                               uint8_t rank_bits, uint32_t bucket,
-                               uint64_t floor) {
-  if (floor == 0) {
-    return true;
-  }
-  if (max_d < floor) {
-    return false;
-  }
-  if (rank_bits == 0 || min_d >= floor) {
-    return true;
-  }
-  return DeleteRankUpperBound(min_d, max_d, rank_bits, bucket) >= floor;
-}
-
 TileXorFilterBuilder::TileXorFilterBuilder(uint8_t fingerprint_bytes)
-    : TileXorFilterBuilder(fingerprint_bytes, 0) {}
-
-TileXorFilterBuilder::TileXorFilterBuilder(uint8_t fingerprint_bytes,
-                                           uint8_t rank_bits)
-    : fingerprint_bytes_(fingerprint_bytes), rank_bits_(rank_bits) {}
+    : fingerprint_bytes_(fingerprint_bytes) {}
 
 void TileXorFilterBuilder::AddKey(const Slice& user_key, uint32_t page_index) {
-  AddKey(user_key, page_index, next_order_++, 0);
+  AddKey(user_key, page_index, next_order_++);
 }
 
 void TileXorFilterBuilder::AddKey(const Slice& user_key, uint32_t page_index,
-                                  uint32_t order, uint8_t rank_bucket) {
-  assert(page_index < (uint32_t{1} << 28));
-  entries_.push_back(Entry{GetSliceHash64(user_key), order,
-                           (page_index << 4) | (uint32_t{rank_bucket} & 0xfU)});
+                                  uint32_t order) {
+  entries_.push_back(Entry{GetSliceHash64(user_key), order, page_index});
 }
 
 namespace {
@@ -198,57 +141,33 @@ Status TileXorFilterBuilder::Finish(size_t num_pages, std::string* out) {
     return Status::InvalidArgument(
         "KiWi tile XOR filter requires non-empty tile and pages");
   }
+  if (num_pages > std::numeric_limits<uint32_t>::max()) {
+    Clear();
+    return Status::InvalidArgument("KiWi tile XOR filter: too many pages");
+  }
   if (fingerprint_bytes_ < 1 || fingerprint_bytes_ > 8) {
     Clear();
     return Status::InvalidArgument(
         "KiWi tile XOR filter fingerprint bytes must be in [1, 8]");
   }
-  if (rank_bits_ > 4) {
-    Clear();
-    return Status::InvalidArgument(
-        "KiWi tile XOR filter rank bits must be in [0, 4]");
-  }
   const uint8_t page_bits = CeilLog2(num_pages);
-  if (page_bits > 28) {
-    Clear();
-    return Status::InvalidArgument("KiWi tile XOR filter: too many pages");
-  }
-  const uint32_t meta_bits = uint32_t{page_bits} + rank_bits_;
   const uint8_t fp_bits = static_cast<uint8_t>(
-      std::min<uint32_t>(uint32_t{fingerprint_bytes_} * 8U, 64U - meta_bits));
-  const uint8_t slot_bits = static_cast<uint8_t>(fp_bits + meta_bits);
+      std::min<uint32_t>(uint32_t{fingerprint_bytes_} * 8U, 64U - page_bits));
+  const uint8_t slot_bits = static_cast<uint8_t>(fp_bits + page_bits);
   const uint64_t fp_mask = BitMaskFromBits(fp_bits);
   const uint64_t slot_mask = BitMaskFromBits(slot_bits);
-  const uint8_t rank_mask =
-      rank_bits_ == 0 ? 0 : static_cast<uint8_t>((1U << rank_bits_) - 1U);
 
   // Deduplicate equal hashes keeping the earliest insertion order (newest
-  // internal key if versions ever share a tile or file) for page_index while
-  // taking the max rank bucket across duplicate versions so secondary delete
-  // pruning never drops a surviving older version on the same page.
+  // internal key if versions ever share a tile or file).
   std::sort(entries_.begin(), entries_.end(),
             [](const Entry& a, const Entry& b) {
               return a.hash != b.hash ? a.hash < b.hash : a.order < b.order;
             });
-  size_t write_idx = 0;
-  for (size_t read_idx = 0; read_idx < entries_.size(); ++read_idx) {
-    if (write_idx == 0 ||
-        entries_[read_idx].hash != entries_[write_idx - 1].hash) {
-      entries_[write_idx] = entries_[read_idx];
-      entries_[write_idx].page_and_rank =
-          (entries_[read_idx].page_and_rank & ~0xfU) |
-          (entries_[read_idx].page_and_rank & rank_mask);
-      ++write_idx;
-    } else {
-      const uint32_t prev_rank = entries_[write_idx - 1].page_and_rank & 0xfU;
-      const uint32_t cur_rank = entries_[read_idx].page_and_rank & rank_mask;
-      if (cur_rank > prev_rank) {
-        entries_[write_idx - 1].page_and_rank =
-            (entries_[write_idx - 1].page_and_rank & ~0xfU) | cur_rank;
-      }
-    }
-  }
-  entries_.resize(write_idx);
+  entries_.erase(std::unique(entries_.begin(), entries_.end(),
+                             [](const Entry& a, const Entry& b) {
+                               return a.hash == b.hash;
+                             }),
+                 entries_.end());
 
   if (entries_.size() > (std::numeric_limits<uint32_t>::max() - 32) / 2) {
     Clear();
@@ -329,38 +248,26 @@ Status TileXorFilterBuilder::Finish(size_t num_pages, std::string* out) {
     const Entry& e = entries_[step.edge_idx];
     const CachedSlots& s = derived_[step.edge_idx];
     const uint64_t fp = s.fp & fp_mask;
-    const uint32_t page_index = e.page_and_rank >> 4;
-    const uint32_t rank_bucket = e.page_and_rank & 0xfU;
-    uint64_t target = fp;
-    if (meta_bits > 0) {
-      target = (target << page_bits) | page_index;
-      if (rank_bits_ > 0) {
-        target = (target << rank_bits_) | rank_bucket;
-      }
-    }
+    const uint64_t target =
+        page_bits == 0 ? fp : ((fp << page_bits) | e.page_index);
     slots_[step.vertex] =
         (slots_[s.idx[0]] ^ slots_[s.idx[1]] ^ slots_[s.idx[2]] ^ target) &
         slot_mask;
   }
 
-  const bool use_v2 = (rank_bits_ > 0);
-  const size_t header_bytes = use_v2 ? kHeaderBytesV2 : kHeaderBytes;
   const uint64_t total_bits = uint64_t{num_slots} * slot_bits;
   const size_t payload_bytes = static_cast<size_t>((total_bits + 7) / 8);
   out->clear();
-  out->reserve(header_bytes + payload_bytes);
-  out->push_back(use_v2 ? kFormatVersionAugmented : kFormatVersion);
+  out->reserve(kHeaderBytes + payload_bytes);
+  out->push_back(kFormatVersion);
   out->push_back(static_cast<char>(chosen_seed));
   out->push_back(static_cast<char>(fp_bits));
-  out->push_back(static_cast<char>((rank_bits_ << 5) | page_bits));
+  out->push_back(static_cast<char>(page_bits));
   PutFixed32(out, chosen_seg_len);
-  if (use_v2) {
-    PutFixed32(out, 0);  // base_page = 0
-  }
-  out->resize(header_bytes + payload_bytes);
+  out->resize(kHeaderBytes + payload_bytes);
 
   // Pack tightly using a 64-bit little-endian streaming accumulator.
-  char* payload = out->data() + header_bytes;
+  char* payload = out->data() + kHeaderBytes;
   size_t out_pos = 0;
   uint64_t bit_buf = 0;
   uint32_t bit_count = 0;
@@ -387,118 +294,40 @@ Status TileXorFilterBuilder::Finish(size_t num_pages, std::string* out) {
   return Status::OK();
 }
 
-Status TileXorFilterBuilder::ShiftBasePage(const Slice& encoded_filter,
-                                           uint32_t dropped_prefix_pages,
-                                           size_t surviving_num_pages,
-                                           std::string* out) {
-  assert(out != nullptr);
-  if (surviving_num_pages == 0 ||
-      encoded_filter.size() < TileXorFilterBuilder::kHeaderBytes) {
-    return Status::Corruption(
-        "KiWi tile XOR filter shift: invalid input filter or page count");
-  }
-  const unsigned char* hdr =
-      reinterpret_cast<const unsigned char*>(encoded_filter.data());
-  const char version = static_cast<char>(hdr[0]);
-  if (version != kFormatVersion && version != kFormatVersionAugmented) {
-    return Status::Corruption("KiWi tile XOR filter shift: unknown version");
-  }
-  const size_t old_hdr_bytes =
-      version == kFormatVersionAugmented ? kHeaderBytesV2 : kHeaderBytes;
-  if (encoded_filter.size() < old_hdr_bytes) {
-    return Status::Corruption("KiWi tile XOR filter shift: truncated header");
-  }
-  const uint8_t seed = hdr[1];
-  const uint8_t fp_bits = hdr[2];
-  const uint8_t rank_bits = static_cast<uint8_t>(hdr[3] >> 5);
-  const uint8_t page_bits = static_cast<uint8_t>(hdr[3] & 0x1fU);
-  const uint32_t seg_len = DecodeFixed32(encoded_filter.data() + 4);
-  const uint32_t old_base_page =
-      version == kFormatVersionAugmented
-          ? DecodeFixed32(encoded_filter.data() + 8)
-          : 0U;
-  if (dropped_prefix_pages >
-      std::numeric_limits<uint32_t>::max() - old_base_page) {
-    return Status::InvalidArgument("KiWi tile XOR filter shift: overflow");
-  }
-  const uint32_t new_base_page = old_base_page + dropped_prefix_pages;
-  if (surviving_num_pages >
-          std::numeric_limits<uint32_t>::max() - new_base_page ||
-      page_bits != CeilLog2(new_base_page + surviving_num_pages)) {
-    return Status::InvalidArgument(
-        "KiWi tile XOR filter shift: surviving page count mismatch");
-  }
-  if (dropped_prefix_pages == 0) {
-    out->assign(encoded_filter.data(), encoded_filter.size());
-    return Status::OK();
-  }
-  const size_t payload_bytes = encoded_filter.size() - old_hdr_bytes;
-  out->clear();
-  out->reserve(kHeaderBytesV2 + payload_bytes);
-  out->push_back(kFormatVersionAugmented);
-  out->push_back(static_cast<char>(seed));
-  out->push_back(static_cast<char>(fp_bits));
-  out->push_back(static_cast<char>((rank_bits << 5) | page_bits));
-  PutFixed32(out, seg_len);
-  PutFixed32(out, new_base_page);
-  out->append(encoded_filter.data() + old_hdr_bytes, payload_bytes);
-  return Status::OK();
-}
-
 Status TileXorFilterReader::Init(const Slice& encoded, size_t num_pages) {
   if (num_pages == 0 || encoded.size() < TileXorFilterBuilder::kHeaderBytes) {
     return Status::Corruption("KiWi tile XOR filter: truncated header");
   }
   const unsigned char* hdr =
       reinterpret_cast<const unsigned char*>(encoded.data());
-  const char version = static_cast<char>(hdr[0]);
-  size_t header_bytes = 0;
-  uint32_t base_page = 0;
-  if (version == TileXorFilterBuilder::kFormatVersion) {
-    header_bytes = TileXorFilterBuilder::kHeaderBytes;
-  } else if (version == TileXorFilterBuilder::kFormatVersionAugmented) {
-    if (encoded.size() < TileXorFilterBuilder::kHeaderBytesV2) {
-      return Status::Corruption("KiWi tile XOR filter: truncated v2 header");
-    }
-    header_bytes = TileXorFilterBuilder::kHeaderBytesV2;
-    base_page = DecodeFixed32(encoded.data() + 8);
-  } else {
+  if (static_cast<char>(hdr[0]) != TileXorFilterBuilder::kFormatVersion) {
     return Status::Corruption("KiWi tile XOR filter: unknown version");
   }
   const uint8_t seed = hdr[1];
   const uint8_t fp_bits = hdr[2];
-  const uint8_t rank_bits = static_cast<uint8_t>(hdr[3] >> 5);
-  const uint8_t page_bits = static_cast<uint8_t>(hdr[3] & 0x1fU);
+  const uint8_t page_bits = hdr[3];
   const uint32_t seg_len = DecodeFixed32(encoded.data() + 4);
-  if (num_pages > std::numeric_limits<uint32_t>::max() ||
-      base_page > std::numeric_limits<uint32_t>::max() - num_pages ||
-      rank_bits > 4 || fp_bits == 0 || fp_bits > 64 ||
-      page_bits != CeilLog2(static_cast<size_t>(base_page) + num_pages) ||
-      static_cast<uint32_t>(fp_bits) + page_bits + rank_bits > 64 ||
-      seg_len == 0) {
+  if (num_pages > std::numeric_limits<uint32_t>::max() || fp_bits == 0 ||
+      fp_bits > 64 || page_bits != CeilLog2(num_pages) ||
+      static_cast<uint32_t>(fp_bits) + page_bits > 64 || seg_len == 0) {
     return Status::Corruption("KiWi tile XOR filter: invalid header fields");
   }
-  if (version == TileXorFilterBuilder::kFormatVersion && rank_bits != 0) {
-    return Status::Corruption("KiWi tile XOR filter: invalid v1 header fields");
-  }
-  const uint8_t slot_bits = static_cast<uint8_t>(fp_bits + page_bits + rank_bits);
+  const uint8_t slot_bits = static_cast<uint8_t>(fp_bits + page_bits);
   const uint64_t num_slots = uint64_t{3} * seg_len;
   if (num_slots > std::numeric_limits<uint64_t>::max() / slot_bits) {
     return Status::Corruption("KiWi tile XOR filter: size overflow");
   }
   const uint64_t payload_bytes = (num_slots * slot_bits + 7) / 8;
-  if (encoded.size() - header_bytes != payload_bytes) {
+  if (encoded.size() - TileXorFilterBuilder::kHeaderBytes != payload_bytes) {
     return Status::Corruption("KiWi tile XOR filter: payload length mismatch");
   }
-  payload_ = encoded.data() + header_bytes;
+  payload_ = encoded.data() + TileXorFilterBuilder::kHeaderBytes;
   seg_len_ = seg_len;
   num_pages_ = static_cast<uint32_t>(num_pages);
-  base_page_ = base_page;
   min_live_page_ = 0;
   seed_ = seed;
   fp_bits_ = fp_bits;
   page_bits_ = page_bits;
-  rank_bits_ = rank_bits;
   return Status::OK();
 }
 
@@ -530,20 +359,11 @@ uint64_t TileXorFilterReader::ReadSlot(uint32_t slot, uint8_t slot_bits,
 
 bool TileXorFilterReader::MayMatchPage(const Slice& user_key,
                                        uint32_t* page_index) const {
-  uint32_t unused_rank = 0;
-  return MayMatchPage(user_key, page_index, &unused_rank);
-}
-
-bool TileXorFilterReader::MayMatchPage(const Slice& user_key,
-                                       uint32_t* page_index,
-                                       uint32_t* rank_bucket) const {
   assert(page_index != nullptr);
-  assert(rank_bucket != nullptr);
   if (UNLIKELY(payload_ == nullptr || min_live_page_ >= num_pages_)) {
     return false;
   }
-  const uint8_t slot_bits =
-      static_cast<uint8_t>(fp_bits_ + page_bits_ + rank_bits_);
+  const uint8_t slot_bits = static_cast<uint8_t>(fp_bits_ + page_bits_);
   const size_t payload_bytes =
       static_cast<size_t>((uint64_t{3} * seg_len_ * slot_bits + 7) / 8);
   const uint64_t slot_mask = BitMaskFromBits(slot_bits);
@@ -555,28 +375,18 @@ bool TileXorFilterReader::MayMatchPage(const Slice& user_key,
       ReadSlot(s.idx[0], slot_bits, payload_bytes, slot_mask) ^
       ReadSlot(s.idx[1], slot_bits, payload_bytes, slot_mask) ^
       ReadSlot(s.idx[2], slot_bits, payload_bytes, slot_mask);
-  const uint8_t meta_bits = static_cast<uint8_t>(page_bits_ + rank_bits_);
-  const uint64_t got_fp = meta_bits == 0 ? combined : (combined >> meta_bits);
+  const uint64_t got_fp = page_bits_ == 0 ? combined : (combined >> page_bits_);
   if (got_fp != (s.fp & fp_mask)) {
     return false;
   }
-  const uint64_t page_mask = BitMaskFromBits(page_bits_);
-  const uint32_t encoded_p =
+  const uint32_t local_p =
       page_bits_ == 0
           ? 0U
-          : static_cast<uint32_t>((combined >> rank_bits_) & page_mask);
-  if (encoded_p < base_page_) {
-    return false;
-  }
-  const uint32_t local_p = encoded_p - base_page_;
+          : static_cast<uint32_t>(combined & BitMaskFromBits(page_bits_));
   if (local_p >= num_pages_ || local_p < min_live_page_) {
     return false;
   }
   *page_index = local_p;
-  *rank_bucket =
-      rank_bits_ == 0
-          ? 0U
-          : static_cast<uint32_t>(combined & BitMaskFromBits(rank_bits_));
   return true;
 }
 
@@ -670,7 +480,6 @@ Status Directory::Decode(std::string contents) {
   tile_first_page_.clear();
   tile_offsets_.clear();
   tile_max_delete_key_.clear();
-  raw_tile_filters_.clear();
   filters_.clear();
   tile_filters_.clear();
   has_file_filter_ = false;
@@ -684,7 +493,6 @@ Status Directory::Decode(std::string contents) {
     tile_first_page_.clear();
     tile_offsets_.clear();
     tile_max_delete_key_.clear();
-    raw_tile_filters_.clear();
     filters_.clear();
     tile_filters_.clear();
     has_file_filter_ = false;
@@ -734,14 +542,14 @@ Status Directory::Decode(std::string contents) {
   tile_max_delete_key_.reserve(num_tiles);
   if (is_tile_filter) {
     tile_filters_.reserve(num_tiles);
-    raw_tile_filters_.reserve(num_tiles);
   }
 
   uint64_t prev_tile_offset = 0;
   size_t max_tile_pages = 0;
-  std::vector<Slice> tmp_tile_slices;
+  std::vector<Slice> tmp_tile_payloads;
+  size_t total_tile_payload_bytes = 0;
   if (is_tile_filter) {
-    tmp_tile_slices.reserve(num_tiles);
+    tmp_tile_payloads.reserve(num_tiles);
   }
   for (uint32_t t = 0; t < num_tiles; ++t) {
     uint64_t num_pages = 0;
@@ -763,7 +571,11 @@ Status Directory::Decode(std::string contents) {
         return corrupt("bad tile XOR filter");
       }
       tile_filters_.push_back(reader);
-      tmp_tile_slices.push_back(raw_tile_filter);
+      const Slice payload(
+          raw_tile_filter.data() + TileXorFilterBuilder::kHeaderBytes,
+          raw_tile_filter.size() - TileXorFilterBuilder::kHeaderBytes);
+      tmp_tile_payloads.push_back(payload);
+      total_tile_payload_bytes += payload.size();
       filter_bytes_ += raw_tile_filter.size();
     } else if (num_pages > input.size() / min_page_bytes) {
       return corrupt("bad page count");
@@ -813,44 +625,37 @@ Status Directory::Decode(std::string contents) {
   directory_bytes_ = raw_dir_bytes;
   // The directory is pinned in memory for the life of the table reader. In
   // v2/v3 modes, discard serialized page records (already decoded into pages_)
-  // and retain only raw filter bytes inside contents_.
+  // and retain only raw filter payloads inside contents_.
   pages_.shrink_to_fit();
   tile_first_page_.shrink_to_fit();
   tile_offsets_.shrink_to_fit();
   tile_max_delete_key_.shrink_to_fit();
   if (is_tile_filter) {
     std::string compacted;
-    compacted.reserve(filter_bytes_);
-    std::vector<std::pair<size_t, size_t>> spans;
-    spans.reserve(num_tiles);
+    compacted.reserve(total_tile_payload_bytes);
+    std::vector<size_t> offsets;
+    offsets.reserve(num_tiles);
     for (uint32_t t = 0; t < num_tiles; ++t) {
-      const size_t off = compacted.size();
-      const Slice& raw = tmp_tile_slices[t];
-      compacted.append(raw.data(), raw.size());
-      spans.emplace_back(off, raw.size());
+      offsets.push_back(compacted.size());
+      const Slice& payload = tmp_tile_payloads[t];
+      compacted.append(payload.data(), payload.size());
     }
     contents_.swap(compacted);
     contents_.shrink_to_fit();
-    raw_tile_filters_.reserve(num_tiles);
     for (uint32_t t = 0; t < num_tiles; ++t) {
-      const Slice raw(contents_.data() + spans[t].first, spans[t].second);
-      raw_tile_filters_.push_back(raw);
-      const size_t hdr_bytes =
-          raw[0] == TileXorFilterBuilder::kFormatVersionAugmented
-              ? TileXorFilterBuilder::kHeaderBytesV2
-              : TileXorFilterBuilder::kHeaderBytes;
-      tile_filters_[t].RelocatePayload(raw.data() + hdr_bytes);
+      tile_filters_[t].RelocatePayload(contents_.data() + offsets[t]);
     }
   } else if (is_file_filter) {
-    std::string compacted(raw_file_filter.data(), raw_file_filter.size());
+    std::string compacted;
+    if (has_file_filter_) {
+      compacted.assign(
+          raw_file_filter.data() + TileXorFilterBuilder::kHeaderBytes,
+          raw_file_filter.size() - TileXorFilterBuilder::kHeaderBytes);
+    }
     contents_.swap(compacted);
     contents_.shrink_to_fit();
     if (has_file_filter_) {
-      const size_t hdr_bytes =
-          contents_[0] == TileXorFilterBuilder::kFormatVersionAugmented
-              ? TileXorFilterBuilder::kHeaderBytesV2
-              : TileXorFilterBuilder::kHeaderBytes;
-      file_filter_.RelocatePayload(contents_.data() + hdr_bytes);
+      file_filter_.RelocatePayload(contents_.data());
     }
   } else {
     filters_.reserve(pages_.size());
@@ -887,39 +692,19 @@ bool Directory::FileMayMatch(const Slice& user_key,
   return file_filter_.MayMatchPage(user_key, page_index);
 }
 
-bool Directory::FileMayMatch(const Slice& user_key, uint32_t* page_index,
-                             uint32_t* rank_bucket) const {
-  assert(has_file_filter_);
-  return file_filter_.MayMatchPage(user_key, page_index, rank_bucket);
-}
-
 bool Directory::TileMayMatch(size_t tile_index, const Slice& user_key,
                              uint32_t* page_index) const {
   assert(tile_index < tile_filters_.size());
   return tile_filters_[tile_index].MayMatchPage(user_key, page_index);
 }
 
-bool Directory::TileMayMatch(size_t tile_index, const Slice& user_key,
-                             uint32_t* page_index,
-                             uint32_t* rank_bucket) const {
-  assert(tile_index < tile_filters_.size());
-  return tile_filters_[tile_index].MayMatchPage(user_key, page_index,
-                                                rank_bucket);
-}
-
-Slice Directory::raw_tile_filter(size_t tile_index) const {
-  if (tile_index >= raw_tile_filters_.size()) {
-    return Slice();
-  }
-  return raw_tile_filters_[tile_index];
-}
-
 void Directory::ApplyDeleteFloor(uint64_t floor) {
   if (floor == 0 || tile_filters_.empty()) {
     return;
   }
-  size_t surviving_bytes = 0;
-  bool any_dead = false;
+  size_t surviving_payload_bytes = 0;
+  size_t surviving_filter_bytes = 0;
+  bool any_newly_dead = false;
   for (size_t t = 0; t < tile_filters_.size(); ++t) {
     const TileView tv = tile(t);
     uint32_t dead_prefix = 0;
@@ -929,47 +714,41 @@ void Directory::ApplyDeleteFloor(uint64_t floor) {
     }
     tile_filters_[t].SetMinLivePage(dead_prefix);
     if (dead_prefix == tv.num_pages) {
-      any_dead = true;
-    } else {
-      surviving_bytes += raw_tile_filters_[t].size();
+      if (tile_filters_[t].payload() != nullptr) {
+        any_newly_dead = true;
+      }
+    } else if (tile_filters_[t].payload() != nullptr) {
+      const size_t pbytes = tile_filters_[t].payload_bytes();
+      surviving_payload_bytes += pbytes;
+      surviving_filter_bytes += TileXorFilterBuilder::kHeaderBytes + pbytes;
     }
   }
-  if (!any_dead) {
+  if (!any_newly_dead) {
     return;
   }
   // Free XOR filter bytes belonging to 100%-deleted tiles from memory.
   std::string compacted;
-  compacted.reserve(surviving_bytes);
-  std::vector<std::pair<size_t, size_t>> spans(tile_filters_.size(), {0, 0});
+  compacted.reserve(surviving_payload_bytes);
+  std::vector<size_t> offsets(tile_filters_.size(), 0);
   for (size_t t = 0; t < tile_filters_.size(); ++t) {
     const TileView tv = tile(t);
-    if (tile_filters_[t].min_live_page() >= tv.num_pages) {
-      raw_tile_filters_[t] = Slice();
+    if (tile_filters_[t].min_live_page() >= tv.num_pages ||
+        tile_filters_[t].payload() == nullptr) {
       tile_filters_[t].ClearPayload();
       continue;
     }
-    const Slice& raw = raw_tile_filters_[t];
-    if (!raw.empty()) {
-      const size_t off = compacted.size();
-      compacted.append(raw.data(), raw.size());
-      spans[t] = {off, raw.size()};
-    }
+    offsets[t] = compacted.size();
+    compacted.append(tile_filters_[t].payload(),
+                     tile_filters_[t].payload_bytes());
   }
   contents_.swap(compacted);
   contents_.shrink_to_fit();
   for (size_t t = 0; t < tile_filters_.size(); ++t) {
-    if (spans[t].second == 0) {
-      continue;
+    if (tile_filters_[t].payload() != nullptr) {
+      tile_filters_[t].RelocatePayload(contents_.data() + offsets[t]);
     }
-    const Slice raw(contents_.data() + spans[t].first, spans[t].second);
-    raw_tile_filters_[t] = raw;
-    const size_t hdr_bytes =
-        raw[0] == TileXorFilterBuilder::kFormatVersionAugmented
-            ? TileXorFilterBuilder::kHeaderBytesV2
-            : TileXorFilterBuilder::kHeaderBytes;
-    tile_filters_[t].RelocatePayload(raw.data() + hdr_bytes);
   }
-  filter_bytes_ = contents_.size();
+  filter_bytes_ = surviving_filter_bytes;
 }
 
 bool Directory::PageMayMatch(const DirectoryPage* page,
@@ -989,7 +768,6 @@ size_t Directory::ApproximateMemoryUsage() const {
          tile_first_page_.capacity() * sizeof(size_t) +
          tile_offsets_.capacity() * sizeof(uint64_t) +
          tile_max_delete_key_.capacity() * sizeof(uint64_t) +
-         raw_tile_filters_.capacity() * sizeof(Slice) +
          filters_.capacity() * sizeof(filters_[0]) +
          filters_.size() * kApproxFilterReaderBytes +
          tile_filters_.capacity() * sizeof(TileXorFilterReader);

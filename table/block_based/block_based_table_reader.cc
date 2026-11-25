@@ -1782,12 +1782,11 @@ Status BlockBasedTable::KiWiGet(const ReadOptions& read_options,
   const Slice user_key = ExtractUserKey(key);
   Statistics* stats = rep_->ioptions.stats;
   uint32_t file_page_idx = 0;
-  uint32_t file_rank_bucket = 0;
   bool have_file_match = false;
   bool used_filter = false;
   if (!skip_filters && dir.has_file_filter()) {
     used_filter = true;
-    if (!dir.FileMayMatch(user_key, &file_page_idx, &file_rank_bucket)) {
+    if (!dir.FileMayMatch(user_key, &file_page_idx)) {
       RecordTick(stats, BLOOM_FILTER_USEFUL);
       return Status::OK();
     }
@@ -1855,43 +1854,32 @@ Status BlockBasedTable::KiWiGet(const ReadOptions& read_options,
     const kiwi::Directory::TileView tile = dir.tile(tile_index);
     if (have_file_match) {
       if (file_page_idx < tile.num_pages) {
-        const kiwi::DirectoryPage& target_page = tile.pages[file_page_idx];
-        if (kiwi::DeleteRankMaySurviveFloor(
-                target_page.min_delete_key, target_page.max_delete_key,
-                dir.file_rank_bits(), file_rank_bucket, floor)) {
-          std::unique_ptr<InternalIterator> page(
-              KiWiTableIterator::NewPageIterator(
-                  this, read_options, target_page, get_context, &lookup_context,
-                  /*for_compaction=*/false));
-          if (page != nullptr) {
-            scan_iter(page.get());
-            if (!s.ok()) {
-              break;
-            }
+        std::unique_ptr<InternalIterator> page(
+            KiWiTableIterator::NewPageIterator(
+                this, read_options, tile.pages[file_page_idx], get_context,
+                &lookup_context, /*for_compaction=*/false));
+        if (page != nullptr) {
+          scan_iter(page.get());
+          if (!s.ok()) {
+            break;
           }
         }
       }
     } else if (!skip_filters && dir.has_tile_filters()) {
       used_filter = true;
       uint32_t page_idx = 0;
-      uint32_t rank_bucket = 0;
-      if (!dir.TileMayMatch(tile_index, user_key, &page_idx, &rank_bucket)) {
+      if (!dir.TileMayMatch(tile_index, user_key, &page_idx)) {
         RecordTick(stats, BLOOM_FILTER_USEFUL);
       } else {
         RecordTick(stats, BLOOM_FILTER_FULL_POSITIVE);
-        const kiwi::DirectoryPage& target_page = tile.pages[page_idx];
-        if (kiwi::DeleteRankMaySurviveFloor(
-                target_page.min_delete_key, target_page.max_delete_key,
-                dir.tile_rank_bits(tile_index), rank_bucket, floor)) {
-          std::unique_ptr<InternalIterator> page(
-              KiWiTableIterator::NewPageIterator(
-                  this, read_options, target_page, get_context, &lookup_context,
-                  /*for_compaction=*/false));
-          if (page != nullptr) {
-            scan_iter(page.get());
-            if (!s.ok()) {
-              break;
-            }
+        std::unique_ptr<InternalIterator> page(
+            KiWiTableIterator::NewPageIterator(
+                this, read_options, tile.pages[page_idx], get_context,
+                &lookup_context, /*for_compaction=*/false));
+        if (page != nullptr) {
+          scan_iter(page.get());
+          if (!s.ok()) {
+            break;
           }
         }
       }

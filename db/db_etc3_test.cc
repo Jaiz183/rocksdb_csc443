@@ -1699,7 +1699,7 @@ TEST_F(DBKiWiSecondaryDeleteTest,
   ASSERT_EQ(Get(KiWiKey(1)), Get(KiWiKey(1)));
 }
 
-TEST_F(DBKiWiSecondaryDeleteTest, WholeFileDropAndAugmentedTileXor) {
+TEST_F(DBKiWiSecondaryDeleteTest, WholeFileDropAndFileXorFilter) {
   Random64 rnd(20261126);
   // 1. Instant whole-file unlink when all delete keys in an SST are < floor.
   {
@@ -1729,12 +1729,9 @@ TEST_F(DBKiWiSecondaryDeleteTest, WholeFileDropAndAugmentedTileXor) {
     VerifyModel(model);
   }
 
-  // 2. Rank-tagged (rk=2) and SST-wide file-filter XOR policies end-to-end.
-  for (const std::string& cfg : {
-           std::string("{id=xorfilter:1;kiwi_delete_rank_bits=2}"),
-           std::string("{id=xorfilter:1;kiwi_file_filter=true}"),
-       }) {
-    SCOPED_TRACE(cfg);
+  // 2. SST-wide file-filter XOR policy (Directory v3) end-to-end.
+  {
+    const std::string cfg = "{id=xorfilter:1;kiwi_file_filter=true}";
     Options options = KiWiOptions(4, 0, 1);
     auto* bbto = options.table_factory->GetOptions<BlockBasedTableOptions>();
     ASSERT_NE(bbto, nullptr);

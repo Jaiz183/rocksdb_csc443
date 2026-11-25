@@ -135,30 +135,16 @@ constexpr char kPropFilterBytes[] = "rocksdb.kiwi.filter_bytes";
 // Returns ceil(log2(n)) for n >= 1, or 0 for n <= 1.
 uint8_t CeilLog2(size_t n);
 
-// Overflow-free sub-page delete-key interval helpers. When `rank_bits > 0`,
-// a page's [min_d, max_d] interval is partitioned into (1 << rank_bits)
-// uniform sub-intervals without adding any extra metadata to DirectoryPage.
-uint64_t DeleteRankUpperBound(uint64_t min_d, uint64_t max_d,
-                              uint8_t rank_bits, uint32_t bucket);
-uint8_t ComputeDeleteRankBucket(uint64_t min_d, uint64_t max_d,
-                                uint8_t rank_bits, uint64_t delete_key);
-bool DeleteRankMaySurviveFloor(uint64_t min_d, uint64_t max_d,
-                               uint8_t rank_bits, uint32_t bucket,
-                               uint64_t floor);
-
-// Builds a 3-way XOR filter encoding [fingerprint || page_index || rank_bucket]
-// in every slot so a single filter lookup locates the sole candidate page (and
-// optional sub-page delete-key bucket) without reconstructing the filter when
-// prefix pages are dropped. Buffers are reused across tiles.
+// Builds a 3-way XOR filter encoding [fingerprint || page_index] in every slot
+// so a single filter lookup locates the sole candidate page without
+// reconstructing the filter when prefix pages are dropped. Buffers are reused
+// across tiles.
 class TileXorFilterBuilder {
  public:
   static constexpr char kFormatVersion = 1;
-  static constexpr char kFormatVersionAugmented = 2;
   static constexpr size_t kHeaderBytes = 8;
-  static constexpr size_t kHeaderBytesV2 = 12;
 
   explicit TileXorFilterBuilder(uint8_t fingerprint_bytes);
-  TileXorFilterBuilder(uint8_t fingerprint_bytes, uint8_t rank_bits);
 
   TileXorFilterBuilder(const TileXorFilterBuilder&) = delete;
   TileXorFilterBuilder& operator=(const TileXorFilterBuilder&) = delete;
@@ -166,21 +152,13 @@ class TileXorFilterBuilder {
   // Records `user_key` as residing on `page_index` (0 <= page_index <
   // num_pages) of the current tile. Entries should be added in tile order.
   void AddKey(const Slice& user_key, uint32_t page_index);
-  void AddKey(const Slice& user_key, uint32_t page_index, uint32_t order,
-              uint8_t rank_bucket);
+  void AddKey(const Slice& user_key, uint32_t page_index, uint32_t order);
 
   bool empty() const { return entries_.empty(); }
 
   // Builds the bit-packed XOR+page filter for a tile with `num_pages` pages
   // and resets buffered entries for the next tile.
   Status Finish(size_t num_pages, std::string* out);
-
-  // Shifts an existing tile XOR filter's logical page index origin forward by
-  // `dropped_prefix_pages` with zero hypergraph re-peeling. Requires
-  // `surviving_num_pages >= 1` and matching original `page_bits`.
-  static Status ShiftBasePage(const Slice& encoded_filter,
-                              uint32_t dropped_prefix_pages,
-                              size_t surviving_num_pages, std::string* out);
 
   void Clear() {
     entries_.clear();
@@ -191,8 +169,7 @@ class TileXorFilterBuilder {
   struct Entry {
     uint64_t hash;
     uint32_t order;
-    // Bits [31:4] hold page_index; bits [3:0] hold rank_bucket.
-    uint32_t page_and_rank;
+    uint32_t page_index;
   };
   struct CachedSlots {
     uint32_t idx[3];
@@ -204,7 +181,6 @@ class TileXorFilterBuilder {
   };
 
   const uint8_t fingerprint_bytes_;
-  const uint8_t rank_bits_;
   uint32_t next_order_ = 0;
   std::vector<Entry> entries_;
   std::vector<CachedSlots> derived_;
@@ -233,17 +209,20 @@ class TileXorFilterReader {
   // single candidate page in [min_live_page_, num_pages). Returns false on
   // fingerprint mismatch, out-of-range page index, or dropped prefix page.
   bool MayMatchPage(const Slice& user_key, uint32_t* page_index) const;
-  bool MayMatchPage(const Slice& user_key, uint32_t* page_index,
-                    uint32_t* rank_bucket) const;
 
+  const char* payload() const { return payload_; }
+  size_t payload_bytes() const {
+    return payload_ == nullptr
+               ? 0
+               : static_cast<size_t>(
+                     (uint64_t{3} * seg_len_ * slot_bits() + 7) / 8);
+  }
   uint32_t seg_len() const { return seg_len_; }
-  uint32_t base_page() const { return base_page_; }
   uint32_t min_live_page() const { return min_live_page_; }
   uint8_t fp_bits() const { return fp_bits_; }
   uint8_t page_bits() const { return page_bits_; }
-  uint8_t rank_bits() const { return rank_bits_; }
   uint8_t slot_bits() const {
-    return static_cast<uint8_t>(fp_bits_ + page_bits_ + rank_bits_);
+    return static_cast<uint8_t>(fp_bits_ + page_bits_);
   }
 
  private:
@@ -253,12 +232,10 @@ class TileXorFilterReader {
   const char* payload_ = nullptr;
   uint32_t seg_len_ = 0;
   uint32_t num_pages_ = 0;
-  uint32_t base_page_ = 0;
   uint32_t min_live_page_ = 0;
   uint8_t seed_ = 0;
   uint8_t fp_bits_ = 0;
   uint8_t page_bits_ = 0;
-  uint8_t rank_bits_ = 0;
 };
 
 // What the directory records about one page: where it is, the range of delete
@@ -349,25 +326,14 @@ class Directory {
 
   // Queries the SST-wide XOR+page filter (v3). Requires has_file_filter().
   bool FileMayMatch(const Slice& user_key, uint32_t* page_index) const;
-  bool FileMayMatch(const Slice& user_key, uint32_t* page_index,
-                    uint32_t* rank_bucket) const;
 
   // Queries the per-tile XOR+page filter for tile `tile_index` (v2). Requires
   // has_tile_filters().
   bool TileMayMatch(size_t tile_index, const Slice& user_key,
                     uint32_t* page_index) const;
-  bool TileMayMatch(size_t tile_index, const Slice& user_key,
-                    uint32_t* page_index, uint32_t* rank_bucket) const;
 
   bool TileAllDeleted(size_t tile_index, uint64_t floor) const {
     return floor != 0 && tile_max_delete_key_[tile_index] < floor;
-  }
-
-  Slice raw_tile_filter(size_t tile_index) const;
-
-  uint8_t file_rank_bits() const { return file_filter_.rank_bits(); }
-  uint8_t tile_rank_bits(size_t tile_index) const {
-    return tile_filters_[tile_index].rank_bits();
   }
 
   // Updates prefix page bounds for `floor` and, in v2 mode, frees XOR filter
@@ -391,8 +357,6 @@ class Directory {
   std::vector<uint64_t> tile_offsets_;
   // Max delete key across each tile's pages.
   std::vector<uint64_t> tile_max_delete_key_;
-  // Raw encoded tile filters (header+payload), pointing into contents_ (v2).
-  std::vector<Slice> raw_tile_filters_;
   // One reader per page (v1), parallel to pages_; empty in v2/v3.
   std::vector<std::unique_ptr<FilterBitsReader>> filters_;
   // One reader per tile (v2), parallel to tile_first_page_; empty in v1/v3.
