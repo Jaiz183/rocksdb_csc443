@@ -1,0 +1,13 @@
+== churn_fade_r3 load={ 5.65 5.77 8.38 }
+cf_opts="delete_persistence_threshold=20;skip_level_tombstone_density_threshold=0.3" run_s=60.0 ops=1199900 (puts=658374 dels=541526 rdels=0) ops/s=19998
+write_amp=7.280  (compaction 513.6 MB + flush 68.5 MB) / user 80.0 MB
+avg_upper_tombstones=17838  peak_tomb_age_ub=26s  avg_sst_MB=77.68
+true_tomb_age: peak=17.5s avg=9.7s samples_over_20s=0/59
+end_of_run: sst_MB=76.90 upper_tombs=15474 total_tombs=15474 levels_KB=623/0/0/341/0/2133/75651
+drained:    sst_MB=77.12 upper_tombs=16505 total_tombs=16505 levels_KB=0/0/0/0/1182/2133/75651 space_amp=1.049
+compactions by reason: FadeTtl=124(401.0MB) LevelL0FilesNum=58(61.4MB) LevelMaxLevelSize=48(51.3MB)
+compactions by shape:  L0->L3=58(61.4MB) L3->L4=81(54.6MB) L4->L5=56(130.6MB) L5->L6=35(267.0MB)
+skip-level shapes:     
+L0 compactions:         LevelL0FilesNum=58(avg_l0_files=1.95,avg_in=1.3MB)
+verify: live_keys=670608 mismatches=0 bg_errors=0 -> PASS
+exit=0
