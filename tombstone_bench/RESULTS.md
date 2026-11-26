@@ -636,3 +636,69 @@ s on churn.
   - Two FADE-side options remain untested here: a minimum per-level TTL, or
     leaving the stages above the base level to size compaction and giving
     their budget to deeper stages.
+
+## fade-kiwi-plus-skip-level: KiWi + FADE + skip-level (2026-11-25)
+
+Branch `fade-kiwi-plus-skip-level` is `fade-plus-skip-level` with `kiwi` (KiWi
+delete tiles and `DB::SecondaryDeleteBelow`) merged in. KiWi is our
+colleagues' branch; it is merged here only to check that the features combine.
+
+### Merge
+
+- The only conflict was in VersionEdit's NewFile4 custom fields. FADE's
+  `kOldestTombstoneTime` is tag 20, safe for old readers to ignore. KiWi's
+  `kKiWiDeleteFloor` is unignorable and sits after `kPathId`. The tags do not
+  collide, and both are encoded and decoded.
+- KiWi's input-record check in CompactionJob already loops over every input
+  level, so multi-level skip compactions are covered.
+
+### Tests
+
+| suite | result |
+|---|---|
+| `compaction_picker_test` | 181/181 |
+| `db_skip_level_compaction_test` | 8/8 |
+| `db_compaction_test` | 390/390 |
+| `options_test` | 84/84 |
+| `version_edit_test` | 36/36 |
+| `kiwi_test` | 42/42 |
+| `table_test` | 5631/5631 |
+| `db_etc3_test` | 25/25 |
+
+New: `DBKiWiSecondaryDeleteTest.SecondaryDeleteWithFadeAndSkipLevel`.
+
+- Skip-level compactions read several levels' files at once, each through its
+  own delete floor. The test checks that entries hidden by
+  `SecondaryDeleteBelow` stay hidden through those rewrites.
+- It uses a preloaded 4-level tree, skip modes 1 and 2, FADE on, and a model
+  check after the delete, after further compactions and after a reopen.
+
+### Benchmark
+
+Same setup as `fade-plus-skip-level` at D_th = 10 s, 3 repeats. The `kiwi`
+configs set `KIWI_TILE_PAGES=4`; values then carry their version as the KiWi
+delete key. All 36 runs pass the model check. The third repeat ran after a
+pause; one `churn base` run had a load average of 23 and was about 3% low.
+
+| workload | config | write amp (3 runs) | mean | vs base | vs FADE in the same layout (Welch t) |
+|---|---|---|---|---|---|
+| seqdel | base | 9.35, 9.14, 9.39 | 9.29 | | |
+| seqdel | FADE | 10.39, 10.15, 10.20 | 10.25 | +10.3% | |
+| seqdel | FADE + skip | 9.79, 9.93, 9.73 | 9.82 | +5.6% | **-4.2%** (t = -4.6) |
+| seqdel | KiWi | 9.24, 9.39, 9.33 | 9.32 | +0.3% | |
+| seqdel | KiWi + FADE | 10.60, 10.73, 10.66 | 10.66 | +14.8% | |
+| seqdel | KiWi + FADE + skip | 10.06, 9.56, 10.01 | 9.88 | +6.3% | **-7.3%** (t = -4.8) |
+| churn | base | 4.26, 4.25, 4.13 | 4.22 | | |
+| churn | FADE | 8.42, 9.48, 8.38 | 8.76 | +108% | |
+| churn | FADE + skip | 8.45, 9.76, 8.44 | 8.88 | +111% | +1.5% (t = 0.2) |
+| churn | KiWi | 4.38, 4.26, 4.38 | 4.34 | +3.0% | |
+| churn | KiWi + FADE | 8.85, 9.10, 8.58 | 8.84 | +110% | |
+| churn | KiWi + FADE + skip | 8.71, 8.87, 8.93 | 8.84 | +110% | -0.1% (t = 0.0) |
+
+- **KiWi's layout alone is about write-amp neutral:** +0.3% (seqdel), +3.0%
+  (churn).
+- **Skip-level's saving over FADE survives with KiWi on, and is larger on
+  seqdel** (-7.3%).
+- **On churn at D_th = 10 s both layouts tie,** as on `fade-plus-skip-level`.
+  FADE's last-stage rewrites dominate there; see the D_th sweep above for the
+  settings where FADE + skip is cheap.
