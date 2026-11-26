@@ -68,7 +68,8 @@ if [ -n "${ONLY:-}" ]; then
   CONFIGS=("${KEEP[@]}")
 fi
 N=${#CONFIGS[@]}
-for rep in $(seq 1 "$REPEATS"); do
+# FIRST_REP > 1 resumes a paused run: earlier repeats are kept as they are.
+for rep in $(seq "${FIRST_REP:-1}" "$REPEATS"); do
   for w in "${WORKLOADS[@]}"; do
     name="${w%%|*}"; envs="${w#*|}"
     # rotate config order each repeat to spread machine-load drift
