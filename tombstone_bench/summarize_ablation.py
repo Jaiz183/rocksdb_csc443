@@ -26,7 +26,7 @@ def l0_files_per_compaction(t):
     return sum(int(a) * float(b) for a, b in parts) / n if n else float("nan")
 
 
-ORDER = ["base", "trig", "skip", "trig+skip", "trig+sav", "skip+sav", "fade", "fade+skip"]
+ORDER = ["base", "trig", "skip", "trig+skip", "trig+sav", "skip+sav", "fade", "fade+skip", "fade+p", "fade+skip+p"]
 rows = []
 for path in sorted(glob.glob(os.path.join(d, "*.txt"))):
     tag = os.path.basename(path)[:-4]

@@ -300,6 +300,14 @@ struct MinAndMaxPreserveSeconds {
   void Combine(const CFOpts& opts) {
     uint64_t preserve_seconds = std::max(opts.preserve_internal_time_seconds,
                                          opts.preclude_last_level_data_seconds);
+    // [FADE] fade_precise_tombstone_age dates compaction outputs' tombstones
+    // with the mapping, so it needs samples spanning delete_persistence_
+    // threshold. This only enables recording: the preserve/preclude cutoffs
+    // still come from their own options.
+    if (opts.fade_precise_tombstone_age) {
+      preserve_seconds =
+          std::max(preserve_seconds, opts.delete_persistence_threshold);
+    }
     if (preserve_seconds > 0) {
       min_preserve_seconds = std::min(preserve_seconds, min_preserve_seconds);
       max_preserve_seconds = std::max(preserve_seconds, max_preserve_seconds);

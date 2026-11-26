@@ -616,6 +616,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct MutableCFOptions, delete_persistence_threshold),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"fade_precise_tombstone_age",
+         {offsetof(struct MutableCFOptions, fade_precise_tombstone_age),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"periodic_compaction_seconds",
          {offsetof(struct MutableCFOptions, periodic_compaction_seconds),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -1317,6 +1321,8 @@ void MutableCFOptions::Dump(Logger* log) const {
   ROCKS_LOG_INFO(log,
                  "             delete_persistence_threshold: %" PRIu64,
                  delete_persistence_threshold);
+  ROCKS_LOG_INFO(log, "               fade_precise_tombstone_age: %d",
+                 fade_precise_tombstone_age);
   ROCKS_LOG_INFO(log, "              periodic_compaction_seconds: %" PRIu64,
                  periodic_compaction_seconds);
   ROCKS_LOG_INFO(log, "    read_triggered_compaction_threshold: %f",

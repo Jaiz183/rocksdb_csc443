@@ -4,6 +4,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "db/periodic_task_scheduler.h"
 #include "db/seqno_to_time_mapping.h"
@@ -11,6 +12,7 @@
 #include "rocksdb/iostats_context.h"
 #include "rocksdb/utilities/debug.h"
 #include "test_util/mock_time_env.h"
+#include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -1019,6 +1021,87 @@ TEST_P(SeqnoTimeTablePropTest, PrePopulateInDB) {
                            List({base_options, base_options}));
   ASSERT_EQ(latest_seqno, db_->GetLatestSequenceNumber());
 
+  Close();
+}
+
+// [FADE] fade_precise_tombstone_age: a compaction output is dated by the
+// oldest tombstone it actually contains. Here the old tombstone for key 1 is
+// superseded by a later Put and dropped by the L0 -> L1 compaction, so only
+// the newer tombstone for key 2 survives. Without the option the output keeps
+// the old tombstone's time; with it, the output gets (about) the newer time.
+TEST_F(SeqnoTimeTest, FadePreciseTombstoneAge) {
+  for (bool precise : {false, true}) {
+    SCOPED_TRACE(precise ? "precise" : "inherited");
+    Options options = CurrentOptions();
+    options.env = mock_env_.get();
+    options.compaction_style = kCompactionStyleLevel;
+    options.num_levels = 3;
+    options.level_compaction_dynamic_level_bytes = false;
+    options.disable_auto_compactions = true;
+    options.delete_persistence_threshold = 1000;
+    options.fade_precise_tombstone_age = precise;
+    DestroyAndReopen(options);
+
+    auto sleep = [&](int seconds) {
+      dbfull()->TEST_WaitForPeriodicTaskRun(
+          [&] { mock_clock_->MockSleepForSeconds(seconds); });
+    };
+    auto oldest_tombstone_time_at = [&](int level) {
+      dbfull()->TEST_LockMutex();
+      VersionStorageInfo* vstorage =
+          static_cast_with_check<ColumnFamilyHandleImpl>(
+              db_->DefaultColumnFamily())
+              ->cfd()
+              ->current()
+              ->storage_info();
+      uint64_t t = kNoTombstoneTime;
+      for (FileMetaData* f : vstorage->LevelFiles(level)) {
+        if (f->oldest_tombstone_time != kNoTombstoneTime &&
+            (t == kNoTombstoneTime || f->oldest_tombstone_time < t)) {
+          t = f->oldest_tombstone_time;
+        }
+      }
+      dbfull()->TEST_UnlockMutex();
+      return t;
+    };
+
+    // L2 holds the data, so the L0 -> L1 compaction below is not bottommost
+    // and keeps the tombstones it does not supersede.
+    for (int i = 0; i < 10; i++) {
+      ASSERT_OK(Put(Key(i), "base"));
+    }
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(2);
+    sleep(10);
+
+    ASSERT_OK(Delete(Key(1)));
+    ASSERT_OK(Flush());
+    const uint64_t old_time = oldest_tombstone_time_at(0);
+    ASSERT_NE(kNoTombstoneTime, old_time);
+
+    sleep(500);
+    ASSERT_OK(Put(Key(1), "new"));
+    ASSERT_OK(Delete(Key(2)));
+    ASSERT_OK(Flush());
+    sleep(10);
+    MoveFilesToLevel(1);
+    ASSERT_EQ("0,1,1", FilesPerLevel());
+
+    const uint64_t t = oldest_tombstone_time_at(1);
+    ASSERT_NE(kNoTombstoneTime, t);
+    if (precise) {
+      // The newer tombstone was written about 500 s later; the mapping is
+      // sampled every 10 s (1000 s / 100), so it may read up to one sample
+      // earlier, never later.
+      ASSERT_GE(t, old_time + 500 - 10);
+      ASSERT_LE(t, old_time + 500);
+    } else {
+      ASSERT_EQ(old_time, t);
+    }
+    ASSERT_EQ("new", Get(Key(1)));
+    ASSERT_EQ("NOT_FOUND", Get(Key(2)));
+  }
+  // The DB uses mock_env_, which is destroyed before DBTestBase closes it.
   Close();
 }
 

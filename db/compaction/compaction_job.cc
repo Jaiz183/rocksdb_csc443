@@ -2461,6 +2461,21 @@ Status CompactionJob::FinishCompactionOutputFile(
         // ancestor time, which is never newer than any entry in the file.
         meta->oldest_tombstone_time = meta->oldest_ancestor_time;
       }
+      // fade_precise_tombstone_age: date the oldest tombstone actually
+      // written to this file. The mapping gives the time of the last sample
+      // taken before that sequence number, so it never postdates the write;
+      // the estimate above is a lower bound too, so the later one is used.
+      const SequenceNumber oldest_seqno =
+          outputs.CurrentOutputOldestTombstoneSeqno();
+      if (oldest_seqno != kMaxSequenceNumber &&
+          !seqno_to_time_mapping_.Empty()) {
+        const uint64_t mapped =
+            seqno_to_time_mapping_.GetProximalTimeBeforeSeqno(oldest_seqno);
+        if (mapped != kUnknownTimeBeforeAll &&
+            mapped > meta->oldest_tombstone_time) {
+          meta->oldest_tombstone_time = mapped;
+        }
+      }
     }
     TEST_SYNC_POINT_CALLBACK(
         "CompactionJob::FinishCompactionOutputFile:oldest_tombstone_time",

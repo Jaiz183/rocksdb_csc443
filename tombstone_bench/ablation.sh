@@ -14,6 +14,7 @@
 #   fade       FADE only (delete_persistence_threshold = $DTH seconds)
 #   fade+skip  FADE + skip+sav: dense size picks and dense FADE picks are
 #              extended by the mode 2 rule (needs a branch with both features)
+#   fade+p, fade+skip+p  the same with fade_precise_tombstone_age=true
 #
 # ONLY="base trig+sav" runs just the named configs.
 #
@@ -48,6 +49,8 @@ CONFIGS=(
   "skip+sav|$T=2;skip_level_tombstone_density_trigger=false"
   "fade|delete_persistence_threshold=$DTH"
   "fade+skip|delete_persistence_threshold=$DTH;$T=2;skip_level_tombstone_density_trigger=false"
+  "fade+p|delete_persistence_threshold=$DTH;fade_precise_tombstone_age=true"
+  "fade+skip+p|delete_persistence_threshold=$DTH;fade_precise_tombstone_age=true;$T=2;skip_level_tombstone_density_trigger=false"
 )
 if [ -n "${ONLY:-}" ]; then
   KEEP=()
