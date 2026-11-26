@@ -360,89 +360,89 @@ TEST_F(DBSkipLevelCompactionTest, RandomizedAgainstModel) {
   // buffers, all three modes, each with FADE off and on; verify against an
   // in-memory model.
   for (uint64_t dth : {uint64_t{0}, uint64_t{20}}) {
-  for (uint32_t mode : {0u, 1u, 2u}) {
-    SCOPED_TRACE("mode " + std::to_string(mode) + " dth " +
-                 std::to_string(dth));
-    env_->SetMockSleep();
-    Options options = SkipOptions();
-    options.delete_persistence_threshold = dth;
-    options.disable_auto_compactions = false;
-    options.write_buffer_size = 64 << 10;
-    options.target_file_size_base = 64 << 10;
-    options.max_bytes_for_level_base = 256 << 10;
-    options.level0_file_num_compaction_trigger = 2;
-    options.skip_level_tombstone_compaction = mode;
-    options.skip_level_tombstone_density_threshold = 0.3;
-    // Preload every key into L3 and again into L2 (auto compaction off), so
-    // the random workload's tombstones sit above deeper data, where FADE and
-    // skip-level have work to do.
-    options.disable_auto_compactions = true;
-    DestroyAndReopen(options);
-    Random rnd(301 + mode);
-    std::map<std::string, std::string> model;
-    const int kKeys = 5000;
-    for (int level = 3; level >= 2; level--) {
-      for (int k = 0; k < kKeys; k++) {
-        std::string v = rnd.RandomString(level == 3 ? 200 : 100);
-        ASSERT_OK(Put(Key(k), v));
-        model[Key(k)] = v;
-      }
-      ASSERT_OK(Flush());
-      MoveFilesToLevel(level);
-    }
-    ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "false"}}));
-    listener_->Clear();
-    for (int round = 0; round < 20; round++) {
-      for (int op = 0; op < 2000; op++) {
-        int k = static_cast<int>(rnd.Uniform(kKeys));
-        uint32_t r = rnd.Uniform(100);
-        if (r < 55) {
-          std::string v = rnd.RandomString(64);
+    for (uint32_t mode : {0u, 1u, 2u}) {
+      SCOPED_TRACE("mode " + std::to_string(mode) + " dth " +
+                   std::to_string(dth));
+      env_->SetMockSleep();
+      Options options = SkipOptions();
+      options.delete_persistence_threshold = dth;
+      options.disable_auto_compactions = false;
+      options.write_buffer_size = 64 << 10;
+      options.target_file_size_base = 64 << 10;
+      options.max_bytes_for_level_base = 256 << 10;
+      options.level0_file_num_compaction_trigger = 2;
+      options.skip_level_tombstone_compaction = mode;
+      options.skip_level_tombstone_density_threshold = 0.3;
+      // Preload every key into L3 and again into L2 (auto compaction off), so
+      // the random workload's tombstones sit above deeper data, where FADE and
+      // skip-level have work to do.
+      options.disable_auto_compactions = true;
+      DestroyAndReopen(options);
+      Random rnd(301 + mode);
+      std::map<std::string, std::string> model;
+      const int kKeys = 5000;
+      for (int level = 3; level >= 2; level--) {
+        for (int k = 0; k < kKeys; k++) {
+          std::string v = rnd.RandomString(level == 3 ? 200 : 100);
           ASSERT_OK(Put(Key(k), v));
           model[Key(k)] = v;
-        } else if (r < 98) {
-          ASSERT_OK(Delete(Key(k)));
-          model.erase(Key(k));
-        } else {
-          int e = std::min(kKeys, k + 20);
-          ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
-                                     Key(k), Key(e)));
-          model.erase(model.lower_bound(Key(k)), model.lower_bound(Key(e)));
         }
+        ASSERT_OK(Flush());
+        MoveFilesToLevel(level);
       }
-      if (round % 5 == 4) {
-        ASSERT_OK(dbfull()->TEST_WaitForCompact());
+      ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "false"}}));
+      listener_->Clear();
+      for (int round = 0; round < 20; round++) {
+        for (int op = 0; op < 2000; op++) {
+          int k = static_cast<int>(rnd.Uniform(kKeys));
+          uint32_t r = rnd.Uniform(100);
+          if (r < 55) {
+            std::string v = rnd.RandomString(64);
+            ASSERT_OK(Put(Key(k), v));
+            model[Key(k)] = v;
+          } else if (r < 98) {
+            ASSERT_OK(Delete(Key(k)));
+            model.erase(Key(k));
+          } else {
+            int e = std::min(kKeys, k + 20);
+            ASSERT_OK(db_->DeleteRange(
+                WriteOptions(), db_->DefaultColumnFamily(), Key(k), Key(e)));
+            model.erase(model.lower_bound(Key(k)), model.lower_bound(Key(e)));
+          }
+        }
+        if (round % 5 == 4) {
+          ASSERT_OK(dbfull()->TEST_WaitForCompact());
+        }
+        // Ages tombstones so FADE TTLs expire as the rounds go on.
+        env_->MockSleepForSeconds(5);
       }
-      // Ages tombstones so FADE TTLs expire as the rounds go on.
-      env_->MockSleepForSeconds(5);
+      ASSERT_OK(dbfull()->TEST_WaitForCompact());
+      std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+      auto mit = model.begin();
+      for (it->SeekToFirst(); it->Valid(); it->Next(), ++mit) {
+        ASSERT_TRUE(mit != model.end());
+        ASSERT_EQ(mit->first, it->key().ToString());
+        ASSERT_EQ(mit->second, it->value().ToString());
+      }
+      ASSERT_OK(it->status());
+      ASSERT_TRUE(mit == model.end());
+      if (mode == 0) {
+        ASSERT_TRUE(SkipRecords().empty());
+      }
+      // Each variant really exercised its feature.
+      int fade_compactions = 0;
+      for (const CompactionRecord& r : listener_->Records()) {
+        fade_compactions += r.reason == CompactionReason::kFadeTtl ? 1 : 0;
+      }
+      if (dth == 0) {
+        ASSERT_EQ(0, fade_compactions);
+      } else if (mode == 0) {
+        ASSERT_GT(fade_compactions, 0);
+      }
+      if (mode == 1) {
+        ASSERT_FALSE(SkipRecords().empty());
+      }
     }
-    ASSERT_OK(dbfull()->TEST_WaitForCompact());
-    std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
-    auto mit = model.begin();
-    for (it->SeekToFirst(); it->Valid(); it->Next(), ++mit) {
-      ASSERT_TRUE(mit != model.end());
-      ASSERT_EQ(mit->first, it->key().ToString());
-      ASSERT_EQ(mit->second, it->value().ToString());
-    }
-    ASSERT_OK(it->status());
-    ASSERT_TRUE(mit == model.end());
-    if (mode == 0) {
-      ASSERT_TRUE(SkipRecords().empty());
-    }
-    // Each variant really exercised its feature.
-    int fade_compactions = 0;
-    for (const CompactionRecord& r : listener_->Records()) {
-      fade_compactions += r.reason == CompactionReason::kFadeTtl ? 1 : 0;
-    }
-    if (dth == 0) {
-      ASSERT_EQ(0, fade_compactions);
-    } else if (mode == 0) {
-      ASSERT_GT(fade_compactions, 0);
-    }
-    if (mode == 1) {
-      ASSERT_FALSE(SkipRecords().empty());
-    }
-  }
   }
 }
 

@@ -1486,83 +1486,88 @@ TEST_F(DBKiWiSecondaryDeleteTest, DeletesBelowTheFloorAndSurvivesRestarts) {
 // and rewritten in one multi-level compaction.
 TEST_F(DBKiWiSecondaryDeleteTest, SecondaryDeleteWithFadeAndSkipLevel) {
   Random64 rnd(Env::Default()->NowMicros());
-  for (uint32_t skip_mode : {1U, 2U}) {
-    SCOPED_TRACE("skip_mode=" + std::to_string(skip_mode));
-    env_->SetMockSleep();
-    Options options = KiWiOptions(4);
-    options.delete_persistence_threshold = 20;
-    options.skip_level_tombstone_compaction = skip_mode;
-    options.skip_level_tombstone_density_threshold = 0.2;
-    options.skip_level_tombstone_density_trigger = false;
-    // A fixed 4-level tree, preloaded below, so tombstones sit above deeper
-    // data where FADE and skip-level have work to do.
-    options.num_levels = 4;
-    options.level_compaction_dynamic_level_bytes = false;
-    DestroyAndReopen(options);
+  for (bool precise : {false, true}) {
+    for (uint32_t skip_mode : {1U, 2U}) {
+      SCOPED_TRACE("skip_mode=" + std::to_string(skip_mode) +
+                   " precise=" + std::to_string(precise));
+      env_->SetMockSleep();
+      Options options = KiWiOptions(4);
+      options.delete_persistence_threshold = 20;
+      options.fade_precise_tombstone_age = precise;
+      options.skip_level_tombstone_compaction = skip_mode;
+      options.skip_level_tombstone_density_threshold = 0.2;
+      options.skip_level_tombstone_density_trigger = false;
+      // A fixed 4-level tree, preloaded below, so tombstones sit above deeper
+      // data where FADE and skip-level have work to do.
+      options.num_levels = 4;
+      options.level_compaction_dynamic_level_bytes = false;
+      DestroyAndReopen(options);
 
-    std::atomic<int> skip_compactions{0};
-    std::atomic<int> fade_compactions{0};
-    SyncPoint::GetInstance()->SetCallBack(
-        "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
-          Compaction* c = static_cast<Compaction*>(arg);
-          if (c->compaction_reason() == CompactionReason::kSkipLevelTombstone) {
-            skip_compactions++;
-          } else if (c->compaction_reason() == CompactionReason::kFadeTtl) {
-            fade_compactions++;
+      std::atomic<int> skip_compactions{0};
+      std::atomic<int> fade_compactions{0};
+      SyncPoint::GetInstance()->SetCallBack(
+          "LevelCompactionPicker::PickCompaction:Return", [&](void* arg) {
+            Compaction* c = static_cast<Compaction*>(arg);
+            if (c->compaction_reason() ==
+                CompactionReason::kSkipLevelTombstone) {
+              skip_compactions++;
+            } else if (c->compaction_reason() == CompactionReason::kFadeTtl) {
+              fade_compactions++;
+            }
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+
+      Model model;
+      uint64_t clock = 1000;
+      // Delete-heavy writes; tombstones age with the mock clock so FADE TTLs
+      // expire, and dense picks are extended by skip-level.
+      auto write_phase = [&](int ops) {
+        for (int op = 0; op < ops; ++op) {
+          const std::string key = KiWiKey(rnd.Uniform(kNumKeys));
+          if (rnd.OneIn(3)) {
+            ASSERT_OK(Delete(key));
+            model.erase(key);
+          } else {
+            const std::string value = TimestampedValue(clock++, &rnd);
+            ASSERT_OK(Put(key, value));
+            model[key] = value;
           }
-        });
-    SyncPoint::GetInstance()->EnableProcessing();
-
-    Model model;
-    uint64_t clock = 1000;
-    // Delete-heavy writes; tombstones age with the mock clock so FADE TTLs
-    // expire, and dense picks are extended by skip-level.
-    auto write_phase = [&](int ops) {
-      for (int op = 0; op < ops; ++op) {
-        const std::string key = KiWiKey(rnd.Uniform(kNumKeys));
-        if (rnd.OneIn(3)) {
-          ASSERT_OK(Delete(key));
-          model.erase(key);
-        } else {
+          if (op % 300 == 299) {
+            ASSERT_OK(Flush());
+            env_->MockSleepForSeconds(3);
+          }
+        }
+        ASSERT_OK(dbfull()->TEST_WaitForCompact());
+      };
+      for (int level = 3; level >= 2; --level) {
+        for (uint64_t i = 0; i < kNumKeys; ++i) {
           const std::string value = TimestampedValue(clock++, &rnd);
-          ASSERT_OK(Put(key, value));
-          model[key] = value;
+          ASSERT_OK(Put(KiWiKey(i), value));
+          model[KiWiKey(i)] = value;
         }
-        if (op % 300 == 299) {
-          ASSERT_OK(Flush());
-          env_->MockSleepForSeconds(3);
-        }
+        ASSERT_OK(Flush());
+        MoveFilesToLevel(level);
       }
-      ASSERT_OK(dbfull()->TEST_WaitForCompact());
-    };
-    for (int level = 3; level >= 2; --level) {
-      for (uint64_t i = 0; i < kNumKeys; ++i) {
-        const std::string value = TimestampedValue(clock++, &rnd);
-        ASSERT_OK(Put(KiWiKey(i), value));
-        model[KiWiKey(i)] = value;
+      write_phase(3000);
+      VerifyModel(model);
+
+      // Hide the oldest third, then keep compacting the floored files.
+      const uint64_t floor = 1000 + (clock - 1000) / 3;
+      ASSERT_OK(DeleteBelow(floor));
+      EraseBelow(&model, floor);
+      VerifyModel(model);
+      write_phase(3000);
+      VerifyModel(model);
+      Reopen(options);
+      VerifyModel(model);
+
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      // Both mechanisms really ran.
+      ASSERT_GT(skip_compactions.load() + fade_compactions.load(), 0);
+      if (skip_mode == 1) {
+        ASSERT_GT(skip_compactions.load(), 0);
       }
-      ASSERT_OK(Flush());
-      MoveFilesToLevel(level);
-    }
-    write_phase(3000);
-    VerifyModel(model);
-
-    // Hide the oldest third, then keep compacting the floored files.
-    const uint64_t floor = 1000 + (clock - 1000) / 3;
-    ASSERT_OK(DeleteBelow(floor));
-    EraseBelow(&model, floor);
-    VerifyModel(model);
-    write_phase(3000);
-    VerifyModel(model);
-    Reopen(options);
-    VerifyModel(model);
-
-    SyncPoint::GetInstance()->DisableProcessing();
-    SyncPoint::GetInstance()->ClearAllCallBacks();
-    // Both mechanisms really ran.
-    ASSERT_GT(skip_compactions.load() + fade_compactions.load(), 0);
-    if (skip_mode == 1) {
-      ASSERT_GT(skip_compactions.load(), 0);
     }
   }
 }
