@@ -1,0 +1,14 @@
+== churn_kiwi+fade+skip_r1 load={ 5.98 7.96 12.18 }
+cf_opts="delete_persistence_threshold=40;skip_level_tombstone_compaction=2;skip_level_tombstone_density_trigger=false;skip_level_tombstone_density_threshold=0.3" run_s=60.0 ops=1200000 (puts=658427 dels=541573 rdels=0) ops/s=20000
+write_amp=5.293  (compaction 353.8 MB + flush 69.4 MB) / user 80.0 MB
+avg_upper_tombstones=16498  peak_tomb_age_ub=60s  avg_sst_MB=80.03
+true_tomb_age: peak=21.5s avg=12.2s samples_over_40s=0/59
+end_of_run: sst_MB=78.97 upper_tombs=9893 total_tombs=9893 levels_KB=0/0/0/0/0/5682/75179
+drained:    sst_MB=79.53 upper_tombs=13439 total_tombs=13439 levels_KB=571/0/0/0/0/5682/75179 space_amp=1.081
+compactions by reason: FadeTtl=29(154.6MB) LevelMaxLevelSize=18(48.2MB) SkipLevelTombstone=56(151.0MB)
+compactions by shape:  L0->L4=38(80.2MB) L0->L5=18(70.8MB) L4->L5=24(88.9MB) L5->L6=23(113.9MB)
+skip-level shapes:      L0->L4=38(80.2MB) L0->L5=18(70.8MB)
+compactions by reason+shape: FadeTtl:L4->L5=15(61.2MB) FadeTtl:L5->L6=14(93.3MB) LevelMaxLevelSize:L4->L5=9(27.6MB) LevelMaxLevelSize:L5->L6=9(20.6MB) SkipLevelTombstone:L0->L4=38(80.2MB) SkipLevelTombstone:L0->L5=18(70.8MB)
+L0 compactions:         SkipLevelTombstone=56(avg_l0_files=2.00,avg_in=3.5MB)
+verify: live_keys=670607 mismatches=0 bg_errors=0 -> PASS
+exit=0

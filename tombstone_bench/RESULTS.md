@@ -798,3 +798,53 @@ pause; one `churn base` run had a load average of 23 and was about 3% low.
 - **On churn at D_th = 10 s both layouts tie,** as on `fade-plus-skip-level`.
   FADE's last-stage rewrites dominate there; see the D_th sweep above for the
   settings where FADE + skip is cheap.
+
+## fade-kiwi-plus-skip-level: precise FADE tombstone ages with KiWi (2026-11-26)
+
+`fade-plus-skip-level`'s `fade_precise_tombstone_age` was merged into this
+branch; only the benchmark scripts and this file conflicted.
+
+### Tests
+
+| suite | result |
+|---|---|
+| `seqno_time_test` | 30/30 |
+| `kiwi_test` | 42/42 |
+| `db_etc3_test` | 25/25 |
+| `db_compaction_test` | 390/390 |
+| `compaction_picker_test` | 181/181 |
+| `db_skip_level_compaction_test` | 8/8 |
+| `options_test` | 84/84 |
+| `version_edit_test` | 36/36 |
+
+`SecondaryDeleteWithFadeAndSkipLevel` now also runs with precise ages on:
+KiWi secondary deletes stay correct through FADE and skip-level compactions in
+all four variants.
+
+### Benchmark
+
+D_th = 40 s, 3 repeats, load-gated. The `kiwi*` configs write KiWi delete
+tiles (`KIWI_TILE_PAGES=4`). All 24 runs pass the model check.
+
+| workload | config | write amp (3 runs) | mean | vs base | vs without the fix (Welch t) | FADE L5 -> L6 per run | peak true age |
+|---|---|---|---|---|---|---|---|
+| seqdel | base | 9.24, 9.19, 9.43 | 9.29 | | | 0 | 4.5-8.2 s |
+| seqdel | KiWi | 9.34, 9.41, 9.37 | 9.37 | +0.9% | | 0 | 5.1-8.7 s |
+| seqdel | KiWi + FADE + skip | 9.15, 9.26, 9.24 | 9.22 | -0.8% | | 0 | 4.7-6.8 s |
+| seqdel | KiWi + FADE + skip + precise | 9.05, 9.06, 9.16 | 9.09 | **-2.1%** | -1.4% (t = -2.5) | 0 | 4.2-7.0 s |
+| churn | base | 4.29, 4.24, 4.32 | 4.28 | | | 0 | 34-40 s |
+| churn | KiWi | 4.33, 4.17, 4.28 | 4.26 | -0.5% | | 0 | 32-37 s |
+| churn | KiWi + FADE + skip | 5.29, 5.51, 5.11 | 5.30 | +23.8% | | 14 | 19.6-21.5 s |
+| churn | KiWi + FADE + skip + precise | 4.56, 4.46, 4.66 | 4.56 | **+6.4%** | **-14.0%** (t = -5.7) | 0 | 20.5-20.6 s |
+
+No run had a sample over 40 s.
+
+### Findings
+
+- The fix carries over with KiWi tiles on. It removes FADE's stale
+  last-level compactions (14 per run -> 0) and cuts churn write amp by 14%.
+  Churn then lands at +6.4% vs base while bounding tombstone age at 40 s;
+  base reaches 40 s.
+- On seqdel with KiWi, FADE + skip + precise ages is -2.1% vs base and -3.0%
+  vs KiWi alone (t = -6.8).
+- KiWi's layout alone stays write-amp neutral: +0.9% (seqdel), -0.5% (churn).
