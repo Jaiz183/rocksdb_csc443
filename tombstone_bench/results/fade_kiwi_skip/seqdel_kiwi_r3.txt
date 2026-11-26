@@ -1,0 +1,13 @@
+== seqdel_kiwi_r3 load={ 10.81 9.44 7.23 }
+cf_opts="" run_s=60.0 ops=1200000 (puts=839529 dels=360471 rdels=0) ops/s=20000
+write_amp=9.331  (compaction 807.2 MB + flush 100.0 MB) / user 97.2 MB
+avg_upper_tombstones=11760  peak_tomb_age_ub=62s  avg_sst_MB=84.58
+true_tomb_age: peak=5.4s avg=2.5s samples_over_10s=0/59
+end_of_run: sst_MB=86.85 upper_tombs=19480 total_tombs=19480 levels_KB=787/0/0/0/2618/13528/72002
+drained:    sst_MB=84.69 upper_tombs=0 total_tombs=0 levels_KB=0/0/0/749/2711/13104/70154 space_amp=1.179
+compactions by reason: LevelL0FilesNum=65(138.7MB) LevelMaxLevelSize=335(668.4MB)
+compactions by shape:  L0->L3=65(138.7MB) L3->L4=122(128.2MB) L4->L5=118(296.5MB) L5->L6=95(243.7MB)
+skip-level shapes:     
+L0 compactions:         LevelL0FilesNum=65(avg_l0_files=2.00,avg_in=2.2MB)
+verify: live_keys=654673 mismatches=0 bg_errors=0 -> PASS
+exit=0
