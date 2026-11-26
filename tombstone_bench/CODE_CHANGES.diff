@@ -1,0 +1,1685 @@
+diff --git a/BUCK b/BUCK
+index dfabafced..f8c6640dc 100644
+--- a/BUCK
++++ b/BUCK
+@@ -5100,6 +5100,12 @@ cpp_unittest_wrapper(name="db_secondary_test",
+             extra_compiler_flags=[])
+ 
+ 
++cpp_unittest_wrapper(name="db_skip_level_compaction_test",
++            srcs=["db/db_skip_level_compaction_test.cc"],
++            deps=[":rocksdb_test_lib"],
++            extra_compiler_flags=[])
++
++
+ cpp_unittest_wrapper(name="db_split_merge_test",
+             srcs=["utilities/db_split_merge_test.cc"],
+             deps=[":rocksdb_test_lib"],
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2bb63bcc5..117880070 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1510,6 +1510,7 @@ if(WITH_TESTS)
+         db/db_bloom_filter_test.cc
+         db/db_compaction_filter_test.cc
+         db/db_compaction_test.cc
++        db/db_skip_level_compaction_test.cc
+         db/db_compaction_abort_test.cc
+         db/db_clip_test.cc
+         utilities/db_split_merge_test.cc
+diff --git a/Makefile b/Makefile
+index 011a76256..d43ddf3b8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1779,6 +1779,9 @@ db_log_iter_test: $(OBJ_DIR)/db/db_log_iter_test.o $(TEST_LIBRARY) $(LIBRARY)
+ db_compaction_filter_test: $(OBJ_DIR)/db/db_compaction_filter_test.o $(TEST_LIBRARY) $(LIBRARY)
+ 	$(AM_LINK)
+ 
++db_skip_level_compaction_test: $(OBJ_DIR)/db/db_skip_level_compaction_test.o $(TEST_LIBRARY) $(LIBRARY)
++	$(AM_LINK)
++
+ db_compaction_test: $(OBJ_DIR)/db/db_compaction_test.o $(TEST_LIBRARY) $(LIBRARY)
+ 	$(AM_LINK)
+ 
+diff --git a/db/column_family.cc b/db/column_family.cc
+index 669388c61..4761e22da 100644
+--- a/db/column_family.cc
++++ b/db/column_family.cc
+@@ -1653,6 +1653,22 @@ Status ColumnFamilyData::ValidateOptions(
+         "Use 0.0 to disable.");
+   }
+ 
++  if (cf_options.skip_level_tombstone_compaction > 2) {
++    return Status::InvalidArgument(
++        "skip_level_tombstone_compaction must be 0 (off), 1 (always) or 2 "
++        "(cost-based).");
++  }
++  if (!(cf_options.skip_level_tombstone_density_threshold > 0.0 &&
++        cf_options.skip_level_tombstone_density_threshold <= 1.0)) {
++    return Status::InvalidArgument(
++        "skip_level_tombstone_density_threshold must be in (0, 1].");
++  }
++  if (!(cf_options.skip_level_max_overlap_ratio >= 1.0) ||
++      std::isinf(cf_options.skip_level_max_overlap_ratio)) {
++    return Status::InvalidArgument(
++        "skip_level_max_overlap_ratio must be finite and >= 1.");
++  }
++
+   if (cf_options.compaction_style == kCompactionStyleFIFO &&
+       db_options.max_open_files != -1 && cf_options.ttl > 0) {
+     return Status::NotSupported(
+diff --git a/db/compaction/compaction.cc b/db/compaction/compaction.cc
+index 21e77f9dc..1f616cc4c 100644
+--- a/db/compaction/compaction.cc
++++ b/db/compaction/compaction.cc
+@@ -592,6 +592,19 @@ bool Compaction::IsTrivialMove() const {
+     return false;
+   }
+ 
++  if (compaction_reason_ == CompactionReason::kFadeTtl && bottommost_level_) {
++    // [FADE] Moving a file with expired tombstones into the bottommost level
++    // without rewriting it would keep the tombstones (and the data they
++    // invalidate) alive. The rewrite is what persists the delete.
++    return false;
++  }
++
++  if (compaction_reason_ == CompactionReason::kSkipLevelTombstone) {
++    // The point is to rewrite the tombstones (and drop them when the output
++    // is bottommost), so never just move the file.
++    return false;
++  }
++
+   // Used in universal compaction, where trivial move can be done if the
+   // input files are non overlapping
+   if ((mutable_cf_options_.compaction_options_universal.allow_trivial_move) &&
+@@ -1046,6 +1059,28 @@ uint64_t Compaction::MinInputFileOldestAncestorTime(
+   return min_oldest_ancestor_time;
+ }
+ 
++uint64_t Compaction::MinInputFileOldestTombstoneTime(
++    const InternalKey* start, const InternalKey* end) const {
++  uint64_t min_tombstone_time = std::numeric_limits<uint64_t>::max();
++  const InternalKeyComparator& icmp =
++      column_family_data()->internal_comparator();
++  for (const auto& level_files : inputs_) {
++    for (const auto& file : level_files.files) {
++      if (start != nullptr && icmp.Compare(file->largest, *start) < 0) {
++        continue;
++      }
++      if (end != nullptr && icmp.Compare(file->smallest, *end) > 0) {
++        continue;
++      }
++      uint64_t t = file->TryGetOldestTombstoneTime();
++      if (t != kNoTombstoneTime) {
++        min_tombstone_time = std::min(min_tombstone_time, t);
++      }
++    }
++  }
++  return min_tombstone_time;
++}
++
+ uint64_t Compaction::MinInputFileEpochNumber() const {
+   uint64_t min_epoch_number = std::numeric_limits<uint64_t>::max();
+   for (const auto& inputs_per_level : inputs_) {
+diff --git a/db/compaction/compaction.h b/db/compaction/compaction.h
+index 915187fd2..cb2c187cd 100644
+--- a/db/compaction/compaction.h
++++ b/db/compaction/compaction.h
+@@ -468,6 +468,12 @@ class Compaction {
+   // This is used to filter out some input files' ancestor's time range.
+   uint64_t MinInputFileOldestAncestorTime(const InternalKey* start,
+                                           const InternalKey* end) const;
++  // [FADE] start and end are the output file's key range. Returns the
++  // oldest tombstone time among input files overlapping that range that carry
++  // tombstones, or std::numeric_limits<uint64_t>::max() if none do.
++  uint64_t MinInputFileOldestTombstoneTime(const InternalKey* start,
++                                           const InternalKey* end) const;
++
+   // Return the minimum epoch number among
+   // input files' associated with this compaction
+   uint64_t MinInputFileEpochNumber() const;
+diff --git a/db/compaction/compaction_job.cc b/db/compaction/compaction_job.cc
+index 173d8632c..e15844041 100644
+--- a/db/compaction/compaction_job.cc
++++ b/db/compaction/compaction_job.cc
+@@ -170,6 +170,10 @@ const char* GetCompactionReasonString(CompactionReason compaction_reason) {
+       return "RefitLevel";
+     case CompactionReason::kReadTriggered:
+       return "ReadTriggered";
++    case CompactionReason::kFadeTtl:
++      return "FadeTtl";
++    case CompactionReason::kSkipLevelTombstone:
++      return "SkipLevelTombstone";
+     case CompactionReason::kNumOfReasons:
+       // fall through
+     default:
+@@ -2438,6 +2442,44 @@ Status CompactionJob::FinishCompactionOutputFile(
+         }
+       }
+     }
++
++    // [FADE] Carry a_max forward. If tombstones survived into this output
++    // file, it inherits the oldest tombstone time of the overlapping inputs.
++    // This is conservative (it may pick a tombstone that was actually
++    // dropped), so FADE can only compact earlier than strictly needed, never
++    // later. If no tombstones survived (e.g. bottommost compaction), clear it.
++    const TableProperties tp = outputs.GetTableProperties();
++    meta->oldest_tombstone_time = kNoTombstoneTime;
++    if (tp.num_deletions > 0 || tp.num_range_deletions > 0) {
++      uint64_t t = sub_compact->compaction->MinInputFileOldestTombstoneTime(
++          meta->smallest.size() > 0 ? &(meta->smallest) : nullptr,
++          meta->largest.size() > 0 ? &(meta->largest) : nullptr);
++      if (t != std::numeric_limits<uint64_t>::max()) {
++        meta->oldest_tombstone_time = t;
++      } else {
++        // Inputs had no recorded tombstone time; fall back to the oldest
++        // ancestor time, which is never newer than any entry in the file.
++        meta->oldest_tombstone_time = meta->oldest_ancestor_time;
++      }
++      // fade_precise_tombstone_age: date the oldest tombstone actually
++      // written to this file. The mapping gives the time of the last sample
++      // taken before that sequence number, so it never postdates the write;
++      // the estimate above is a lower bound too, so the later one is used.
++      const SequenceNumber oldest_seqno =
++          outputs.CurrentOutputOldestTombstoneSeqno();
++      if (oldest_seqno != kMaxSequenceNumber &&
++          !seqno_to_time_mapping_.Empty()) {
++        const uint64_t mapped =
++            seqno_to_time_mapping_.GetProximalTimeBeforeSeqno(oldest_seqno);
++        if (mapped != kUnknownTimeBeforeAll &&
++            mapped > meta->oldest_tombstone_time) {
++          meta->oldest_tombstone_time = mapped;
++        }
++      }
++    }
++    TEST_SYNC_POINT_CALLBACK(
++        "CompactionJob::FinishCompactionOutputFile:oldest_tombstone_time",
++        &meta->oldest_tombstone_time);
+   }
+ 
+   // Finish and check for file errors
+diff --git a/db/compaction/compaction_outputs.cc b/db/compaction/compaction_outputs.cc
+index 5ed242930..c5448bc13 100644
+--- a/db/compaction/compaction_outputs.cc
++++ b/db/compaction/compaction_outputs.cc
+@@ -52,6 +52,8 @@ Status CompactionOutputs::Finish(
+     meta->fd.file_size = current_bytes;
+     meta->tail_size = builder_->GetTailSize();
+     meta->marked_for_compaction = builder_->NeedCompact();
++    meta->from_skip_level_compaction = compaction_->compaction_reason() ==
++                                       CompactionReason::kSkipLevelTombstone;
+     const TableProperties& tp = builder_->GetTableProperties();
+     meta->user_defined_timestamps_persisted =
+         static_cast<bool>(tp.user_defined_timestamps_persisted);
+@@ -501,6 +503,14 @@ Status CompactionOutputs::AddToOutput(
+ 
+     if (add_result == TableBuilderAddResult::kAdded) {
+       current_output().validator.AddValidated(key, value);
++      if (track_tombstone_seqno_) {
++        const ParsedInternalKey& ikey = c_iter.ikey();
++        if (ikey.type == kTypeDeletion || ikey.type == kTypeSingleDeletion ||
++            ikey.type == kTypeDeletionWithTimestamp) {
++          SequenceNumber& oldest = current_output().oldest_tombstone_seqno;
++          oldest = std::min(oldest, ikey.sequence);
++        }
++      }
+       break;
+     }
+ 
+@@ -888,6 +898,10 @@ Status CompactionOutputs::AddRangeDels(
+ 
+     // Range tombstone is not supported by output validator yet.
+     builder_->Add(kv.first.Encode(), kv.second);
++    if (track_tombstone_seqno_) {
++      SequenceNumber& oldest = current_output().oldest_tombstone_seqno;
++      oldest = std::min(oldest, tombstone.seq_);
++    }
+     assert(icmp.Compare(tombstone_start, tombstone_end) <= 0);
+     meta.UpdateBoundariesForRange(tombstone_start, tombstone_end,
+                                   tombstone.seq_, icmp);
+@@ -963,6 +977,9 @@ void CompactionOutputs::FillFilesToCutForTtl() {
+ CompactionOutputs::CompactionOutputs(const Compaction* compaction,
+                                      const bool is_proximal_level)
+     : compaction_(compaction), is_proximal_level_(is_proximal_level) {
++  track_tombstone_seqno_ =
++      compaction->mutable_cf_options().fade_precise_tombstone_age &&
++      compaction->mutable_cf_options().delete_persistence_threshold > 0;
+   partitioner_ = compaction->output_level() == 0
+                      ? nullptr
+                      : compaction->CreateSstPartitioner();
+diff --git a/db/compaction/compaction_outputs.h b/db/compaction/compaction_outputs.h
+index 88dd0128b..76c0f9e6a 100644
+--- a/db/compaction/compaction_outputs.h
++++ b/db/compaction/compaction_outputs.h
+@@ -42,6 +42,10 @@ class CompactionOutputs {
+     bool finished;
+     bool is_proximal_level;
+     std::shared_ptr<const TableProperties> table_properties;
++    // [FADE] Smallest sequence number among the point and range tombstones
++    // written to this file; kMaxSequenceNumber if none (or not tracked, see
++    // track_tombstone_seqno_).
++    SequenceNumber oldest_tombstone_seqno = kMaxSequenceNumber;
+   };
+ 
+   CompactionOutputs() = delete;
+@@ -186,6 +190,11 @@ class CompactionOutputs {
+ 
+   FileMetaData* GetMetaData() { return &current_output().meta; }
+ 
++  // [FADE] See Output::oldest_tombstone_seqno. Current (last) output only.
++  SequenceNumber CurrentOutputOldestTombstoneSeqno() {
++    return current_output().oldest_tombstone_seqno;
++  }
++
+   bool HasOutput() const { return !outputs_.empty(); }
+ 
+   uint64_t NumEntries() const { return builder_->NumEntries(); }
+@@ -345,6 +354,10 @@ class CompactionOutputs {
+ 
+   const Compaction* compaction_;
+ 
++  // [FADE] Record Output::oldest_tombstone_seqno; only when
++  // fade_precise_tombstone_age and delete_persistence_threshold are set.
++  bool track_tombstone_seqno_ = false;
++
+   // current output builder and writer
+   std::unique_ptr<TableBuilder> builder_;
+   std::unique_ptr<WritableFileWriter> file_writer_;
+diff --git a/db/compaction/compaction_picker_level.cc b/db/compaction/compaction_picker_level.cc
+index 98b36219f..92a6812e8 100644
+--- a/db/compaction/compaction_picker_level.cc
++++ b/db/compaction/compaction_picker_level.cc
+@@ -15,12 +15,17 @@
+ 
+ #include "db/version_edit.h"
+ #include "logging/log_buffer.h"
++#include "logging/logging.h"
+ #include "test_util/sync_point.h"
+ 
+ namespace ROCKSDB_NAMESPACE {
+ 
+ bool LevelCompactionPicker::NeedsCompaction(
+     const VersionStorageInfo* vstorage) const {
++  // [FADE] delete-driven trigger
++  if (!vstorage->FadeExpiredFiles().empty()) {
++    return true;
++  }
+   if (!vstorage->ExpiredTtlFiles().empty()) {
+     return true;
+   }
+@@ -39,6 +44,9 @@ bool LevelCompactionPicker::NeedsCompaction(
+   if (!vstorage->ReadTriggeredCompactionFiles().empty()) {
+     return true;
+   }
++  if (!vstorage->TombstoneDenseFiles().empty()) {
++    return true;
++  }
+   for (int i = 0; i <= vstorage->MaxInputLevel(); i++) {
+     if (vstorage->CompactionScore(i) >= 1) {
+       return true;
+@@ -82,6 +90,15 @@ class LevelCompactionBuilder {
+   // in Intra-L0 compactions)
+   void SetupInitialFiles();
+ 
++  // [FADE] Delete-driven trigger + delete-driven file selection (DD mode).
++  // Returns true and fills start_level_inputs_ if a compaction was picked.
++  bool PickFadeCompaction();
++
++  // [FADE] Like PickFadeCompaction(), but only considers expired files in
++  // `level`. Used when a size-triggered compaction has already chosen the
++  // level: within that level, prefer a file whose tombstones have expired.
++  bool PickFadeCompactionAtLevel(int level);
++
+   // If the initial files are from L0 level, pick other L0
+   // files if needed.
+   bool SetupOtherL0FilesIfNeeded();
+@@ -95,6 +112,29 @@ class LevelCompactionBuilder {
+ 
+   Compaction* GetCompaction();
+ 
++  // Skip-level tombstone compaction (see
++  // AdvancedColumnFamilyOptions::skip_level_tombstone_compaction).
++  //
++  // True iff the picked start-level inputs should be considered for a
++  // skip-level compaction.
++  bool ShouldTrySkipLevel() const;
++
++  // Density trigger: tries the tombstone-dense files, densest first, and sets
++  // up the first one for which TrySetupSkipLevelCompaction() finds a target
++  // deeper than the normal output level. A dense file that cannot skip is left
++  // to size-based compaction: a one-level compaction picked only for its
++  // tombstones costs a full extra level crossing and its output is usually
++  // still dense, so it would be picked again at the next level.
++  bool PickSkipLevelTriggerCompaction();
++  // True once TrySetupSkipLevelCompaction() succeeded for the current pick.
++  bool skip_level_set_up_ = false;
++  // Tries to turn the picked start-level inputs into a multi-level
++  // compaction start_level_ -> t with t deeper than the normal output level.
++  // On success fills compaction_inputs_, output_level_, grandparents_ and
++  // compaction_reason_ and returns true. On failure leaves the builder state
++  // untouched so the normal path can proceed.
++  bool TrySetupSkipLevelCompaction();
++
+   // From `start_level_`, pick files to compact to `output_level_`.
+   // Returns false if there is no file to compact.
+   // If it returns true, inputs->files.size() will be exactly one for
+@@ -204,7 +244,64 @@ void LevelCompactionBuilder::PickFileToCompact(
+   start_level_inputs_.files.clear();
+ }
+ 
++bool LevelCompactionBuilder::PickFadeCompaction() {
++  const auto& fade_files = vstorage_->FadeExpiredFiles();
++  if (fade_files.empty()) {
++    return false;
++  }
++  // FadeExpiredFiles() is already ordered by (level, oldest tombstone,
++  // #tombstones). kSkipLastLevel: a file is moved one level down
++  // (L0 -> base_level, Ln -> Ln+1) and never self-compacted in the last level.
++  PickFileToCompact(fade_files, CompactToNextLevel::kSkipLastLevel);
++  if (!start_level_inputs_.empty()) {
++    compaction_reason_ = CompactionReason::kFadeTtl;
++    TEST_SYNC_POINT_CALLBACK("LevelCompactionBuilder::PickFadeCompaction:Picked",
++                             &start_level_);
++    return true;
++  }
++  return false;
++}
++
++bool LevelCompactionBuilder::PickFadeCompactionAtLevel(int level) {
++  autovector<std::pair<int, FileMetaData*>> level_files;
++  for (const std::pair<int, FileMetaData*>& level_file :
++       vstorage_->FadeExpiredFiles()) {
++    if (level_file.first == level) {
++      level_files.push_back(level_file);
++    }
++  }
++  if (level_files.empty()) {
++    return false;
++  }
++  PickFileToCompact(level_files, CompactToNextLevel::kSkipLastLevel);
++  if (!start_level_inputs_.empty()) {
++    compaction_reason_ = CompactionReason::kFadeTtl;
++    TEST_SYNC_POINT_CALLBACK("LevelCompactionBuilder::PickFadeCompaction:Picked",
++                             &start_level_);
++    return true;
++  }
++  return false;
++}
++
+ void LevelCompactionBuilder::SetupInitialFiles() {
++  // [FADE] Starvation guard. An expired tombstone TTL takes precedence over
++  // saturation (paper Sec. 4.1.4) only while the tree is healthy, i.e. no
++  // level's size score has reached kFadeYieldScore. FADE's smallest-level-
++  // first order means that, with a short L0 deadline, there is almost always
++  // an expired candidate; if FADE always went first, size-triggered
++  // compactions would starve whenever compaction bandwidth is tight, levels
++  // would overfill and the backlog would feed on itself. Once a level is
++  // that far over its target, the size-based picker chooses the level, and
++  // FADE only chooses which file in that level to compact (see the loop
++  // below). The scores are sorted in descending order, so CompactionScore(0)
++  // is the maximum. L0's score is #files / level0_file_num_compaction_trigger,
++  // so this also covers L0 backlogs well before the write-slowdown trigger.
++  static constexpr double kFadeYieldScore = 1.5;
++  const bool tree_saturated = vstorage_->CompactionScore(0) >= kFadeYieldScore;
++  if (!tree_saturated && PickFadeCompaction()) {
++    return;
++  }
++
+   // Find the compactions by size on all levels.
+   bool skipped_l0_to_base = false;
+   for (int i = 0; i < compaction_picker_->NumberLevels() - 1; i++) {
+@@ -218,6 +315,14 @@ void LevelCompactionBuilder::SetupInitialFiles() {
+         // may starve.
+         continue;
+       }
++      // [FADE] The tree is saturated and this level needs a size-based
++      // compaction anyway: compact a file with expired tombstones from it if
++      // there is one (L0 is excluded; its size-based compaction already takes
++      // all overlapping L0 files).
++      if (tree_saturated && start_level_ > 0 &&
++          PickFadeCompactionAtLevel(start_level_)) {
++        break;
++      }
+       output_level_ =
+           (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
+       bool picked_file_to_compact = PickFileToCompact();
+@@ -262,6 +367,20 @@ void LevelCompactionBuilder::SetupInitialFiles() {
+     return;
+   }
+ 
++  // [FADE] The tree is saturated but no size-based compaction was possible
++  // (e.g. the saturated levels are busy): do not let expired files wait.
++  if (tree_saturated && PickFadeCompaction()) {
++    return;
++  }
++
++  // Skip-level tombstone compaction trigger: tombstone-dense files above the
++  // last non-empty level. Runs after size-based compaction so it never
++  // starves it.
++  parent_index_ = base_index_ = -1;
++  if (PickSkipLevelTriggerCompaction()) {
++    return;
++  }
++
+   // if we didn't find a compaction, check if there are any files marked for
+   // compaction
+   parent_index_ = base_index_ = -1;
+@@ -538,6 +657,13 @@ Compaction* LevelCompactionBuilder::PickCompaction() {
+   }
+   assert(start_level_ >= 0 && output_level_ >= 0);
+ 
++  if (skip_level_set_up_ ||
++      (ShouldTrySkipLevel() && TrySetupSkipLevelCompaction())) {
++    Compaction* c = GetCompaction();
++    TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
++    return c;
++  }
++
+   // If it is a L0 -> base level compaction, we need to set up other L0
+   // files if needed.
+   if (!SetupOtherL0FilesIfNeeded()) {
+@@ -599,6 +725,225 @@ Compaction* LevelCompactionBuilder::GetCompaction() {
+   return c;
+ }
+ 
++bool LevelCompactionBuilder::PickSkipLevelTriggerCompaction() {
++  for (const auto& level_file : vstorage_->TombstoneDenseFiles()) {
++    assert(!level_file.second->being_compacted);
++    start_level_ = level_file.first;
++    if (start_level_ >= vstorage_->num_non_empty_levels() - 1 ||
++        (start_level_ == 0 &&
++         !compaction_picker_->level0_compactions_in_progress()->empty())) {
++      continue;
++    }
++    output_level_ =
++        (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
++    start_level_inputs_.files = {level_file.second};
++    start_level_inputs_.level = start_level_;
++    if (!compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
++                                                    &start_level_inputs_)) {
++      continue;
++    }
++    if (TrySetupSkipLevelCompaction()) {
++      return true;
++    }
++  }
++  start_level_inputs_.files.clear();
++  return false;
++}
++
++bool LevelCompactionBuilder::ShouldTrySkipLevel() const {
++  if (mutable_cf_options_.skip_level_tombstone_compaction == 0 ||
++      is_l0_trivial_move_ || output_level_ == start_level_ ||
++      start_level_inputs_.empty()) {
++    return false;
++  }
++  if (compaction_reason_ == CompactionReason::kSkipLevelTombstone) {
++    return true;
++  }
++  // Size-triggered and FADE (expired tombstone TTL) picks can be extended.
++  // FADE decides when a file's tombstones must move down; the skip rule
++  // decides how many levels they can cross in that one rewrite.
++  if (compaction_reason_ != CompactionReason::kLevelL0FilesNum &&
++      compaction_reason_ != CompactionReason::kLevelMaxLevelSize &&
++      compaction_reason_ != CompactionReason::kFadeTtl) {
++    return false;
++  }
++  // Only extend the pick if the start inputs are dense.
++  uint64_t entries = 0;
++  uint64_t deletions = 0;
++  for (const FileMetaData* f : start_level_inputs_.files) {
++    entries += f->num_entries;
++    deletions += f->num_deletions;
++  }
++  return entries > 0 &&
++         static_cast<double>(deletions) >=
++             mutable_cf_options_.skip_level_tombstone_density_threshold *
++                 static_cast<double>(entries);
++}
++
++bool LevelCompactionBuilder::TrySetupSkipLevelCompaction() {
++  const int start = start_level_;
++  const int last = vstorage_->num_non_empty_levels() - 1;
++  const int first_next = (start == 0) ? vstorage_->base_level() : start + 1;
++  // If the normal output level is already the last level there is nothing to
++  // skip.
++  if (first_next >= last) {
++    return false;
++  }
++  const uint32_t mode = mutable_cf_options_.skip_level_tombstone_compaction;
++
++  CompactionInputFiles start_inputs = start_level_inputs_;
++  if (start == 0) {
++    // Same rule as GetOverlappingL0Files(): only one compaction out of L0 at a
++    // time, and take every L0 file overlapping the picked range.
++    if (!compaction_picker_->level0_compactions_in_progress()->empty()) {
++      return false;
++    }
++    InternalKey smallest;
++    InternalKey largest;
++    compaction_picker_->GetRange(start_inputs, &smallest, &largest);
++    start_inputs.files.clear();
++    vstorage_->GetOverlappingInputs(0, &smallest, &largest, &start_inputs.files,
++                                    /*hint_index=*/-1, /*file_index=*/nullptr,
++                                    /*expand_range=*/true);
++    if (compaction_picker_->AreFilesInCompaction(start_inputs.files)) {
++      return false;
++    }
++  }
++  const uint64_t start_bytes = TotalFileSize(start_inputs.files);
++  if (start_bytes == 0) {
++    return false;
++  }
++
++  // Every level in (start, t] must not receive output from a running
++  // compaction in our (final) key range: data written there while we move
++  // newer data past it would end up above older data... or below newer data.
++  auto conflicts_with_running =
++      [&](const std::vector<CompactionInputFiles>& inputs, int t) {
++        for (int j = first_next; j <= t; j++) {
++          if (compaction_picker_->FilesRangeOverlapWithCompaction(
++                  inputs, j,
++                  Compaction::EvaluateProximalLevel(
++                      vstorage_, mutable_cf_options_, ioptions_, start, j))) {
++            return true;
++          }
++        }
++        return false;
++      };
++
++  std::vector<CompactionInputFiles> inputs;
++  inputs.push_back(start_inputs);
++  uint64_t total_bytes = start_bytes;
++
++  // Mode 2 (amortized cascade). Let S = start_bytes, n = first_next, B(j) =
++  // total_bytes after adding level j, and T = max_bytes_for_level_multiplier.
++  // The first hop (start -> n) costs B(n) either way. In steady state every
++  // later one-level hop of S bytes costs about (1 + T) * S amortized: the
++  // overlap it meets at the next level is shared with data arriving from other
++  // compactions. Skipping to t instead pays the measured extra overlap
++  // B(t) - B(n) now, so the estimated saving is
++  //   net(t) = (t - n) * (1 + T) * S - (B(t) - B(n)),
++  // which is positive only when the overlap below n is well under the tree's
++  // average. Take the t with the largest net(t) > 0 (ties go deeper); also
++  // never let the compaction grow past skip_level_max_overlap_ratio * B(n).
++  const double hop_bytes =
++      (1.0 + mutable_cf_options_.max_bytes_for_level_multiplier) *
++      static_cast<double>(start_bytes);
++  int best_level = -1;
++  size_t best_num_inputs = 0;
++  uint64_t normal_bytes = 0;  // B(n)
++  double best_net = 0.0;
++  for (int j = first_next; j <= last; j++) {
++    InternalKey smallest;
++    InternalKey largest;
++    compaction_picker_->GetRange(inputs, &smallest, &largest,
++                                 Compaction::kInvalidLevel);
++    CompactionInputFiles level_inputs;
++    level_inputs.level = j;
++    vstorage_->GetOverlappingInputs(j, &smallest, &largest,
++                                    &level_inputs.files);
++    if (!level_inputs.empty()) {
++      if (!compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
++                                                      &level_inputs)) {
++        // Some file at this depth is being compacted: cannot go deeper.
++        break;
++      }
++      total_bytes += TotalFileSize(level_inputs.files);
++      inputs.push_back(level_inputs);
++    }
++    if (total_bytes > mutable_cf_options_.max_compaction_bytes) {
++      break;
++    }
++    if (conflicts_with_running(inputs, j)) {
++      break;
++    }
++    if (j == first_next) {
++      normal_bytes = total_bytes;
++      best_level = j;
++      best_num_inputs = inputs.size();
++      continue;
++    }
++    if (mode == 1) {
++      best_level = j;
++      best_num_inputs = inputs.size();
++      continue;
++    }
++    const double growth =
++        static_cast<double>(total_bytes) / static_cast<double>(normal_bytes);
++    if (growth > mutable_cf_options_.skip_level_max_overlap_ratio) {
++      // B(j) only grows with j, so no deeper level can qualify either.
++      break;
++    }
++    const double net = static_cast<double>(j - first_next) * hop_bytes -
++                       static_cast<double>(total_bytes - normal_bytes);
++    if (net > 0.0 && net >= best_net) {
++      best_level = j;
++      best_num_inputs = inputs.size();
++      best_net = net;
++    }
++  }
++  TEST_SYNC_POINT_CALLBACK(
++      "LevelCompactionBuilder::TrySetupSkipLevelCompaction:BestLevel",
++      &best_level);
++  if (best_level <= first_next) {
++    // Not deeper than a normal compaction: let the normal path handle it.
++    return false;
++  }
++
++  ROCKS_LOG_BUFFER(log_buffer_,
++                   "[%s] Skip-level tombstone compaction L%d -> L%d (normal "
++                   "L%d): %" PRIu64
++                   " normal bytes, est. %.0f bytes saved "
++                   "(mode 2 only)",
++                   cf_name_.c_str(), start, best_level, first_next,
++                   normal_bytes, best_net);
++  inputs.resize(best_num_inputs);
++  output_level_ = best_level;
++  start_level_inputs_ = inputs[0];
++  compaction_inputs_ = std::move(inputs);
++  compaction_reason_ = CompactionReason::kSkipLevelTombstone;
++
++  // Grandparents: first level below the output level with overlapping files.
++  InternalKey smallest;
++  InternalKey largest;
++  compaction_picker_->GetRange(compaction_inputs_, &smallest, &largest,
++                               Compaction::kInvalidLevel);
++  grandparents_.clear();
++  for (int level = output_level_ + 1;
++       level < compaction_picker_->NumberLevels(); level++) {
++    vstorage_->GetOverlappingInputs(level, &smallest, &largest, &grandparents_);
++    if (!grandparents_.empty()) {
++      break;
++    }
++  }
++  ROCKS_LOG_BUFFER(log_buffer_,
++                   "[%s] Skip-level tombstone compaction: L%d -> L%d, "
++                   "%zu input levels",
++                   cf_name_.c_str(), start, output_level_,
++                   compaction_inputs_.size());
++  skip_level_set_up_ = true;
++  return true;
++}
++
+ /*
+  * Find the optimal path to place a file
+  * Given a level, finds the path where levels up to it will fit in levels
+diff --git a/db/db_impl/db_impl.cc b/db/db_impl/db_impl.cc
+index 3af5bcf71..0cfd97e2b 100644
+--- a/db/db_impl/db_impl.cc
++++ b/db/db_impl/db_impl.cc
+@@ -2147,7 +2147,9 @@ Status DBImpl::SetOptions(
+     bool needs_seqno_worker = update_seqno_worker;
+     for (const auto& cf_opts : column_families_opts_map) {
+       if (cf_opts.second.count("preserve_internal_time_seconds") > 0 ||
+-          cf_opts.second.count("preclude_last_level_data_seconds") > 0) {
++          cf_opts.second.count("preclude_last_level_data_seconds") > 0 ||
++          cf_opts.second.count("delete_persistence_threshold") > 0 ||
++          cf_opts.second.count("fade_precise_tombstone_age") > 0) {
+         needs_seqno_worker = true;
+         break;
+       }
+@@ -5106,7 +5108,9 @@ Status DBImpl::WrapUpCreateColumnFamilies(
+   bool register_worker = false;
+   for (auto* opts_ptr : cf_options) {
+     if (opts_ptr->preserve_internal_time_seconds > 0 ||
+-        opts_ptr->preclude_last_level_data_seconds > 0) {
++        opts_ptr->preclude_last_level_data_seconds > 0 ||
++        (opts_ptr->fade_precise_tombstone_age &&
++         opts_ptr->delete_persistence_threshold > 0)) {
+       register_worker = true;
+       break;
+     }
+diff --git a/db/flush_job.cc b/db/flush_job.cc
+index 39d72c4e7..a621a4556 100644
+--- a/db/flush_job.cc
++++ b/db/flush_job.cc
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cinttypes>
++#include <limits>
+ #include <vector>
+ 
+ #include "db/builder.h"
+@@ -1083,6 +1084,28 @@ Status FlushJob::WriteLevel0Table() {
+           base_, &memtable_payload_bytes, &memtable_garbage_bytes, &flush_stats,
+           blob_file_garbages_for_filtering, fast_sst_open_);
+       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
++
++      // [FADE] a_max bookkeeping for the new L0 file: the oldest tombstone
++      // insertion time across all memtables being flushed. Only recorded if
++      // the output actually contains point or range tombstones.
++      if (s.ok() && (table_properties_.num_deletions > 0 ||
++                     table_properties_.num_range_deletions > 0)) {
++        uint64_t oldest_tombstone_time = std::numeric_limits<uint64_t>::max();
++        for (ReadOnlyMemTable* m : mems_) {
++          oldest_tombstone_time = std::min(oldest_tombstone_time,
++                                           m->ApproximateOldestTombstoneTime());
++        }
++        if (oldest_tombstone_time == std::numeric_limits<uint64_t>::max()) {
++          // Not tracked (e.g. non-MemTable implementation): fall back to the
++          // oldest key time, which is never newer than any tombstone.
++          oldest_tombstone_time = oldest_ancestor_time;
++        }
++        meta_.oldest_tombstone_time = oldest_tombstone_time;
++      } else {
++        meta_.oldest_tombstone_time = kNoTombstoneTime;
++      }
++      TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:oldest_tombstone_time",
++                               &meta_.oldest_tombstone_time);
+       // TODO: Cleanup io_status in BuildTable and table builders
+       assert(!s.ok() || io_s.ok());
+       io_s.PermitUncheckedError();
+diff --git a/db/memtable.cc b/db/memtable.cc
+index 57db773b1..198455f66 100644
+--- a/db/memtable.cc
++++ b/db/memtable.cc
+@@ -229,6 +229,7 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
+       insert_with_hint_prefix_extractor_(
+           ioptions.memtable_insert_with_hint_prefix_extractor.get()),
+       oldest_key_time_(std::numeric_limits<uint64_t>::max()),
++      oldest_tombstone_time_(std::numeric_limits<uint64_t>::max()),
+       approximate_memory_usage_(0),
+       memtable_max_range_deletions_(
+           mutable_cf_options.memtable_max_range_deletions),
+@@ -403,6 +404,22 @@ void MemTable::UpdateOldestKeyTime() {
+   }
+ }
+ 
++void MemTable::UpdateOldestTombstoneTime() {
++  // Same pattern as UpdateOldestKeyTime(): only the first tombstone pays for a
++  // clock read; every later tombstone is a single relaxed load.
++  uint64_t oldest = oldest_tombstone_time_.load(std::memory_order_relaxed);
++  if (oldest == std::numeric_limits<uint64_t>::max()) {
++    int64_t current_time = 0;
++    auto s = clock_->GetCurrentTime(&current_time);
++    if (s.ok()) {
++      assert(current_time >= 0);
++      oldest_tombstone_time_.compare_exchange_strong(
++          oldest, static_cast<uint64_t>(current_time),
++          std::memory_order_relaxed, std::memory_order_relaxed);
++    }
++  }
++}
++
+ Status MemTable::VerifyEntryChecksum(const char* entry,
+                                      uint32_t protection_bytes_per_key,
+                                      bool allow_data_in_errors) {
+@@ -1295,6 +1312,10 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
+     is_range_del_table_empty_.StoreRelaxed(false);
+   }
+   UpdateOldestKeyTime();
++  if (type == kTypeDeletion || type == kTypeSingleDeletion ||
++      type == kTypeDeletionWithTimestamp || type == kTypeRangeDeletion) {
++    UpdateOldestTombstoneTime();
++  }
+   TEST_SYNC_POINT_CALLBACK("MemTable::Add:BeforeReturn:Encoded", &encoded);
+   return Status::OK();
+ }
+diff --git a/db/memtable.h b/db/memtable.h
+index fc6856964..3ba0747cd 100644
+--- a/db/memtable.h
++++ b/db/memtable.h
+@@ -10,6 +10,7 @@
+ #pragma once
+ #include <deque>
+ #include <functional>
++#include <limits>
+ #include <memory>
+ #include <string>
+ #include <unordered_set>
+@@ -325,6 +326,13 @@ class ReadOnlyMemTable {
+ 
+   virtual uint64_t ApproximateOldestKeyTime() const = 0;
+ 
++  // [FADE] Unix time at which the first (oldest) point or range tombstone was
++  // inserted into this memtable, or std::numeric_limits<uint64_t>::max() if
++  // it contains no tombstones (or the implementation does not track it).
++  virtual uint64_t ApproximateOldestTombstoneTime() const {
++    return std::numeric_limits<uint64_t>::max();
++  }
++
+   // Inserts a range tombstone [start_key, end_key) that is logically redundant
+   // -- it is derived from existing point tombstones observed during iteration
+   // and does not delete any data that isn't already deleted. This is a
+@@ -887,6 +895,10 @@ class MemTable final : public ReadOnlyMemTable {
+     return oldest_key_time_.load(std::memory_order_relaxed);
+   }
+ 
++  uint64_t ApproximateOldestTombstoneTime() const override {
++    return oldest_tombstone_time_.load(std::memory_order_relaxed);
++  }
++
+   // Returns a heuristic flush decision
+   bool ShouldFlushNow();
+ 
+@@ -1015,6 +1027,9 @@ class MemTable final : public ReadOnlyMemTable {
+   // Timestamp of oldest key
+   std::atomic<uint64_t> oldest_key_time_;
+ 
++  // [FADE] Timestamp of the oldest tombstone (max() if none yet)
++  std::atomic<uint64_t> oldest_tombstone_time_;
++
+   // keep track of memory usage in table_, arena_, and range_del_table_.
+   // Gets refreshed inside `ApproximateMemoryUsage()` or `ShouldFlushNow`
+   RelaxedAtomic<uint64_t> approximate_memory_usage_;
+@@ -1037,6 +1052,9 @@ class MemTable final : public ReadOnlyMemTable {
+ 
+   void UpdateOldestKeyTime();
+ 
++  // [FADE] Records the insertion time of the first tombstone in this memtable.
++  void UpdateOldestTombstoneTime();
++
+   void GetFromTable(const LookupKey& key,
+                     SequenceNumber max_covering_tombstone_seq, bool do_merge,
+                     ReadCallback* callback, bool* is_blob_index,
+diff --git a/db/seqno_to_time_mapping.h b/db/seqno_to_time_mapping.h
+index a74041fd9..a153040ab 100644
+--- a/db/seqno_to_time_mapping.h
++++ b/db/seqno_to_time_mapping.h
+@@ -300,6 +300,14 @@ struct MinAndMaxPreserveSeconds {
+   void Combine(const CFOpts& opts) {
+     uint64_t preserve_seconds = std::max(opts.preserve_internal_time_seconds,
+                                          opts.preclude_last_level_data_seconds);
++    // [FADE] fade_precise_tombstone_age dates compaction outputs' tombstones
++    // with the mapping, so it needs samples spanning delete_persistence_
++    // threshold. This only enables recording: the preserve/preclude cutoffs
++    // still come from their own options.
++    if (opts.fade_precise_tombstone_age) {
++      preserve_seconds =
++          std::max(preserve_seconds, opts.delete_persistence_threshold);
++    }
+     if (preserve_seconds > 0) {
+       min_preserve_seconds = std::min(preserve_seconds, min_preserve_seconds);
+       max_preserve_seconds = std::max(preserve_seconds, max_preserve_seconds);
+diff --git a/db/version_edit.cc b/db/version_edit.cc
+index 74d101724..efcfa8f20 100644
+--- a/db/version_edit.cc
++++ b/db/version_edit.cc
+@@ -211,6 +211,7 @@ void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
+           f.file_open_metadata);
+   FileMetaData& added = new_files_.back().second;
+   added.db_ownership_start_time = f.db_ownership_start_time;
++  added.oldest_tombstone_time = f.oldest_tombstone_time;
+   added.data_file_provenance = f.data_file_provenance | provenance_flags_to_set;
+ }
+ 
+@@ -515,6 +516,12 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
+     PutVarint32(&varint_data_file_provenance, f.data_file_provenance);
+     PutLengthPrefixedSlice(dst, Slice(varint_data_file_provenance));
+   }
++  if (f.oldest_tombstone_time != kNoTombstoneTime) {
++    PutVarint32(dst, NewFileCustomTag::kOldestTombstoneTime);
++    std::string varint_oldest_tombstone_time;
++    PutVarint64(&varint_oldest_tombstone_time, f.oldest_tombstone_time);
++    PutLengthPrefixedSlice(dst, Slice(varint_oldest_tombstone_time));
++  }
+   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
+                            dst);
+ 
+@@ -673,6 +680,11 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
+             return "invalid data file provenance";
+           }
+           break;
++        case kOldestTombstoneTime:
++          if (!GetVarint64(&field, &f.oldest_tombstone_time)) {
++            return "invalid oldest tombstone time";
++          }
++          break;
+         default:
+           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
+             // Should not proceed if cannot understand it
+@@ -1179,6 +1191,10 @@ std::string VersionEdit::DebugString(bool hex_key) const {
+     AppendNumberTo(&r, f.file_creation_time);
+     r.append(" epoch_number:");
+     AppendNumberTo(&r, f.epoch_number);
++    if (f.oldest_tombstone_time != kNoTombstoneTime) {
++      r.append(" oldest_tombstone_time:");
++      AppendNumberTo(&r, f.oldest_tombstone_time);
++    }
+     if (f.db_ownership_start_time != kUnknownDbOwnershipStartTime) {
+       r.append(" db_ownership_start_time:");
+       AppendNumberTo(&r, f.db_ownership_start_time);
+diff --git a/db/version_edit.h b/db/version_edit.h
+index 9dc87369e..fb889d5e3 100644
+--- a/db/version_edit.h
++++ b/db/version_edit.h
+@@ -121,6 +121,9 @@ enum NewFileCustomTag : uint32_t {
+   kFileOpenMetadata = 17,
+   kDbOwnershipStartTime = 18,
+   kDataFileProvenance = 19,
++  // [FADE / Lethe] Unix time of the oldest (point or range) tombstone in the
++  // file. Safe to ignore by older readers (bit 6 not set).
++  kOldestTombstoneTime = 20,
+ 
+   // If this bit for the custom tag is set, opening DB should fail if
+   // we don't know this field.
+@@ -137,6 +140,8 @@ constexpr uint64_t kUnknownOldestAncestorTime = 0;
+ constexpr uint64_t kUnknownNewestKeyTime = 0;
+ constexpr uint64_t kUnknownFileCreationTime = 0;
+ constexpr uint64_t kUnknownDbOwnershipStartTime = 0;
++// [FADE] 0 means the file holds no tombstones (or the time is unknown).
++constexpr uint64_t kNoTombstoneTime = 0;
+ constexpr uint64_t kUnknownEpochNumber = 0;
+ // If `Options::cf_allow_ingest_behind` is true, this epoch number
+ // will be dedicated to files ingested behind.
+@@ -308,6 +313,12 @@ struct FileMetaData {
+ 
+   bool marked_for_compaction = false;  // True if client asked us nicely to
+                                        // compact this file.
++  // [CSC443 draft] True if this file was written by a kSkipLevelTombstone
++  // compaction. In memory only (false after reopen). Such files are not
++  // tombstone-density trigger candidates (see
++  // VersionStorageInfo::ComputeTombstoneDenseFiles), so the trigger cannot
++  // pick the same tombstones again until another compaction rewrites them.
++  bool from_skip_level_compaction = false;
+   Temperature temperature = Temperature::kUnknown;
+ 
+   // How this DB got the file's contents and what has happened to the file
+@@ -332,6 +343,21 @@ struct FileMetaData {
+   // 0 means the information is not available.
+   uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
+ 
++  // [FADE / Lethe] Unix time (seconds) at which the oldest point or range
++  // tombstone contained in this file was inserted into the memtable. This is
++  // the paper's a_max expressed as an absolute time: a_max = now - this value.
++  //
++  // - Flush output: earliest tombstone insertion time over the flushed
++  //   memtables (tracked in MemTable::Add).
++  // - Compaction output: min over the input files that carry tombstones, if
++  //   the output file itself still contains tombstones (conservative: it may
++  //   over-estimate a_max, never under-estimate it, so D_th still holds).
++  // - Trivial move / manifest rewrite: carried over unchanged.
++  //
++  // kNoTombstoneTime (0) means no tombstones or unknown. Persisted in the
++  // MANIFEST under NewFileCustomTag::kOldestTombstoneTime.
++  uint64_t oldest_tombstone_time = kNoTombstoneTime;
++
+   // Unix time when the SST file's contents were built (by flush or
+   // compaction, in this DB or another, or by SstFileWriter). Preserved when
+   // the file is moved between levels or copied to another temperature.
+@@ -454,6 +480,27 @@ struct FileMetaData {
+     return kUnknownOldestAncestorTime;
+   }
+ 
++  // [FADE] Best-known insertion time of the oldest tombstone in this file.
++  // Falls back to the oldest ancestor time (never newer than any entry in the
++  // file) for files that hold tombstones but predate FADE bookkeeping.
++  // Returns kNoTombstoneTime (0) if the file has no known tombstones.
++  uint64_t TryGetOldestTombstoneTime() {
++    if (oldest_tombstone_time != kNoTombstoneTime) {
++      return oldest_tombstone_time;
++    }
++    if (num_deletions > 0 || num_range_deletions > 0) {
++      return TryGetOldestAncestorTime();
++    }
++    return kNoTombstoneTime;
++  }
++
++  // [FADE] The paper's b_f: estimated number of entries invalidated by this
++  // file's tombstones. RocksDB's num_deletions already includes range
++  // deletions; we use it directly as p_f + (number of range tombstones),
++  // i.e. each range tombstone is counted as invalidating one entry because we
++  // have no cheap system-wide key histogram (see report for discussion).
++  uint64_t FadeInvalidatedEntriesEstimate() const { return num_deletions; }
++
+   uint64_t TryGetFileCreationTime() {
+     if (file_creation_time != kUnknownFileCreationTime) {
+       return file_creation_time;
+diff --git a/db/version_set.cc b/db/version_set.cc
+index 2f4d979c5..f01068ef7 100644
+--- a/db/version_set.cc
++++ b/db/version_set.cc
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cinttypes>
++#include <cmath>
+ #include <cstdio>
+ #include <list>
+ #include <map>
+@@ -3971,6 +3972,8 @@ void VersionStorageInfo::ComputeCompactionScore(
+           immutable_options.allow_ingest_behind,
+       immutable_options.user_comparator, full_history_ts_low);
+   ComputeExpiredTtlFiles(immutable_options, mutable_cf_options.ttl);
++  ComputeFadeExpiredFiles(immutable_options, mutable_cf_options);
++  ComputeTombstoneDenseFiles(mutable_cf_options);
+   ComputeFilesMarkedForPeriodicCompaction(
+       immutable_options, mutable_cf_options.periodic_compaction_seconds,
+       max_output_level);
+@@ -3988,7 +3991,8 @@ void VersionStorageInfo::ComputeCompactionScore(
+ void VersionStorageInfo::RemoveFilesBeingCompactedFromCompactionCandidates() {
+   for (auto* candidates :
+        {&files_marked_for_compaction_, &bottommost_files_marked_for_compaction_,
+-        &expired_ttl_files_, &files_marked_for_periodic_compaction_,
++        &expired_ttl_files_, &fade_expired_files_, &tombstone_dense_files_,
++        &files_marked_for_periodic_compaction_,
+         &files_marked_for_forced_blob_gc_, &read_triggered_compaction_files_}) {
+     const size_t remaining =
+         std::remove_if(candidates->begin(), candidates->end(),
+@@ -4037,6 +4041,51 @@ void VersionStorageInfo::ComputeFilesMarkedForCompaction(int last_level) {
+   }
+ }
+ 
++void VersionStorageInfo::ComputeTombstoneDenseFiles(
++    const MutableCFOptions& mutable_cf_options) {
++  tombstone_dense_files_.clear();
++  if (mutable_cf_options.skip_level_tombstone_compaction == 0 ||
++      !mutable_cf_options.skip_level_tombstone_density_trigger ||
++      compaction_style_ != CompactionStyle::kCompactionStyleLevel) {
++    return;
++  }
++  // Only files strictly above the last non-empty level can be pushed down.
++  int last_non_empty = -1;
++  for (int level = num_levels() - 1; level >= 0; level--) {
++    if (!files_[level].empty()) {
++      last_non_empty = level;
++      break;
++    }
++  }
++  const double threshold =
++      mutable_cf_options.skip_level_tombstone_density_threshold;
++  // L0 files are not candidates. Every L0 file covers about the whole key
++  // range, so a compaction out of L0 rereads the same overlap no matter how
++  // many L0 files it takes; picking one file as soon as it is flushed pays
++  // that overlap per file instead of sharing it across the
++  // level0_file_num_compaction_trigger files that size-based compaction
++  // batches. Dense L0 files still skip levels when that compaction runs.
++  for (int level = 1; level < last_non_empty; level++) {
++    for (FileMetaData* f : files_[level]) {
++      if (!f->being_compacted && !f->from_skip_level_compaction &&
++          f->num_deletions > 0 && TombstoneDensity(f) >= threshold) {
++        tombstone_dense_files_.emplace_back(level, f);
++      }
++    }
++  }
++  // Densest first; break ties by smaller level (shallower files shadow more).
++  std::sort(tombstone_dense_files_.begin(), tombstone_dense_files_.end(),
++            [](const std::pair<int, FileMetaData*>& a,
++               const std::pair<int, FileMetaData*>& b) {
++              const double da = TombstoneDensity(a.second);
++              const double db = TombstoneDensity(b.second);
++              if (da != db) {
++                return da > db;
++              }
++              return a.first < b.first;
++            });
++}
++
+ void VersionStorageInfo::ComputeExpiredTtlFiles(
+     const ImmutableOptions& ioptions, const uint64_t ttl) {
+   expired_ttl_files_.clear();
+@@ -4064,6 +4113,127 @@ void VersionStorageInfo::ComputeExpiredTtlFiles(
+   }
+ }
+ 
++// [FADE] Lethe (SIGMOD'20) Sec. 4.1.
++//
++// Level mapping. The paper's tree has a memory buffer ("level 0") followed by
++// disk levels, and every level i gets a TTL d_i with sum(d_i) = D_th. In
++// RocksDB a tombstone travels memtable -> L0 -> base_level -> ... -> last
++// non-empty level, where the compaction that brings it there purges it. We
++// therefore assign one TTL *stage* to every level a tombstone still has to
++// leave:
++//   stage 0       : L0 (the memtable's residency is folded into this stage,
++//                   because the tombstone's clock starts at memtable insert)
++//   stage 1..n-1  : base_level .. last_non_empty_level - 1
++// Levels 1..base_level-1 are always empty under dynamic level sizing and get
++// no stage. The last non-empty level gets no stage either.
++//
++// With size ratio T and n stages:
++//   d_0 = D_th * (T - 1) / (T^n - 1),  d_k = T * d_{k-1}
++// and, since a_max is measured from the tombstone's insertion (not from when
++// it arrived at the current level), the trigger compares a_max against the
++// cumulative deadline
++//   D_k = d_0 + ... + d_k = D_th * (T^(k+1) - 1) / (T^n - 1),   D_{n-1} = D_th
++// This matches the cumulative d[i] in the pseudo-code of the paper's Fig. 4.
++//
++// The stages are recomputed whenever a Version is built (i.e. after every
++// flush and compaction), which covers "recompute d_i when the tree grows".
++void VersionStorageInfo::ComputeFadeExpiredFiles(
++    const ImmutableOptions& ioptions,
++    const MutableCFOptions& mutable_cf_options) {
++  fade_expired_files_.clear();
++  fade_level_deadline_.assign(num_levels(), 0);
++  const uint64_t dth = mutable_cf_options.delete_persistence_threshold;
++  if (dth == 0 || compaction_style_ != CompactionStyle::kCompactionStyleLevel ||
++      num_levels() < 2) {
++    return;
++  }
++
++  int64_t _current_time;
++  auto status = ioptions.clock->GetCurrentTime(&_current_time);
++  if (!status.ok()) {
++    return;
++  }
++  const uint64_t current_time = static_cast<uint64_t>(_current_time);
++
++  // Last non-empty level: tombstones are purged on the way into it.
++  int last_level = 0;
++  for (int level = num_levels() - 1; level > 0; level--) {
++    if (!files_[level].empty()) {
++      last_level = level;
++      break;
++    }
++  }
++
++  // Levels governed by FADE, in stage order.
++  std::vector<int> stage_levels;
++  stage_levels.push_back(0);
++  if (last_level > 0) {
++    for (int level = std::max(1, base_level_); level < last_level; level++) {
++      stage_levels.push_back(level);
++    }
++  }
++  const int n = static_cast<int>(stage_levels.size());
++
++  const double t = mutable_cf_options.max_bytes_for_level_multiplier;
++  for (int k = 0; k < n; k++) {
++    double cumulative;
++    if (t > 1.0) {
++      cumulative = static_cast<double>(dth) * (std::pow(t, k + 1) - 1.0) /
++                   (std::pow(t, n) - 1.0);
++    } else {
++      // Degenerate size ratio: fall back to the uniform split D_th / n.
++      cumulative = static_cast<double>(dth) * (k + 1) / n;
++    }
++    // Never 0 (0 means "not governed") and never above D_th.
++    uint64_t deadline = static_cast<uint64_t>(cumulative);
++    deadline = std::min<uint64_t>(std::max<uint64_t>(deadline, 1), dth);
++    fade_level_deadline_[stage_levels[k]] = deadline;
++  }
++  // Guarantee the final stage is exactly D_th despite rounding.
++  fade_level_deadline_[stage_levels[n - 1]] = dth;
++
++  for (int level : stage_levels) {
++    const uint64_t deadline = fade_level_deadline_[level];
++    for (FileMetaData* f : files_[level]) {
++      if (f->being_compacted) {
++        continue;
++      }
++      const uint64_t tombstone_time = f->TryGetOldestTombstoneTime();
++      if (tombstone_time == kNoTombstoneTime ||
++          tombstone_time > current_time) {
++        continue;
++      }
++      // a_max = now - tombstone_time
++      if (current_time - tombstone_time > deadline) {
++        fade_expired_files_.emplace_back(level, f);
++      }
++    }
++  }
++
++  // DD-mode ordering: smallest level first (avoid write stalls), then the
++  // file with the oldest tombstone, then the file with the largest b_f.
++  std::vector<std::pair<int, FileMetaData*>> sorted(
++      fade_expired_files_.begin(), fade_expired_files_.end());
++  std::sort(sorted.begin(), sorted.end(),
++            [](const std::pair<int, FileMetaData*>& a,
++               const std::pair<int, FileMetaData*>& b) {
++              if (a.first != b.first) {
++                return a.first < b.first;
++              }
++              const uint64_t ta = a.second->TryGetOldestTombstoneTime();
++              const uint64_t tb = b.second->TryGetOldestTombstoneTime();
++              if (ta != tb) {
++                return ta < tb;
++              }
++              return a.second->FadeInvalidatedEntriesEstimate() >
++                     b.second->FadeInvalidatedEntriesEstimate();
++            });
++  fade_expired_files_.clear();
++  for (const auto& level_file : sorted) {
++    fade_expired_files_.push_back(level_file);
++  }
++}
++
+ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
+     const ImmutableOptions& ioptions,
+     const uint64_t periodic_compaction_seconds, int last_level) {
+diff --git a/db/version_set.h b/db/version_set.h
+index d9eb7f714..f67881473 100644
+--- a/db/version_set.h
++++ b/db/version_set.h
+@@ -233,11 +233,23 @@ class VersionStorageInfo {
+   // ComputeCompactionScore()
+   void ComputeFilesMarkedForCompaction(int last_level);
+ 
++  // This computes tombstone_dense_files_ (skip-level tombstone compaction
++  // candidates) and is called by ComputeCompactionScore()
++  void ComputeTombstoneDenseFiles(const MutableCFOptions& mutable_cf_options);
++
+   // This computes ttl_expired_files_ and is called by
+   // ComputeCompactionScore()
+   void ComputeExpiredTtlFiles(const ImmutableOptions& ioptions,
+                               const uint64_t ttl);
+ 
++  // [FADE] Computes the per-level cumulative tombstone deadlines
++  // (fade_level_deadline_) from delete_persistence_threshold and collects the
++  // files whose oldest tombstone has outlived its level's deadline into
++  // fade_expired_files_, ordered for FADE's delete-driven (DD) file selection.
++  // Called by ComputeCompactionScore().
++  void ComputeFadeExpiredFiles(const ImmutableOptions& ioptions,
++                               const MutableCFOptions& mutable_cf_options);
++
+   // This computes files_marked_for_periodic_compaction_ and is called by
+   // ComputeCompactionScore()
+   void ComputeFilesMarkedForPeriodicCompaction(
+@@ -625,11 +637,53 @@ class VersionStorageInfo {
+   // REQUIRES: ComputeCompactionScore has been called
+   // REQUIRES: DB mutex held during access
+   // Used by Leveled Compaction only.
++  // Files above the last non-empty level whose tombstone density is at least
++  // skip_level_tombstone_density_threshold, densest first. Empty unless
++  // skip_level_tombstone_compaction != 0.
++  // REQUIRES: ComputeCompactionScore has been called
++  // REQUIRES: DB mutex held during access
++  // Used by Leveled Compaction only.
++  const autovector<std::pair<int, FileMetaData*>>& TombstoneDenseFiles() const {
++    assert(finalized_);
++    return tombstone_dense_files_;
++  }
++
++  // Tombstone density of a file: num_deletions / num_entries (num_deletions
++  // already counts range deletions). 0 if the file has no entries.
++  static double TombstoneDensity(const FileMetaData* f) {
++    if (f->num_entries == 0) {
++      return 0.0;
++    }
++    return static_cast<double>(f->num_deletions) /
++           static_cast<double>(f->num_entries);
++  }
++
+   const autovector<std::pair<int, FileMetaData*>>& ExpiredTtlFiles() const {
+     assert(finalized_);
+     return expired_ttl_files_;
+   }
+ 
++  // [FADE] Files holding a tombstone older than their level's cumulative
++  // FADE deadline, sorted by (level asc, oldest tombstone asc, #tombstones
++  // desc). Empty when delete_persistence_threshold == 0.
++  // REQUIRES: ComputeCompactionScore has been called
++  // REQUIRES: DB mutex held during access
++  // Used by Leveled Compaction only.
++  const autovector<std::pair<int, FileMetaData*>>& FadeExpiredFiles() const {
++    assert(finalized_);
++    return fade_expired_files_;
++  }
++
++  // [FADE] Cumulative deadline D_i (seconds since a tombstone was written by
++  // which it must have left `level`). 0 if FADE does not govern this level
++  // (disabled, empty intermediate level, or the last non-empty level).
++  uint64_t FadeLevelDeadline(int level) const {
++    if (level < 0 || static_cast<size_t>(level) >= fade_level_deadline_.size()) {
++      return 0;
++    }
++    return fade_level_deadline_[level];
++  }
++
+   // REQUIRES: ComputeCompactionScore has been called
+   // REQUIRES: DB mutex held during access
+   // Used by Leveled and Universal Compaction.
+@@ -878,6 +932,11 @@ class VersionStorageInfo {
+ 
+   autovector<std::pair<int, FileMetaData*>> expired_ttl_files_;
+ 
++  // [FADE] see FadeExpiredFiles() / FadeLevelDeadline()
++  autovector<std::pair<int, FileMetaData*>> fade_expired_files_;
++  std::vector<uint64_t> fade_level_deadline_;
++  autovector<std::pair<int, FileMetaData*>> tombstone_dense_files_;
++
+   autovector<std::pair<int, FileMetaData*>>
+       files_marked_for_periodic_compaction_;
+ 
+diff --git a/include/rocksdb/advanced_options.h b/include/rocksdb/advanced_options.h
+index 80e95503d..ad6b32a6e 100644
+--- a/include/rocksdb/advanced_options.h
++++ b/include/rocksdb/advanced_options.h
+@@ -893,6 +893,54 @@ struct AdvancedColumnFamilyOptions {
+   // instead.
+   uint64_t ttl = 0xfffffffffffffffe;
+ 
++  // [FADE, from "Lethe: A Tunable Delete-Aware LSM Engine" (SIGMOD'20)]
++  // Delete persistence threshold D_th, in seconds. When non-zero (and
++  // compaction_style == kCompactionStyleLevel), RocksDB guarantees on a
++  // best-effort basis that every point/range tombstone reaches the last
++  // non-empty level (where it is purged) within D_th seconds of being written.
++  //
++  // D_th is split into exponentially growing per-level TTLs
++  //   d_0 = D_th * (T - 1) / (T^n - 1),  d_i = T * d_{i-1}
++  // where T = max_bytes_for_level_multiplier and n is the number of levels a
++  // tombstone has to leave (L0 and base_level .. last_non_empty_level - 1).
++  // A file at stage i whose oldest tombstone is older than d_0 + ... + d_i is
++  // compacted into the next level with CompactionReason::kFadeTtl. Among such
++  // files, the smallest level wins, then the oldest tombstone, then the most
++  // tombstones (FADE's DD mode). These compactions run ahead of
++  // size-triggered compactions only while every level's compaction score is
++  // below 1.5. Beyond that, size-triggered compactions choose the level first
++  // (preferring a file with expired tombstones within it), so that FADE
++  // cannot starve them and let the tree's shape degrade.
++  //
++  // Like `ttl`, expiry is only evaluated when a new Version is installed (on
++  // flush/compaction) so an idle DB will not act on expired files.
++  //
++  // unit: seconds. 0 disables FADE (default).
++  //
++  // Dynamically changeable through SetOptions() API
++  uint64_t delete_persistence_threshold = 0;
++
++  // [FADE] How a compaction output's oldest tombstone time is estimated.
++  //
++  // false (default): the output inherits the oldest tombstone time of the
++  // input files it overlaps. This is safe but can be far too old: when the
++  // oldest tombstone is dropped by the compaction (for example because a
++  // newer write to the same key supersedes it), later outputs keep its time
++  // and FADE compacts them again although their tombstones are recent.
++  //
++  // true: the compaction also records the smallest sequence number among the
++  // tombstones it writes to each output file and converts it to a time with
++  // the DB's sequence-number-to-time mapping (recorded at least once per
++  // second while FADE is enabled). The later of the two estimates is used.
++  // Both are lower bounds on when the tombstone was written, so tombstone
++  // ages are never underestimated and delete_persistence_threshold still
++  // holds. Costs a few bytes of mapping per SST file (a table property).
++  //
++  // Ignored unless delete_persistence_threshold > 0.
++  //
++  // Dynamically changeable through SetOptions() API
++  bool fade_precise_tombstone_age = false;
++
+   // This option has different meanings for different compaction styles:
+   //
+   // Leveled: files older than `periodic_compaction_seconds` will be picked up
+@@ -1002,6 +1050,72 @@ struct AdvancedColumnFamilyOptions {
+   // Dynamically changeable through SetOptions() API
+   double read_triggered_compaction_threshold = 0.0;
+ 
++  // [CSC443 draft] Skip-level tombstone compaction (leveled compaction only).
++  //
++  // A "tombstone-dense" file is a file above the last non-empty level whose
++  // num_deletions / num_entries (num_deletions includes range deletions) is
++  // at least `skip_level_tombstone_density_threshold`. Instead of pushing such
++  // a file down one level at a time (L -> L+1 -> ... -> Lmax, rewriting the
++  // tombstones at every hop), a single multi-level compaction takes the file
++  // plus every overlapping file in the intermediate levels and writes the
++  // result straight into a deeper level. When that level is the bottommost
++  // one, the tombstones (and the data they shadow) are dropped right away.
++  //
++  // Modes:
++  //   0 = off (default): no change from stock RocksDB.
++  //   1 = always: target the deepest feasible level (the last non-empty level
++  //       when possible, limited by `max_compaction_bytes` and by files that
++  //       are already being compacted).
++  //   2 = amortized cascade: let S be the start files' bytes, n the normal
++  //       output level, B(t) the input bytes of a compaction from the start
++  //       level straight to level t, and T = max_bytes_for_level_multiplier.
++  //       Pushing S down one level at a time costs about (1 + T) * S per
++  //       level after the first (amortized over the data that shares the
++  //       deeper overlap), while the skip pays the measured B(t) - B(n). This
++  //       picks the t with the largest positive
++  //         (t - n) * (1 + T) * S - (B(t) - B(n)),
++  //       i.e. it skips only where the overlap below n is well under the
++  //       tree's average, and never lets B(t) exceed
++  //       `skip_level_max_overlap_ratio` * B(n).
++  //
++  // When enabled, size-triggered compactions and FADE compactions
++  // (CompactionReason::kFadeTtl, see `delete_persistence_threshold`) whose
++  // start-level inputs are tombstone-dense are extended to skip levels as
++  // above (they stay normal one-level compactions when no deeper target
++  // qualifies). If
++  // `skip_level_tombstone_density_trigger` is also true, tombstone-dense
++  // files in L1 and below additionally become a compaction trigger
++  // (CompactionReason::kSkipLevelTombstone) that runs after size-based
++  // compaction. L0 files are left to the L0 file-count trigger, so that one
++  // compaction out of L0 still takes a whole batch of flushed files. The
++  // trigger only runs compactions that skip at least one level, and it
++  // ignores files written by a kSkipLevelTombstone compaction until they are
++  // rewritten by another compaction.
++  //
++  // Dynamically changeable through SetOptions() API
++  uint32_t skip_level_tombstone_compaction = 0;
++
++  // See `skip_level_tombstone_compaction`. Valid range: (0, 1].
++  //
++  // Dynamically changeable through SetOptions() API
++  double skip_level_tombstone_density_threshold = 0.5;
++
++  // See `skip_level_tombstone_compaction`. Whether tombstone-dense files are
++  // picked for compaction on their own (true) or only when a size-triggered
++  // compaction picks them anyway (false).
++  //
++  // Dynamically changeable through SetOptions() API
++  bool skip_level_tombstone_density_trigger = true;
++
++  // See `skip_level_tombstone_compaction` (cascade-savings mode only). Must
++  // be >= 1. With level size multiplier T, going one level deeper makes the
++  // compaction about T times larger, so the default (2 * T for T = 10)
++  // allows skipping one level but not two. A value of 1 disables skipping
++  // whenever the deeper level has overlapping data.
++  //
++  // Dynamically changeable through SetOptions() API
++  double skip_level_max_overlap_ratio = 20.0;
++
+   // If this option is set then 1 in N blocks are compressed
+   // using a fast (lz4) and slow (zstd) compression algorithm.
+   // The compressibility is reported as stats and the stored
+diff --git a/include/rocksdb/listener.h b/include/rocksdb/listener.h
+index 0d5d549ee..71d92cb15 100644
+--- a/include/rocksdb/listener.h
++++ b/include/rocksdb/listener.h
+@@ -160,6 +160,13 @@ enum class CompactionReason : int {
+   kRefitLevel,
+   // Compaction triggered by high read frequency on SST files
+   kReadTriggered,
++  // [FADE / Lethe, SIGMOD'20] Delete-driven compaction: a file holds a
++  // tombstone older than its level's cumulative TTL derived from
++  // delete_persistence_threshold.
++  kFadeTtl,
++  // [Level] Multi-level compaction that pushes a tombstone-dense file past one
++  // or more levels in one step (see skip_level_tombstone_compaction).
++  kSkipLevelTombstone,
+   // total number of compaction reasons, new reasons must be added above this.
+   kNumOfReasons,
+ };
+diff --git a/options/cf_options.cc b/options/cf_options.cc
+index 363fc5af3..d7ccb373b 100644
+--- a/options/cf_options.cc
++++ b/options/cf_options.cc
+@@ -612,6 +612,14 @@ static std::unordered_map<std::string, OptionTypeInfo>
+         {"ttl",
+          {offsetof(struct MutableCFOptions, ttl), OptionType::kUInt64T,
+           OptionVerificationType::kNormal, OptionTypeFlags::kMutable}},
++        {"delete_persistence_threshold",
++         {offsetof(struct MutableCFOptions, delete_persistence_threshold),
++          OptionType::kUInt64T, OptionVerificationType::kNormal,
++          OptionTypeFlags::kMutable}},
++        {"fade_precise_tombstone_age",
++         {offsetof(struct MutableCFOptions, fade_precise_tombstone_age),
++          OptionType::kBoolean, OptionVerificationType::kNormal,
++          OptionTypeFlags::kMutable}},
+         {"periodic_compaction_seconds",
+          {offsetof(struct MutableCFOptions, periodic_compaction_seconds),
+           OptionType::kUInt64T, OptionVerificationType::kNormal,
+@@ -621,6 +629,24 @@ static std::unordered_map<std::string, OptionTypeInfo>
+                    read_triggered_compaction_threshold),
+           OptionType::kDouble, OptionVerificationType::kNormal,
+           OptionTypeFlags::kMutable}},
++        {"skip_level_tombstone_compaction",
++         {offsetof(struct MutableCFOptions, skip_level_tombstone_compaction),
++          OptionType::kUInt32T, OptionVerificationType::kNormal,
++          OptionTypeFlags::kMutable}},
++        {"skip_level_tombstone_density_threshold",
++         {offsetof(struct MutableCFOptions,
++                   skip_level_tombstone_density_threshold),
++          OptionType::kDouble, OptionVerificationType::kNormal,
++          OptionTypeFlags::kMutable}},
++        {"skip_level_tombstone_density_trigger",
++         {offsetof(struct MutableCFOptions,
++                   skip_level_tombstone_density_trigger),
++          OptionType::kBoolean, OptionVerificationType::kNormal,
++          OptionTypeFlags::kMutable}},
++        {"skip_level_max_overlap_ratio",
++         {offsetof(struct MutableCFOptions, skip_level_max_overlap_ratio),
++          OptionType::kDouble, OptionVerificationType::kNormal,
++          OptionTypeFlags::kMutable}},
+         {"preclude_last_level_data_seconds",
+          {offsetof(struct MutableCFOptions, preclude_last_level_data_seconds),
+           OptionType::kUInt64T, OptionVerificationType::kNormal,
+@@ -1292,10 +1318,23 @@ void MutableCFOptions::Dump(Logger* log) const {
+                  max_bytes_for_level_multiplier);
+   ROCKS_LOG_INFO(log, "                                      ttl: %" PRIu64,
+                  ttl);
++  ROCKS_LOG_INFO(log,
++                 "             delete_persistence_threshold: %" PRIu64,
++                 delete_persistence_threshold);
++  ROCKS_LOG_INFO(log, "               fade_precise_tombstone_age: %d",
++                 fade_precise_tombstone_age);
+   ROCKS_LOG_INFO(log, "              periodic_compaction_seconds: %" PRIu64,
+                  periodic_compaction_seconds);
+   ROCKS_LOG_INFO(log, "    read_triggered_compaction_threshold: %f",
+                  read_triggered_compaction_threshold);
++  ROCKS_LOG_INFO(log, "        skip_level_tombstone_compaction: %" PRIu32,
++                 skip_level_tombstone_compaction);
++  ROCKS_LOG_INFO(log, " skip_level_tombstone_density_threshold: %f",
++                 skip_level_tombstone_density_threshold);
++  ROCKS_LOG_INFO(log, "   skip_level_tombstone_density_trigger: %d",
++                 skip_level_tombstone_density_trigger);
++  ROCKS_LOG_INFO(log, "           skip_level_max_overlap_ratio: %f",
++                 skip_level_max_overlap_ratio);
+   ROCKS_LOG_INFO(log,
+                  "              preclude_last_level_data_seconds: %" PRIu64,
+                  preclude_last_level_data_seconds);
+diff --git a/options/cf_options.h b/options/cf_options.h
+index c95523668..827a01131 100644
+--- a/options/cf_options.h
++++ b/options/cf_options.h
+@@ -152,9 +152,18 @@ struct MutableCFOptions {
+         max_bytes_for_level_base(options.max_bytes_for_level_base),
+         max_bytes_for_level_multiplier(options.max_bytes_for_level_multiplier),
+         ttl(options.ttl),
++        delete_persistence_threshold(options.delete_persistence_threshold),
+         periodic_compaction_seconds(options.periodic_compaction_seconds),
+         read_triggered_compaction_threshold(
+             options.read_triggered_compaction_threshold),
++        skip_level_tombstone_compaction(
++            options.skip_level_tombstone_compaction),
++        skip_level_tombstone_density_threshold(
++            options.skip_level_tombstone_density_threshold),
++        skip_level_tombstone_density_trigger(
++            options.skip_level_tombstone_density_trigger),
++        fade_precise_tombstone_age(options.fade_precise_tombstone_age),
++        skip_level_max_overlap_ratio(options.skip_level_max_overlap_ratio),
+         max_bytes_for_level_multiplier_additional(
+             options.max_bytes_for_level_multiplier_additional),
+         compaction_options_fifo(options.compaction_options_fifo),
+@@ -235,8 +244,14 @@ struct MutableCFOptions {
+         max_bytes_for_level_base(0),
+         max_bytes_for_level_multiplier(0),
+         ttl(0),
++        delete_persistence_threshold(0),
+         periodic_compaction_seconds(0),
+         read_triggered_compaction_threshold(0.0),
++        skip_level_tombstone_compaction(0),
++        skip_level_tombstone_density_threshold(0.5),
++        skip_level_tombstone_density_trigger(true),
++        fade_precise_tombstone_age(false),
++        skip_level_max_overlap_ratio(20.0),
+         compaction_options_fifo(),
+         preclude_last_level_data_seconds(0),
+         preserve_internal_time_seconds(0),
+@@ -339,8 +354,14 @@ struct MutableCFOptions {
+   uint64_t max_bytes_for_level_base;
+   double max_bytes_for_level_multiplier;
+   uint64_t ttl;
++  uint64_t delete_persistence_threshold;  // [FADE] D_th, 0 = disabled
+   uint64_t periodic_compaction_seconds;
+   double read_triggered_compaction_threshold;
++  uint32_t skip_level_tombstone_compaction;
++  double skip_level_tombstone_density_threshold;
++  bool skip_level_tombstone_density_trigger;
++  bool fade_precise_tombstone_age;  // [FADE]
++  double skip_level_max_overlap_ratio;
+   std::vector<int> max_bytes_for_level_multiplier_additional;
+   CompactionOptionsFIFO compaction_options_fifo;
+   CompactionOptionsUniversal compaction_options_universal;
+diff --git a/options/options.cc b/options/options.cc
+index c60fefe34..bf64b1545 100644
+--- a/options/options.cc
++++ b/options/options.cc
+@@ -92,7 +92,15 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
+       report_bg_io_stats(options.report_bg_io_stats),
+       disallow_memtable_writes(options.disallow_memtable_writes),
+       ttl(options.ttl),
++      delete_persistence_threshold(options.delete_persistence_threshold),
++      fade_precise_tombstone_age(options.fade_precise_tombstone_age),
+       periodic_compaction_seconds(options.periodic_compaction_seconds),
++      skip_level_tombstone_compaction(options.skip_level_tombstone_compaction),
++      skip_level_tombstone_density_threshold(
++          options.skip_level_tombstone_density_threshold),
++      skip_level_tombstone_density_trigger(
++          options.skip_level_tombstone_density_trigger),
++      skip_level_max_overlap_ratio(options.skip_level_max_overlap_ratio),
+       sample_for_compression(options.sample_for_compression),
+       last_level_temperature(options.last_level_temperature),
+       default_write_temperature(options.default_write_temperature),
+@@ -423,9 +431,24 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
+                    disallow_memtable_writes);
+   ROCKS_LOG_HEADER(log, "                              Options.ttl: %" PRIu64,
+                    ttl);
++  ROCKS_LOG_HEADER(log,
++                   "             Options.delete_persistence_threshold: %" PRIu64,
++                   delete_persistence_threshold);
++  ROCKS_LOG_HEADER(log, "             Options.fade_precise_tombstone_age: %d",
++                   fade_precise_tombstone_age);
+   ROCKS_LOG_HEADER(log,
+                    "         Options.periodic_compaction_seconds: %" PRIu64,
+                    periodic_compaction_seconds);
++  ROCKS_LOG_HEADER(log,
++                   "     Options.skip_level_tombstone_compaction: %" PRIu32,
++                   skip_level_tombstone_compaction);
++  ROCKS_LOG_HEADER(log,
++                   "     Options.skip_level_tombstone_density_threshold: %f",
++                   skip_level_tombstone_density_threshold);
++  ROCKS_LOG_HEADER(log, "     Options.skip_level_tombstone_density_trigger: %d",
++                   skip_level_tombstone_density_trigger);
++  ROCKS_LOG_HEADER(log, "     Options.skip_level_max_overlap_ratio: %f",
++                   skip_level_max_overlap_ratio);
+   const auto& it_temp = temperature_to_string.find(default_temperature);
+   std::string str_default_temperature;
+   if (it_temp == temperature_to_string.end()) {
+diff --git a/options/options_helper.cc b/options/options_helper.cc
+index 313e506ff..caff2ccad 100644
+--- a/options/options_helper.cc
++++ b/options/options_helper.cc
+@@ -373,9 +373,18 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
+   cf_opts->max_bytes_for_level_multiplier =
+       moptions.max_bytes_for_level_multiplier;
+   cf_opts->ttl = moptions.ttl;
++  cf_opts->delete_persistence_threshold = moptions.delete_persistence_threshold;
++  cf_opts->fade_precise_tombstone_age = moptions.fade_precise_tombstone_age;
+   cf_opts->periodic_compaction_seconds = moptions.periodic_compaction_seconds;
+   cf_opts->read_triggered_compaction_threshold =
+       moptions.read_triggered_compaction_threshold;
++  cf_opts->skip_level_tombstone_compaction =
++      moptions.skip_level_tombstone_compaction;
++  cf_opts->skip_level_tombstone_density_threshold =
++      moptions.skip_level_tombstone_density_threshold;
++  cf_opts->skip_level_tombstone_density_trigger =
++      moptions.skip_level_tombstone_density_trigger;
++  cf_opts->skip_level_max_overlap_ratio = moptions.skip_level_max_overlap_ratio;
+   cf_opts->preclude_last_level_data_seconds =
+       moptions.preclude_last_level_data_seconds;
+   cf_opts->preserve_internal_time_seconds =
+diff --git a/src.mk b/src.mk
+index 8455f0213..ebea2d7d7 100644
+--- a/src.mk
++++ b/src.mk
+@@ -521,6 +521,7 @@ TEST_MAIN_SOURCES =                                                     \
+   db/db_compaction_abort_test.cc                                        \
+   db/db_compaction_filter_test.cc                                       \
+   db/db_compaction_test.cc                                              \
++  db/db_skip_level_compaction_test.cc                                   \
+   db/db_clip_test.cc                                                    \
+   utilities/db_split_merge_test.cc                                     \
+   db/db_dynamic_level_test.cc                                           \
