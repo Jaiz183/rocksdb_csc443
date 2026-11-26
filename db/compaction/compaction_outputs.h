@@ -42,6 +42,10 @@ class CompactionOutputs {
     bool finished;
     bool is_proximal_level;
     std::shared_ptr<const TableProperties> table_properties;
+    // [FADE] Smallest sequence number among the point and range tombstones
+    // written to this file; kMaxSequenceNumber if none (or not tracked, see
+    // track_tombstone_seqno_).
+    SequenceNumber oldest_tombstone_seqno = kMaxSequenceNumber;
   };
 
   CompactionOutputs() = delete;
@@ -185,6 +189,11 @@ class CompactionOutputs {
   }
 
   FileMetaData* GetMetaData() { return &current_output().meta; }
+
+  // [FADE] See Output::oldest_tombstone_seqno. Current (last) output only.
+  SequenceNumber CurrentOutputOldestTombstoneSeqno() {
+    return current_output().oldest_tombstone_seqno;
+  }
 
   bool HasOutput() const { return !outputs_.empty(); }
 
@@ -344,6 +353,10 @@ class CompactionOutputs {
   }
 
   const Compaction* compaction_;
+
+  // [FADE] Record Output::oldest_tombstone_seqno; only when
+  // fade_precise_tombstone_age and delete_persistence_threshold are set.
+  bool track_tombstone_seqno_ = false;
 
   // current output builder and writer
   std::unique_ptr<TableBuilder> builder_;

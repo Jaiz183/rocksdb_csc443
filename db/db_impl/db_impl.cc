@@ -2147,7 +2147,9 @@ Status DBImpl::SetOptions(
     bool needs_seqno_worker = update_seqno_worker;
     for (const auto& cf_opts : column_families_opts_map) {
       if (cf_opts.second.count("preserve_internal_time_seconds") > 0 ||
-          cf_opts.second.count("preclude_last_level_data_seconds") > 0) {
+          cf_opts.second.count("preclude_last_level_data_seconds") > 0 ||
+          cf_opts.second.count("delete_persistence_threshold") > 0 ||
+          cf_opts.second.count("fade_precise_tombstone_age") > 0) {
         needs_seqno_worker = true;
         break;
       }
@@ -5106,7 +5108,9 @@ Status DBImpl::WrapUpCreateColumnFamilies(
   bool register_worker = false;
   for (auto* opts_ptr : cf_options) {
     if (opts_ptr->preserve_internal_time_seconds > 0 ||
-        opts_ptr->preclude_last_level_data_seconds > 0) {
+        opts_ptr->preclude_last_level_data_seconds > 0 ||
+        (opts_ptr->fade_precise_tombstone_age &&
+         opts_ptr->delete_persistence_threshold > 0)) {
       register_worker = true;
       break;
     }

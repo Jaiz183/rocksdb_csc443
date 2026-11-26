@@ -1,0 +1,14 @@
+== seqdel_fade+skip_r2 load={ 2.61 10.72 32.20 }
+cf_opts="delete_persistence_threshold=40;skip_level_tombstone_compaction=2;skip_level_tombstone_density_trigger=false;skip_level_tombstone_density_threshold=0.3" run_s=60.0 ops=1200000 (puts=839529 dels=360471 rdels=0) ops/s=20000
+write_amp=9.027  (compaction 778.5 MB + flush 99.2 MB) / user 97.2 MB
+avg_upper_tombstones=10750  peak_tomb_age_ub=61s  avg_sst_MB=83.52
+true_tomb_age: peak=5.0s avg=2.1s samples_over_40s=0/59
+end_of_run: sst_MB=85.13 upper_tombs=8480 total_tombs=8480 levels_KB=780/0/0/0/2359/13777/70252
+drained:    sst_MB=83.27 upper_tombs=11169 total_tombs=11169 levels_KB=0/0/0/0/2495/11747/71024 space_amp=1.160
+compactions by reason: FadeTtl=1(0.0MB) LevelL0FilesNum=31(54.5MB) LevelMaxLevelSize=227(551.1MB) SkipLevelTombstone=43(173.0MB)
+compactions by shape:  L0->L3=31(54.5MB) L0->L4=34(131.0MB) L3->L4=40(44.0MB) L3->L5=9(41.9MB) L4->L5=96(255.3MB) L5->L6=92(251.7MB)
+skip-level shapes:      L0->L4=34(131.0MB) L3->L5=9(41.9MB)
+compactions by reason+shape: FadeTtl:L3->L4=1(0.0MB) LevelL0FilesNum:L0->L3=31(54.5MB) LevelMaxLevelSize:L3->L4=39(44.0MB) LevelMaxLevelSize:L4->L5=96(255.3MB) LevelMaxLevelSize:L5->L6=92(251.7MB) SkipLevelTombstone:L0->L4=34(131.0MB) SkipLevelTombstone:L3->L5=9(41.9MB)
+L0 compactions:         LevelL0FilesNum=31(avg_l0_files=2.00,avg_in=1.8MB) SkipLevelTombstone=34(avg_l0_files=2.00,avg_in=3.9MB)
+verify: live_keys=654673 mismatches=0 bg_errors=0 -> PASS
+exit=0

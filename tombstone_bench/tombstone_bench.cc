@@ -104,6 +104,8 @@ struct Listener : public EventListener {
   std::map<std::string, std::pair<int, uint64_t>> by_shape;   // "L1->L3"
   // Shapes of SkipLevelTombstone compactions only.
   std::map<std::string, std::pair<int, uint64_t>> skip_shape;
+  // "Reason:L1->L2", so each reason's compactions can be told apart by level.
+  std::map<std::string, std::pair<int, uint64_t>> reason_shape;
   // Compactions that start at L0, by reason: how many L0 files each one
   // takes and how many bytes it reads in total (L0 + overlapping levels).
   struct L0Stat {
@@ -135,6 +137,9 @@ struct Listener : public EventListener {
       }
       z.in_bytes += ci.stats.total_input_bytes;
     }
+    auto& rs = reason_shape[reason + ":" + shape];
+    rs.first++;
+    rs.second += ci.stats.total_output_bytes;
     auto& r = by_reason[reason];
     r.first++;
     r.second += ci.stats.total_output_bytes;
@@ -378,6 +383,7 @@ int main(int argc, char** argv) {
     listener->by_reason.clear();
     listener->by_shape.clear();
     listener->skip_shape.clear();
+    listener->reason_shape.clear();
     listener->l0_stat.clear();
   }
 
@@ -581,6 +587,11 @@ int main(int argc, char** argv) {
     }
     printf("\nskip-level shapes:     ");
     for (auto& kv : listener->skip_shape) {
+      printf(" %s=%d(%.1fMB)", kv.first.c_str(), kv.second.first,
+             kv.second.second / 1048576.0);
+    }
+    printf("\ncompactions by reason+shape:");
+    for (auto& kv : listener->reason_shape) {
       printf(" %s=%d(%.1fMB)", kv.first.c_str(), kv.second.first,
              kv.second.second / 1048576.0);
     }

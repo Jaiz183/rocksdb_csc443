@@ -162,6 +162,7 @@ struct MutableCFOptions {
             options.skip_level_tombstone_density_threshold),
         skip_level_tombstone_density_trigger(
             options.skip_level_tombstone_density_trigger),
+        fade_precise_tombstone_age(options.fade_precise_tombstone_age),
         skip_level_max_overlap_ratio(options.skip_level_max_overlap_ratio),
         max_bytes_for_level_multiplier_additional(
             options.max_bytes_for_level_multiplier_additional),
@@ -249,6 +250,7 @@ struct MutableCFOptions {
         skip_level_tombstone_compaction(0),
         skip_level_tombstone_density_threshold(0.5),
         skip_level_tombstone_density_trigger(true),
+        fade_precise_tombstone_age(false),
         skip_level_max_overlap_ratio(20.0),
         compaction_options_fifo(),
         preclude_last_level_data_seconds(0),
@@ -358,6 +360,7 @@ struct MutableCFOptions {
   uint32_t skip_level_tombstone_compaction;
   double skip_level_tombstone_density_threshold;
   bool skip_level_tombstone_density_trigger;
+  bool fade_precise_tombstone_age;  // [FADE]
   double skip_level_max_overlap_ratio;
   std::vector<int> max_bytes_for_level_multiplier_additional;
   CompactionOptionsFIFO compaction_options_fifo;

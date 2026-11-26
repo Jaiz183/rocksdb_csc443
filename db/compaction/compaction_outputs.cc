@@ -503,6 +503,14 @@ Status CompactionOutputs::AddToOutput(
 
     if (add_result == TableBuilderAddResult::kAdded) {
       current_output().validator.AddValidated(key, value);
+      if (track_tombstone_seqno_) {
+        const ParsedInternalKey& ikey = c_iter.ikey();
+        if (ikey.type == kTypeDeletion || ikey.type == kTypeSingleDeletion ||
+            ikey.type == kTypeDeletionWithTimestamp) {
+          SequenceNumber& oldest = current_output().oldest_tombstone_seqno;
+          oldest = std::min(oldest, ikey.sequence);
+        }
+      }
       break;
     }
 
@@ -890,6 +898,10 @@ Status CompactionOutputs::AddRangeDels(
 
     // Range tombstone is not supported by output validator yet.
     builder_->Add(kv.first.Encode(), kv.second);
+    if (track_tombstone_seqno_) {
+      SequenceNumber& oldest = current_output().oldest_tombstone_seqno;
+      oldest = std::min(oldest, tombstone.seq_);
+    }
     assert(icmp.Compare(tombstone_start, tombstone_end) <= 0);
     meta.UpdateBoundariesForRange(tombstone_start, tombstone_end,
                                   tombstone.seq_, icmp);
@@ -965,6 +977,9 @@ void CompactionOutputs::FillFilesToCutForTtl() {
 CompactionOutputs::CompactionOutputs(const Compaction* compaction,
                                      const bool is_proximal_level)
     : compaction_(compaction), is_proximal_level_(is_proximal_level) {
+  track_tombstone_seqno_ =
+      compaction->mutable_cf_options().fade_precise_tombstone_age &&
+      compaction->mutable_cf_options().delete_persistence_threshold > 0;
   partitioner_ = compaction->output_level() == 0
                      ? nullptr
                      : compaction->CreateSstPartitioner();

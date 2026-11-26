@@ -920,6 +920,27 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   uint64_t delete_persistence_threshold = 0;
 
+  // [FADE] How a compaction output's oldest tombstone time is estimated.
+  //
+  // false (default): the output inherits the oldest tombstone time of the
+  // input files it overlaps. This is safe but can be far too old: when the
+  // oldest tombstone is dropped by the compaction (for example because a
+  // newer write to the same key supersedes it), later outputs keep its time
+  // and FADE compacts them again although their tombstones are recent.
+  //
+  // true: the compaction also records the smallest sequence number among the
+  // tombstones it writes to each output file and converts it to a time with
+  // the DB's sequence-number-to-time mapping (recorded at least once per
+  // second while FADE is enabled). The later of the two estimates is used.
+  // Both are lower bounds on when the tombstone was written, so tombstone
+  // ages are never underestimated and delete_persistence_threshold still
+  // holds. Costs a few bytes of mapping per SST file (a table property).
+  //
+  // Ignored unless delete_persistence_threshold > 0.
+  //
+  // Dynamically changeable through SetOptions() API
+  bool fade_precise_tombstone_age = false;
+
   // This option has different meanings for different compaction styles:
   //
   // Leveled: files older than `periodic_compaction_seconds` will be picked up

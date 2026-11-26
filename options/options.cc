@@ -93,6 +93,7 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       disallow_memtable_writes(options.disallow_memtable_writes),
       ttl(options.ttl),
       delete_persistence_threshold(options.delete_persistence_threshold),
+      fade_precise_tombstone_age(options.fade_precise_tombstone_age),
       periodic_compaction_seconds(options.periodic_compaction_seconds),
       skip_level_tombstone_compaction(options.skip_level_tombstone_compaction),
       skip_level_tombstone_density_threshold(
@@ -433,6 +434,8 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log,
                    "             Options.delete_persistence_threshold: %" PRIu64,
                    delete_persistence_threshold);
+  ROCKS_LOG_HEADER(log, "             Options.fade_precise_tombstone_age: %d",
+                   fade_precise_tombstone_age);
   ROCKS_LOG_HEADER(log,
                    "         Options.periodic_compaction_seconds: %" PRIu64,
                    periodic_compaction_seconds);

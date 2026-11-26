@@ -760,6 +760,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "disallow_memtable_writes=true;"
       "ttl=60;"
       "delete_persistence_threshold=120;"
+      "fade_precise_tombstone_age=true;"
       "periodic_compaction_seconds=3600;"
       "read_triggered_compaction_threshold=0.5;"
       "skip_level_tombstone_compaction=2;"

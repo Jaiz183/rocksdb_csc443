@@ -637,6 +637,102 @@ s on churn.
     leaving the stages above the base level to size compaction and giving
     their budget to deeper stages.
 
+## fade-plus-skip-level: precise FADE tombstone ages (2026-11-26)
+
+### Diagnosis
+
+At D_th = 40 s on churn, FADE ran 14 L5 -> L6 compactions (68 MB) per run.
+Yet the oldest tombstone still above the last level never got older than
+20.5 s, so none of them were needed. `tombstone_bench` now prints compactions
+by reason and shape (`FadeTtl:L5->L6=...`), which made this visible.
+
+The cause is how FADE dated compaction outputs:
+
+- A compaction output inherited the oldest tombstone time of the input files
+  it overlaps.
+- That stays true even when the oldest tombstone is dropped by the compaction.
+  On churn this happens all the time: a re-insert of the key supersedes the
+  tombstone.
+- The old time then stuck to files whose tombstones were all recent, and FADE
+  pushed those files into the last level again and again.
+
+### Fix: `fade_precise_tombstone_age` (new option, default off)
+
+- While writing each output file, compaction records the smallest sequence
+  number among the point and range tombstones it writes there.
+- At file finish, that sequence number is dated with the DB's seqno -> time
+  mapping, and the later of that time and the inherited time is used.
+- Both are lower bounds on when the tombstone was written, so ages are never
+  underestimated and D_th still holds.
+- FADE enables recording of the mapping through `MinAndMaxPreserveSeconds`,
+  sampled every D_th/100 s, rounded up to 1 s. This only turns recording on:
+  sequence-number zeroing and tiering cutoffs still read
+  `preserve_internal_time_seconds` and `preclude_last_level_data_seconds`
+  (both 0 here).
+- Cost: a per-key type check in compaction output (only with the option on)
+  and a seqno -> time table property per SST.
+
+### Tests
+
+| suite | result |
+|---|---|
+| `seqno_time_test` | 30/30 |
+| `db_compaction_test` | 390/390 |
+| `compaction_picker_test` | 181/181 |
+| `db_skip_level_compaction_test` | 8/8 |
+| `options_test` | 83/83 |
+| `version_edit_test` | 35/35 |
+
+New: `SeqnoTimeTest.FadePreciseTombstoneAge`. An old tombstone is superseded
+and dropped by an L0 -> L1 compaction while a newer one survives:
+
+- without the option, the output keeps the old time;
+- with it, the output carries the newer time, to within one 10 s sample.
+
+### Benchmark
+
+Same setup as the D_th sweep, 3 repeats, load-gated, all 48 runs pass.
+`fade+p` / `fade+skip+p` = with `fade_precise_tombstone_age=true`. Welch t in
+brackets.
+
+| workload | D_th | base | FADE + skip (old ages) | FADE + precise | FADE + skip + precise | fix effect on FADE + skip | skip effect on precise FADE |
+|---|---|---|---|---|---|---|---|
+| seqdel | 40 s | 9.37 | 9.00 (-3.9%) | 9.44 (+0.8%) | 9.01 (**-3.8%**) | +0.1% (t = 0.1) | **-4.6%** (t = -6.6) |
+| seqdel | 20 s | 9.25 | 8.95 (-3.3%) | 9.44 (+2.0%) | 9.02 (**-2.6%**) | +0.8% (t = 0.7) | **-4.5%** (t = -7.3) |
+| churn | 40 s | 4.26 | 5.30 (+24.4%) | 4.77 (+11.9%) | 4.66 (**+9.4%**) | **-12.1%** (t = -3.6) | -2.3% (t = -1.2) |
+| churn | 20 s | 4.17 | 5.89 (+41.2%) | 5.87 (+40.7%) | 5.32 (**+27.5%**) | **-9.7%** (t = -10.1) | **-9.4%** (t = -9.6) |
+
+Stale FADE L5 -> L6 compactions on churn, and peak true tombstone age:
+
+| D_th | with old ages | with precise ages | peak true age (precise) | samples over D_th |
+|---|---|---|---|---|
+| 40 s | 14-15 per run | 0 | 19.5-23.2 s | 0 in all runs |
+| 20 s | 21-22 per run | 0 | 16.6-18.5 s | 0 in all runs |
+
+For reference, base's peak true age on churn is 28-44 s.
+
+### Findings
+
+- **The fix removes FADE's stale last-level compactions** without weakening
+  the bound.
+  - At D_th = 40 s, FADE + skip's churn penalty roughly halves: +24% -> +9.4%
+    vs base.
+  - Precise FADE is also far more repeatable: 4.76, 4.77, 4.76 at 40 s,
+    against runs that varied by up to 20% before.
+- **With precise ages, skip-level's saving over FADE shows on churn too.**
+  - -9.4% at 20 s.
+  - Expired tombstones cross L3/L4 in one rewrite instead of one FADE
+    compaction per level: FADE compactions drop from about 95 to 38 per run.
+- **On seqdel the fix is neutral,** since nothing is re-inserted, and FADE +
+  skip stays about 3-4% under base.
+- **Best combined setting here: FADE + skip + precise ages at D_th = 40 s.**
+  It gives -3.8% (seqdel) and +9.4% (churn) vs base, while bounding tombstone
+  age at 40 s (base reaches 44 s on churn).
+- **What is left on churn is FADE's intermediate-level deadlines.** At 20 s,
+  L3's and L4's cumulative deadlines are about 0.8 s and 4 s. The next
+  FADE-side lever is the deadline split itself (a per-level minimum, or
+  leaving L0/base to size compaction).
+
 ## fade-kiwi-plus-skip-level: KiWi + FADE + skip-level (2026-11-25)
 
 Branch `fade-kiwi-plus-skip-level` is `fade-plus-skip-level` with `kiwi` (KiWi

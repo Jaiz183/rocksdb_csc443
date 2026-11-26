@@ -14,10 +14,12 @@
 #   fade       FADE only (delete_persistence_threshold = $DTH seconds)
 #   fade+skip  FADE + skip+sav: dense size picks and dense FADE picks are
 #              extended by the mode 2 rule (needs a branch with both features)
+#   fade+p, fade+skip+p  the same with fade_precise_tombstone_age=true
 #   kiwi       KiWi delete tiles on (KIWI_TILE_PAGES=$KIWI pages), no
 #              FADE/skip; needs a branch with KiWi
 #   kiwi+fade  KiWi tiles + fade
 #   kiwi+fade+skip  KiWi tiles + fade+skip
+#   kiwi+fade+skip+p  KiWi tiles + fade+skip+p
 #
 # A config is "name|cf_opts" or "name|cf_opts|extra env" (e.g. KiWi's
 # KIWI_TILE_PAGES, which is a table option set by the driver).
@@ -56,9 +58,12 @@ CONFIGS=(
   "skip+sav|$T=2;skip_level_tombstone_density_trigger=false"
   "fade|delete_persistence_threshold=$DTH"
   "fade+skip|delete_persistence_threshold=$DTH;$T=2;skip_level_tombstone_density_trigger=false"
+  "fade+p|delete_persistence_threshold=$DTH;fade_precise_tombstone_age=true"
+  "fade+skip+p|delete_persistence_threshold=$DTH;fade_precise_tombstone_age=true;$T=2;skip_level_tombstone_density_trigger=false"
   "kiwi||KIWI_TILE_PAGES=$KIWI"
   "kiwi+fade|delete_persistence_threshold=$DTH|KIWI_TILE_PAGES=$KIWI"
   "kiwi+fade+skip|delete_persistence_threshold=$DTH;$T=2;skip_level_tombstone_density_trigger=false|KIWI_TILE_PAGES=$KIWI"
+  "kiwi+fade+skip+p|delete_persistence_threshold=$DTH;fade_precise_tombstone_age=true;$T=2;skip_level_tombstone_density_trigger=false|KIWI_TILE_PAGES=$KIWI"
 )
 if [ -n "${ONLY:-}" ]; then
   KEEP=()
