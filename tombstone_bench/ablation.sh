@@ -81,6 +81,14 @@ for rep in $(seq "${FIRST_REP:-1}" "$REPEATS"); do
         opts="$opts;skip_level_tombstone_density_threshold=$DENS"
       fi
       tag="${name}_${cname}_r${rep}"
+      # Wait (up to LOAD_WAIT_S) for the 1-minute load average to drop below
+      # MAX_LOAD, so background I/O (backups, indexing) does not skew runs.
+      if [ -n "${MAX_LOAD:-}" ]; then
+        waited=0
+        while [ "$waited" -lt "${LOAD_WAIT_S:-600}" ] && awk -v l="$(sysctl -n vm.loadavg | awk '{print $2}')" -v m="$MAX_LOAD" 'BEGIN{exit !(l >= m)}'; do
+          sleep 15; waited=$((waited + 15))
+        done
+      fi
       echo "== $tag load=$(sysctl -n vm.loadavg)" | tee "$OUT/$tag.txt"
       env $TREE $envs $xenv AGE_LIMIT="$DTH" CF_OPTS="$opts" "$BIN" "$DB" "$RUN_S" "$OUT/$tag" \
         >> "$OUT/$tag.txt" 2>&1

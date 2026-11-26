@@ -565,3 +565,74 @@ On churn the skips are mostly L0 -> L5 directly, past two levels.
     comes entirely from those short per-level TTLs.
   - Tuning D_th or the split is the obvious next lever. Skip-level recovers a
     few percent of FADE's cost, not most of it.
+
+## fade-plus-skip-level: D_th sweep (2026-11-25)
+
+The run at D_th = 10 s above left FADE + skip at +103% write amp vs base on
+churn. Where that cost comes from (MB written by shape, churn, repeat 1):
+
+| D_th | config | L0 -> base | L3 -> L4 | L4 -> L5 | **L5 -> L6** |
+|---|---|---|---|---|---|
+| 10 s | base | 74 | 80 | 83 | **37** |
+| 10 s | FADE | 53 | 5 | 198 | **392** |
+| 10 s | FADE + skip | 131 (L0 -> L4/L5) | | 81 | **398** |
+| 20 s | FADE | 62 | 54 | 130 | **260** |
+| 40 s | FADE | 61 | 95 | 95 | **93** |
+
+What the breakdown shows:
+
+- Almost all of FADE's extra cost is in its last stage: tombstones in L5 must
+  reach L6 (about 70 MB) within D_th.
+- The upper levels' sub-second TTLs cost little (5 MB at D_th = 10 s).
+- Skip-level lowers bytes everywhere except that last stage, so turning it off
+  for the top levels would not help.
+- D_th scales every stage's deadline, so it is the lever. The sweep reruns
+  base, FADE and FADE + skip at 20 s and 40 s, 3 repeats each.
+
+Two background jobs (a Time Machine backup and indexing) pushed the load
+average to about 35 during the first attempt. The sweep was restarted with
+`MAX_LOAD=8`: before each run, `ablation.sh` waits up to 10 min for the
+1-minute load to drop below 8. All runs then started at load 3-8.
+
+### Results (write amp, 3 runs each; Welch t in brackets)
+
+| workload | D_th | base | FADE (vs base) | FADE + skip (vs base) | FADE + skip vs FADE | FADE + skip peak true tombstone age | samples over D_th |
+|---|---|---|---|---|---|---|---|
+| seqdel | 10 s | 9.28 | +11.0% | +7.1% | **-3.5%** (t = -2.0) | 6.1-6.4 s | 0/59 |
+| seqdel | 20 s | 9.40 | -0.2% | **-3.7%** (t = -2.8) | **-3.4%** (t = -2.6) | 4.9-8.8 s | 0/59 |
+| seqdel | 40 s | 9.31 | +1.3% | **-4.2%** (t = -4.3) | **-5.4%** (t = -5.8) | 5.6-6.4 s | 0/59 |
+| churn | 10 s | 4.29 | +108% | +103% | -2.3% (t = -0.4) | 10.8 s | 4-5/59 |
+| churn | 20 s | 4.09 | +66% | +57% | -5.3% (t = -0.6) | 16.5-19.5 s | 0/59 |
+| churn | 40 s | 4.33 | +20% | +22% | +1.2% (t = 0.9) | 19.6-20.5 s | 0/59 |
+
+For reference, base's peak true tombstone age is 5.6-7.9 s on seqdel and 29-44
+s on churn.
+
+### Findings
+
+- **Raising D_th removes most of the penalty:**
+
+  | FADE + skip vs base | churn | seqdel |
+  |---|---|---|
+  | D_th = 10 s | +103% | +7.1% |
+  | D_th = 20 s | +57% | -3.7% |
+  | D_th = 40 s | +22% | -4.2% |
+
+  On seqdel at 20 s and above, FADE + skip writes *less* than base while
+  bounding tombstone age.
+- **Skip-level keeps saving on top of FADE on seqdel at every D_th:** -3.4% to
+  -5.4%, significant at 20 s and 40 s.
+- **On churn the saving over FADE is not significant at any D_th:**
+  - At 10-20 s it is -2% to -5%, but with t > -1: FADE's runs vary by up to
+    20%.
+  - At 40 s it is a tie (+1.2%). The skips replace FADE's own L3 -> L4 work
+    byte for byte (346 vs 344 MB in repeat 1), and both take 2.00 L0 files per
+    compaction, so there is no batching regression.
+  - FADE + skip still has about 3x fewer upper-level tombstones on churn
+    (-23% vs -8% at 40 s).
+- **The remaining churn cost at 40 s (+20-22%) is FADE's.**
+  - At 40 s, L3's and L4's cumulative deadlines are only about 1.5 s and 8 s,
+    so FADE still runs about 88 compactions per run.
+  - Two FADE-side options remain untested here: a minimum per-level TTL, or
+    leaving the stages above the base level to size compaction and giving
+    their budget to deeper stages.
