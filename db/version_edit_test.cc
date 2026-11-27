@@ -122,8 +122,7 @@ TEST_F(VersionEditTest, KiWiDeleteFloor) {
   VersionEdit decoded;
   ASSERT_OK(decoded.DecodeFrom(encoded_with));
   ASSERT_EQ(decoded.GetNewFiles().size(), 1U);
-  ASSERT_EQ(decoded.GetNewFiles()[0].second.kiwi_delete_floor,
-            1234567890123U);
+  ASSERT_EQ(decoded.GetNewFiles()[0].second.kiwi_delete_floor, 1234567890123U);
   ASSERT_NE(decoded.DebugString().find("kiwi_delete_floor:1234567890123"),
             std::string::npos);
   VersionEdit decoded_without;

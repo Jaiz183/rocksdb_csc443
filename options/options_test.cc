@@ -1760,8 +1760,8 @@ TEST_F(OptionsTest, KiWiTableOptions) {
   ConfigOptions config_options;
   DBOptions db_opts;
   ColumnFamilyOptions cf_opts;
-  ASSERT_OK(TableFactory::CreateFromString(
-      config_options, "BlockBasedTable", &cf_opts.table_factory));
+  ASSERT_OK(TableFactory::CreateFromString(config_options, "BlockBasedTable",
+                                           &cf_opts.table_factory));
   const auto* bbto =
       cf_opts.table_factory->GetOptions<BlockBasedTableOptions>();
   ASSERT_NE(bbto, nullptr);
@@ -1785,8 +1785,8 @@ TEST_F(OptionsTest, KiWiTableOptions) {
   std::string str;
   ASSERT_OK(cf_opts.table_factory->GetOptionString(config_options, &str));
   std::shared_ptr<TableFactory> copy;
-  ASSERT_OK(TableFactory::CreateFromString(config_options, "BlockBasedTable",
-                                           &copy));
+  ASSERT_OK(
+      TableFactory::CreateFromString(config_options, "BlockBasedTable", &copy));
   ASSERT_OK(copy->ConfigureFromString(config_options, str));
   ASSERT_EQ(copy->GetOptions<BlockBasedTableOptions>()->kiwi_tile_pages, 8U);
 
@@ -1817,11 +1817,12 @@ TEST_F(OptionsTest, KiWiTableOptions) {
   // kiwi_tile_pages <= 1 means KiWi is off, so nothing is rejected.
   {
     ColumnFamilyOptions cfo;
-    ASSERT_OK(TableFactory::CreateFromString(
-        config_options, "BlockBasedTable", &cfo.table_factory));
+    ASSERT_OK(TableFactory::CreateFromString(config_options, "BlockBasedTable",
+                                             &cfo.table_factory));
     ASSERT_OK(cfo.table_factory->ConfigureFromString(
-        config_options, "kiwi_tile_pages=1;index_type=kTwoLevelIndexSearch;"
-                        "partition_filters=true;"));
+        config_options,
+        "kiwi_tile_pages=1;index_type=kTwoLevelIndexSearch;"
+        "partition_filters=true;"));
     cfo.bottommost_compression_opts.max_dict_bytes = 4096;
     ASSERT_OK(cfo.table_factory->ValidateOptions(db_opts, cfo));
   }

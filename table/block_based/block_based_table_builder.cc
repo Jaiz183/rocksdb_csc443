@@ -1370,8 +1370,7 @@ struct BlockBasedTableBuilder::Rep {
     estimate += static_cast<uint64_t>(buffered_keys) * 2;
     if (kiwi->file_xor_filter != nullptr && !kiwi->file_xor_filter->empty()) {
       const uint64_t bytes_per_slot = uint64_t{kiwi->xor_fp_bytes} + 1;
-      estimate +=
-          (props.num_entries * 5 / 4 + 32) * bytes_per_slot + 256;
+      estimate += (props.num_entries * 5 / 4 + 32) * bytes_per_slot + 256;
     }
     return estimate;
   }
@@ -2391,10 +2390,9 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
 
     // With KiWi, a "block" boundary is a tile boundary.
     const bool is_kiwi = r->kiwi != nullptr;
-    auto should_flush = is_kiwi
-                            ? r->kiwi->packer.full()
-                            : r->flush_block_policy->Update(entry_ikey,
-                                                            entry_value);
+    auto should_flush =
+        is_kiwi ? r->kiwi->packer.full()
+                : r->flush_block_policy->Update(entry_ikey, entry_value);
     if (should_flush) {
       if (is_kiwi) {
         FlushTile(/*first_key_in_next_tile=*/&entry_ikey);
@@ -2617,8 +2615,7 @@ void BlockBasedTableBuilder::FlushTile(const Slice* first_key_in_next_tile) {
       }
     }
     const Slice last_ukey = ExtractUserKey(packer.last_key());
-    r->kiwi->prev_tile_last_user_key.assign(last_ukey.data(),
-                                            last_ukey.size());
+    r->kiwi->prev_tile_last_user_key.assign(last_ukey.data(), last_ukey.size());
     buffered_tile.pages.reserve(pages.size());
   }
   for (size_t p = 0; p < pages.size(); ++p) {

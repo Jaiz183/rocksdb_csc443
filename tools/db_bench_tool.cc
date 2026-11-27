@@ -11746,13 +11746,13 @@ class Benchmark {
     const double mb = 1024.0 * 1024.0;
     char msg[300];
     snprintf(msg, sizeof(msg),
-             "(floor=%" PRIu64 "; delete call %.3f ms, compaction read/write "
+             "(floor=%" PRIu64
+             "; delete call %.3f ms, compaction read/write "
              "%.1f/%.1f MB meanwhile; compaction that followed by itself "
              "%.3f s, read/write %.1f/%.1f MB)",
              floor, delete_micros / 1000.0,
              (after_delete.first - before.first) / mb,
-             (after_delete.second - before.second) / mb,
-             reclaim_micros / 1e6,
+             (after_delete.second - before.second) / mb, reclaim_micros / 1e6,
              (after_reclaim.first - after_delete.first) / mb,
              (after_reclaim.second - after_delete.second) / mb);
     thread->stats.FinishedOps(&db_, db, 1, kOthers);

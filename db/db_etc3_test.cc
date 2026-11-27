@@ -1216,9 +1216,9 @@ class DBKiWiTest : public DBEtc3Test {
     TablePropertiesCollection props;
     EXPECT_OK(db_->GetPropertiesOfAllTables(&props));
     for (const auto& file : props) {
-      EXPECT_EQ(file.second->user_collected_properties.count(
-                    kiwi::kPropTilePages),
-                1U);
+      EXPECT_EQ(
+          file.second->user_collected_properties.count(kiwi::kPropTilePages),
+          1U);
     }
     return props.size();
   }
@@ -1634,8 +1634,7 @@ TEST_F(DBKiWiSecondaryDeleteTest, StackableDBForwardsTheCall) {
   VerifyModel(model);
 }
 
-TEST_F(DBKiWiSecondaryDeleteTest,
-       TileXorFilterLifecycleAndSecondaryDeletes) {
+TEST_F(DBKiWiSecondaryDeleteTest, TileXorFilterLifecycleAndSecondaryDeletes) {
   Random64 rnd(20261125);
   for (int xor_bytes : {1, 2}) {
     for (uint32_t tile_pages : {4U, 8U}) {

@@ -556,8 +556,8 @@ Status Directory::Decode(std::string contents) {
     if (!GetVarint64(&input, &num_pages) || num_pages == 0) {
       return corrupt("bad page count");
     }
-    max_tile_pages = std::max<size_t>(max_tile_pages,
-                                      static_cast<size_t>(num_pages));
+    max_tile_pages =
+        std::max<size_t>(max_tile_pages, static_cast<size_t>(num_pages));
     if (is_tile_filter) {
       Slice raw_tile_filter;
       if (!GetLengthPrefixedSlice(&input, &raw_tile_filter)) {

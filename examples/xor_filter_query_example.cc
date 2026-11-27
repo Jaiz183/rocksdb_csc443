@@ -28,8 +28,8 @@ using ROCKSDB_NAMESPACE::NewBloomFilterPolicy;
 using ROCKSDB_NAMESPACE::NewXorFilterPolicy;
 using ROCKSDB_NAMESPACE::Options;
 using ROCKSDB_NAMESPACE::ReadOptions;
-using ROCKSDB_NAMESPACE::Status;
 using ROCKSDB_NAMESPACE::Statistics;
+using ROCKSDB_NAMESPACE::Status;
 using ROCKSDB_NAMESPACE::WriteOptions;
 
 namespace {
@@ -95,7 +95,8 @@ Status ProfileAbsentQueries(DB* db, Statistics* statistics,
     return status;
   }
 
-  const uint64_t useful_before = statistics->getTickerCount(BLOOM_FILTER_USEFUL);
+  const uint64_t useful_before =
+      statistics->getTickerCount(BLOOM_FILTER_USEFUL);
   const uint64_t positive_before =
       statistics->getTickerCount(BLOOM_FILTER_FULL_POSITIVE);
   const std::chrono::steady_clock::time_point start =
@@ -206,10 +207,9 @@ bool RunPolicy(const std::string& db_path, const char* policy_name,
                    present_keys.size() * kQueryRounds);
   PrintQueryTiming("absent keys", absent_ms, absent_keys.size());
   std::cout << "  Measured absent-key filter false-positive rate: "
-            << std::setprecision(4)
-            << (100.0 * false_positives / filter_checks) << "% ("
-            << false_positives << " positive decisions / " << filter_checks
-            << " filter checks)\n";
+            << std::setprecision(4) << (100.0 * false_positives / filter_checks)
+            << "% (" << false_positives << " positive decisions / "
+            << filter_checks << " filter checks)\n";
   return true;
 }
 
@@ -260,8 +260,8 @@ int main(int argc, char** argv) {
       std::cerr << "XOR and Bloom database paths must be different\n";
       return 1;
     }
-    if (!RunPolicy(xor_db_path, "XOR", NewXorFilterPolicy(bytes),
-                   present_keys, absent_keys, bytes)) {
+    if (!RunPolicy(xor_db_path, "XOR", NewXorFilterPolicy(bytes), present_keys,
+                   absent_keys, bytes)) {
       return 1;
     }
   }

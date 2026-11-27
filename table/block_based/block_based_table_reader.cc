@@ -64,8 +64,8 @@
 #include "table/block_based/filter_block.h"
 #include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/full_filter_block.h"
-#include "table/block_based/kiwi_table_iterator.h"
 #include "table/block_based/hash_index_reader.h"
+#include "table/block_based/kiwi_table_iterator.h"
 #include "table/block_based/partitioned_filter_block.h"
 #include "table/block_based/partitioned_index_reader.h"
 #include "table/block_based/user_defined_index_wrapper.h"
@@ -1731,8 +1731,8 @@ Status BlockBasedTable::ReadKiWiDirectory(const ReadOptions& ro,
   if (offset_ok) {
     const std::string& text = offset_prop->second;
     const char* end = text.data() + text.size();
-    const auto parsed = std::from_chars(text.data(), end,
-                                        rep_->kiwi_delete_key_offset);
+    const auto parsed =
+        std::from_chars(text.data(), end, rep_->kiwi_delete_key_offset);
     offset_ok = parsed.ec == std::errc() && parsed.ptr == end;
   }
   if (!offset_ok) {
@@ -1799,9 +1799,9 @@ Status BlockBasedTable::KiWiGet(const ReadOptions& read_options,
       TableReaderCaller::kUserGet, get_context->get_tracing_get_id(),
       /*get_from_user_specified_snapshot=*/read_options.snapshot != nullptr};
   IndexBlockIter iiter_on_stack;
-  InternalIteratorBase<IndexValue>* iiter = NewIndexIterator(
-      read_options, /*disable_prefix_seek=*/false, &iiter_on_stack, get_context,
-      &lookup_context);
+  InternalIteratorBase<IndexValue>* iiter =
+      NewIndexIterator(read_options, /*disable_prefix_seek=*/false,
+                       &iiter_on_stack, get_context, &lookup_context);
   std::unique_ptr<InternalIteratorBase<IndexValue>> iiter_unique_ptr;
   if (iiter != &iiter_on_stack) {
     iiter_unique_ptr.reset(iiter);
@@ -1905,9 +1905,9 @@ Status BlockBasedTable::KiWiGet(const ReadOptions& read_options,
       if (!pages.empty()) {
         // Versions of one key can sit on different pages, so merge them and let
         // the context see them newest first, as for any other table.
-        std::unique_ptr<InternalIterator> merged(NewMergingIterator(
-            &rep_->internal_comparator, pages.data(),
-            static_cast<int>(pages.size())));
+        std::unique_ptr<InternalIterator> merged(
+            NewMergingIterator(&rep_->internal_comparator, pages.data(),
+                               static_cast<int>(pages.size())));
         scan_iter(merged.get());
         if (!s.ok()) {
           break;
@@ -1916,8 +1916,8 @@ Status BlockBasedTable::KiWiGet(const ReadOptions& read_options,
     }
     // Later tiles only hold larger keys: stop unless this tile ends in the
     // user key, in which case older versions may continue in the next tile.
-    if (!done && ucmp->CompareWithoutTimestamp(iiter->user_key(), user_key) !=
-                     0) {
+    if (!done &&
+        ucmp->CompareWithoutTimestamp(iiter->user_key(), user_key) != 0) {
       done = true;
     }
   }
@@ -3078,14 +3078,14 @@ InternalIterator* BlockBasedTable::NewIteratorImpl(
                          /*input_iter=*/nullptr, /*get_context=*/nullptr,
                          &lookup_context));
     if (arena == nullptr) {
-      return new KiWiTableIterator(
-          this, read_options, rep_->internal_comparator,
-          std::move(kiwi_index_iter), caller);
+      return new KiWiTableIterator(this, read_options,
+                                   rep_->internal_comparator,
+                                   std::move(kiwi_index_iter), caller);
     }
     auto* mem = arena->AllocateAligned(sizeof(KiWiTableIterator));
-    return new (mem) KiWiTableIterator(this, read_options,
-                                       rep_->internal_comparator,
-                                       std::move(kiwi_index_iter), caller);
+    return new (mem)
+        KiWiTableIterator(this, read_options, rep_->internal_comparator,
+                          std::move(kiwi_index_iter), caller);
   }
   bool need_upper_bound_check =
       read_options.auto_prefix_mode || PrefixExtractorChanged(prefix_extractor);
@@ -4271,8 +4271,8 @@ Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream,
           out_stream << "Error reading the block - Skipped \n";
           break;
         }
-        DumpKeyValue(datablock_iter->key(), datablock_iter->value(),
-                     out_stream, show_sequence_number_type);
+        DumpKeyValue(datablock_iter->key(), datablock_iter->value(), out_stream,
+                     show_sequence_number_type);
       }
       out_stream << "\n";
     }

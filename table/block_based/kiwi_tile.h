@@ -120,8 +120,6 @@ class TilePacker {
   mutable std::vector<size_t> order_scratch_;
 };
 
-
-
 // Names of the KiWi meta block and user-collected table properties. A file is
 // a KiWi file if and only if it has the kPropTilePages property.
 constexpr char kDirectoryBlockName[] = "rocksdb.kiwi.directory";

@@ -153,8 +153,8 @@ void KiWiTableIterator::InitTile() {
     }
   }
   // Takes ownership of the page iterators.
-  tile_iter_.reset(NewMergingIterator(
-      &icomp_, page_scratch_.data(), static_cast<int>(page_scratch_.size())));
+  tile_iter_.reset(NewMergingIterator(&icomp_, page_scratch_.data(),
+                                      static_cast<int>(page_scratch_.size())));
   if (pinned_iters_mgr_ != nullptr) {
     tile_iter_->SetPinnedItersMgr(pinned_iters_mgr_);
   }

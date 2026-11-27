@@ -16,14 +16,13 @@
 #include "db/dbformat.h"
 #include "db/pinned_iterators_manager.h"
 #include "file/writable_file_writer.h"
+#include "memory/arena.h"
 #include "options/cf_options.h"
 #include "port/stack_trace.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/env.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/statistics.h"
-#include "table/get_context.h"
-#include "table/multiget_context.h"
 #include "rocksdb/table.h"
 #include "table/block_based/block.h"
 #include "table/block_based/block_based_table_builder.h"
@@ -31,17 +30,18 @@
 #include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/kiwi_tile.h"
+#include "table/get_context.h"
 #include "table/internal_iterator.h"
 #include "table/meta_blocks.h"
+#include "table/multiget_context.h"
 #include "table/table_builder.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
-#include "memory/arena.h"
 #include "util/autovector.h"
-#include "util/string_util.h"
 #include "util/compression.h"
 #include "util/random.h"
+#include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace kiwi {
@@ -128,12 +128,11 @@ TEST(KiWiTileTest, PackerEmptyAndReuse) {
   packer.Pack(&pages);
   ASSERT_TRUE(pages.empty());
 
-  ASSERT_OK(packer.Add(MakeInternalKey(1, 10, kTypeValue),
-                       MakeValue(5, 0, 16)));
+  ASSERT_OK(
+      packer.Add(MakeInternalKey(1, 10, kTypeValue), MakeValue(5, 0, 16)));
   ASSERT_FALSE(packer.empty());
   ASSERT_EQ(packer.num_entries(), 1U);
-  ASSERT_EQ(packer.last_key().ToString(),
-            MakeInternalKey(1, 10, kTypeValue));
+  ASSERT_EQ(packer.last_key().ToString(), MakeInternalKey(1, 10, kTypeValue));
   packer.Pack(&pages);
   ASSERT_EQ(pages.size(), 1U);
   ASSERT_EQ(pages[0].entries, std::vector<size_t>{0});
@@ -149,8 +148,7 @@ TEST(KiWiTileTest, PackerEmptyAndReuse) {
 
 TEST(KiWiTileTest, PackerRejectsShortValue) {
   TilePacker packer(/*offset=*/8, /*max_pages=*/4, /*page_size=*/64);
-  ASSERT_EQ(packer.Add(MakeInternalKey(1, 1, kTypeValue),
-                       std::string(15, 'x'))
+  ASSERT_EQ(packer.Add(MakeInternalKey(1, 1, kTypeValue), std::string(15, 'x'))
                 .code(),
             Status::kInvalidArgument);
   // A failed Add leaves nothing buffered.
@@ -227,8 +225,8 @@ TEST(KiWiTileTest, PackerRandomInvariants) {
       // Few distinct delete keys sometimes, to exercise ties.
       const uint64_t d = rnd.OneIn(3) ? rnd.Uniform(8) : rnd.Next();
       const bool deletion = rnd.OneIn(10);
-      const std::string ikey = MakeInternalKey(
-          i, 1000 - i, deletion ? kTypeDeletion : kTypeValue);
+      const std::string ikey =
+          MakeInternalKey(i, 1000 - i, deletion ? kTypeDeletion : kTypeValue);
       const std::string value =
           deletion ? std::string() : MakeValue(d, offset, 8 + rnd.Uniform(60));
       ASSERT_OK(packer.Add(ikey, value));
@@ -241,9 +239,9 @@ TEST(KiWiTileTest, PackerRandomInvariants) {
 
     ASSERT_GE(pages.size(), 1U);
     ASSERT_LE(pages.size(), max_pages);
-    const size_t want_pages = std::clamp(
-        (packer.buffered_bytes() + page_size - 1) / page_size, size_t{1},
-        static_cast<size_t>(max_pages));
+    const size_t want_pages =
+        std::clamp((packer.buffered_bytes() + page_size - 1) / page_size,
+                   size_t{1}, static_cast<size_t>(max_pages));
     ASSERT_LE(pages.size(), want_pages);
     const size_t target =
         (packer.buffered_bytes() + want_pages - 1) / want_pages;
@@ -446,7 +444,8 @@ TEST(KiWiDirectoryTest, V2TileFilterRoundTripAndCorruption) {
   uint64_t offset = 0;
   for (size_t t = 0; t < 8; ++t) {
     const size_t num_pages = 1 + rnd.Uniform(8);
-    TileXorFilterBuilder fb(/*fingerprint_bytes=*/1 + static_cast<uint8_t>(t % 2));
+    TileXorFilterBuilder fb(/*fingerprint_bytes=*/1 +
+                            static_cast<uint8_t>(t % 2));
     std::vector<DirectoryPage> pages(num_pages);
     for (size_t p = 0; p < num_pages; ++p) {
       pages[p].handle = BlockHandle(offset, 64 + rnd.Uniform(200));
@@ -454,8 +453,8 @@ TEST(KiWiDirectoryTest, V2TileFilterRoundTripAndCorruption) {
       pages[p].min_delete_key = p * 100;
       pages[p].max_delete_key = p * 100 + 99;
       for (size_t k = 0; k < 20; ++k) {
-        fb.AddKey("tile" + std::to_string(t) + "_p" + std::to_string(p) +
-                      "_k" + std::to_string(k),
+        fb.AddKey("tile" + std::to_string(t) + "_p" + std::to_string(p) + "_k" +
+                      std::to_string(k),
                   static_cast<uint32_t>(p));
       }
     }
@@ -479,12 +478,13 @@ TEST(KiWiDirectoryTest, V2TileFilterRoundTripAndCorruption) {
     ASSERT_EQ(tv.num_pages, expected_pages[t].size());
     for (size_t p = 0; p < tv.num_pages; ++p) {
       ASSERT_EQ(tv.pages[p].handle, expected_pages[t][p].handle);
-      ASSERT_EQ(tv.pages[p].min_delete_key, expected_pages[t][p].min_delete_key);
-      ASSERT_EQ(tv.pages[p].max_delete_key, expected_pages[t][p].max_delete_key);
+      ASSERT_EQ(tv.pages[p].min_delete_key,
+                expected_pages[t][p].min_delete_key);
+      ASSERT_EQ(tv.pages[p].max_delete_key,
+                expected_pages[t][p].max_delete_key);
       uint32_t got_page = 9999;
       ASSERT_TRUE(dir.TileMayMatch(
-          t,
-          "tile" + std::to_string(t) + "_p" + std::to_string(p) + "_k5",
+          t, "tile" + std::to_string(t) + "_p" + std::to_string(p) + "_k5",
           &got_page));
       ASSERT_EQ(got_page, p);
     }
@@ -509,8 +509,8 @@ TEST(KiWiDirectoryTest, V2TileFilterRoundTripAndCorruption) {
 }
 
 TEST(TileXorFilterTest, RoundTripAndPageLookup) {
-  for (uint8_t fp_bytes : {uint8_t{1}, uint8_t{2}, uint8_t{3}, uint8_t{4},
-                           uint8_t{8}}) {
+  for (uint8_t fp_bytes :
+       {uint8_t{1}, uint8_t{2}, uint8_t{3}, uint8_t{4}, uint8_t{8}}) {
     for (size_t num_pages : {size_t{1}, size_t{2}, size_t{3}, size_t{4},
                              size_t{5}, size_t{8}, size_t{16}}) {
       TileXorFilterBuilder builder(fp_bytes);
@@ -528,8 +528,8 @@ TEST(TileXorFilterTest, RoundTripAndPageLookup) {
       TileXorFilterReader reader;
       ASSERT_OK(reader.Init(encoded, num_pages));
       const uint8_t expected_page_bits = CeilLog2(num_pages);
-      const uint8_t expected_fp_bits = static_cast<uint8_t>(
-          std::min<uint32_t>(uint32_t{fp_bytes} * 8U, 64U - expected_page_bits));
+      const uint8_t expected_fp_bits = static_cast<uint8_t>(std::min<uint32_t>(
+          uint32_t{fp_bytes} * 8U, 64U - expected_page_bits));
       ASSERT_EQ(reader.page_bits(), expected_page_bits);
       ASSERT_EQ(reader.fp_bits(), expected_fp_bits);
       ASSERT_EQ(reader.slot_bits(), expected_fp_bits + expected_page_bits);
@@ -682,7 +682,8 @@ struct BuildParams {
   const Comparator* comparator = BytewiseComparator();
 };
 
-std::shared_ptr<const FilterPolicy> MakeBuildFilterPolicy(const BuildParams& bp) {
+std::shared_ptr<const FilterPolicy> MakeBuildFilterPolicy(
+    const BuildParams& bp) {
   if (!bp.filters) {
     return nullptr;
   }
@@ -741,13 +742,12 @@ void BuildKiWiTable(const std::vector<Entry>& entries, const BuildParams& bp,
   SyncPoint::GetInstance()->EnableProcessing();
 
   std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
-      TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &internal_tbl_prop_coll_factories, bp.compression,
-                          options.compression_opts,
-                          TablePropertiesCollectorFactory::Context::
-                              kUnknownColumnFamily,
-                          column_family_name, /*level=*/-1,
-                          kUnknownNewestKeyTime),
+      TableBuilderOptions(
+          ioptions, moptions, read_options, write_options, ikc,
+          &internal_tbl_prop_coll_factories, bp.compression,
+          options.compression_opts,
+          TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
+          column_family_name, /*level=*/-1, kUnknownNewestKeyTime),
       file_writer.get()));
   for (const Entry& e : entries) {
     builder->Add(e.ikey, e.value);
@@ -774,10 +774,9 @@ void BuildKiWiTable(const std::vector<Entry>& entries, const BuildParams& bp,
   out->directory.clear();
   if (bp.tile_pages >= 2) {
     BlockHandle directory_handle;
-    ASSERT_OK(FindMetaBlockInFile(file_reader.get(), out->contents.size(),
-                                  kBlockBasedTableMagicNumber, ioptions,
-                                  read_options, kDirectoryBlockName,
-                                  &directory_handle));
+    ASSERT_OK(FindMetaBlockInFile(
+        file_reader.get(), out->contents.size(), kBlockBasedTableMagicNumber,
+        ioptions, read_options, kDirectoryBlockName, &directory_handle));
     // Stored uncompressed; the checksum trailer follows the payload.
     out->directory = out->contents.substr(directory_handle.offset(),
                                           directory_handle.size());
@@ -837,8 +836,8 @@ std::vector<Entry> MakeEntries(Random64* rnd, size_t num_keys,
     for (size_t v = 0; v < versions; ++v) {
       const bool deletion = rnd->OneIn(8);
       Entry e;
-      e.ikey = MakeInternalKey(k, 1000 - v, deletion ? kTypeDeletion
-                                                      : kTypeValue);
+      e.ikey =
+          MakeInternalKey(k, 1000 - v, deletion ? kTypeDeletion : kTypeValue);
       if (!deletion) {
         // Few distinct delete keys sometimes, to exercise ties.
         const uint64_t d = rnd->OneIn(3) ? rnd->Uniform(8) : rnd->Next();
@@ -918,9 +917,8 @@ TEST(KiWiBuilderTest, WritesTilesWithKiWiInvariants) {
       }
       if (t > 0) {
         const BlockHandle& prev = table.tiles[t - 1].handle;
-        ASSERT_EQ(tile.handle.offset(),
-                  prev.offset() + prev.size() +
-                      BlockBasedTable::kBlockTrailerSize);
+        ASSERT_EQ(tile.handle.offset(), prev.offset() + prev.size() +
+                                            BlockBasedTable::kBlockTrailerSize);
       }
 
       // The directory describes exactly the pages that were written, and the
@@ -1031,13 +1029,12 @@ TEST(KiWiBuilderTest, ShortValueFailsTheBuilder) {
   const ReadOptions read_options;
   const WriteOptions write_options;
   std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
-      TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &internal_tbl_prop_coll_factories, kNoCompression,
-                          options.compression_opts,
-                          TablePropertiesCollectorFactory::Context::
-                              kUnknownColumnFamily,
-                          column_family_name, /*level=*/-1,
-                          kUnknownNewestKeyTime),
+      TableBuilderOptions(
+          ioptions, moptions, read_options, write_options, ikc,
+          &internal_tbl_prop_coll_factories, kNoCompression,
+          options.compression_opts,
+          TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
+          column_family_name, /*level=*/-1, kUnknownNewestKeyTime),
       file_writer.get()));
   builder->Add(MakeInternalKey(1, 5, kTypeValue), MakeValue(1, 4, 12));
   ASSERT_OK(builder->status());
@@ -1064,13 +1061,12 @@ TEST(KiWiBuilderTest, UserDefinedTimestampsAreNotSupported) {
   const ReadOptions read_options;
   const WriteOptions write_options;
   std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
-      TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &internal_tbl_prop_coll_factories, kNoCompression,
-                          options.compression_opts,
-                          TablePropertiesCollectorFactory::Context::
-                              kUnknownColumnFamily,
-                          column_family_name, /*level=*/-1,
-                          kUnknownNewestKeyTime),
+      TableBuilderOptions(
+          ioptions, moptions, read_options, write_options, ikc,
+          &internal_tbl_prop_coll_factories, kNoCompression,
+          options.compression_opts,
+          TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
+          column_family_name, /*level=*/-1, kUnknownNewestKeyTime),
       file_writer.get()));
   ASSERT_EQ(builder->status().code(), Status::kNotSupported);
   builder->Abandon();
@@ -1093,13 +1089,12 @@ TEST(KiWiBuilderTest, EstimatedFileSizeCountsBufferedTile) {
   const ReadOptions read_options;
   const WriteOptions write_options;
   std::unique_ptr<TableBuilder> builder(factory.NewTableBuilder(
-      TableBuilderOptions(ioptions, moptions, read_options, write_options, ikc,
-                          &internal_tbl_prop_coll_factories, kNoCompression,
-                          options.compression_opts,
-                          TablePropertiesCollectorFactory::Context::
-                              kUnknownColumnFamily,
-                          column_family_name, /*level=*/-1,
-                          kUnknownNewestKeyTime),
+      TableBuilderOptions(
+          ioptions, moptions, read_options, write_options, ikc,
+          &internal_tbl_prop_coll_factories, kNoCompression,
+          options.compression_opts,
+          TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
+          column_family_name, /*level=*/-1, kUnknownNewestKeyTime),
       file_writer.get()));
   uint64_t last = builder->EstimatedFileSize();
   for (uint64_t i = 0; i < 100; ++i) {
@@ -1331,9 +1326,9 @@ TEST(KiWiIteratorTest, ForwardScanMatchesPlainTable) {
     bp.block_size = 64 + rnd.Uniform(400);
     bp.delete_key_offset = static_cast<uint32_t>(rnd.Uniform(8));
     TablePair tables;
-    BuildTablePair(MakeEntries(&rnd, 1 + rnd.Uniform(400),
-                               bp.delete_key_offset, 60),
-                   bp, &tables);
+    BuildTablePair(
+        MakeEntries(&rnd, 1 + rnd.Uniform(400), bp.delete_key_offset, 60), bp,
+        &tables);
 
     // Both heap and arena allocation.
     Arena arena;
@@ -1584,8 +1579,8 @@ std::vector<Entry> MakeVersionedEntries(Random64* rnd, size_t num_keys,
     for (size_t v = 0; v < versions; ++v) {
       const bool deletion = rnd->OneIn(6);
       Entry e;
-      e.ikey = MakeInternalKey(k, 1000 - v, deletion ? kTypeDeletion
-                                                      : kTypeValue);
+      e.ikey =
+          MakeInternalKey(k, 1000 - v, deletion ? kTypeDeletion : kTypeValue);
       if (!deletion) {
         e.value = MakeValue(rnd->Next(), 0, kDeleteKeySize + rnd->Uniform(40));
       }
@@ -2131,8 +2126,8 @@ TEST(KiWiTileXorTableTest, ReadsMatchPlainFileAndProbeSinglePage) {
       ExpectSameIterator(expected.get(), actual.get());
 
       // VerifyChecksum and DumpTable work on v2 directories too.
-      ASSERT_OK(kiwi.reader->VerifyChecksum(ReadOptions(),
-                                            TableReaderCaller::kUserVerifyChecksum));
+      ASSERT_OK(kiwi.reader->VerifyChecksum(
+          ReadOptions(), TableReaderCaller::kUserVerifyChecksum));
 
       // Present-key Gets probe exactly 1 filter and read at most 1 data block.
       Statistics* stats = kiwi.options.statistics.get();
